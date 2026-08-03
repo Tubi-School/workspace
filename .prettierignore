@@ -1,0 +1,25 @@
+node_modules
+pnpm-lock.yaml
+
+# Build output
+dist
+build
+.next
+out
+.turbo
+*.tsbuildinfo
+
+# Generated code (owned by a generator, never hand-edited)
+**/src/generated
+**/generated
+
+# Rewritten by Next.js on every build and typegen.
+next-env.d.ts
+
+# Coverage
+coverage
+
+# Human-authored governance and prompt documents. These are edited by hand and
+# their formatting is deliberate; CI must not fail because of a stray blank line.
+AI
+PROMPTS

@@ -1,0 +1,24 @@
+@import 'tailwindcss';
+
+/* Design tokens live in the design system, not in the application. */
+@import '@tubi/ui/theme.css';
+
+/*
+ * `@tubi/ui` is compiled by Next rather than pre-built, so Tailwind has to be
+ * told to scan its sources for class names. Without this, utilities used only
+ * inside shared components would be absent from the production stylesheet.
+ */
+@source '../../../../packages/ui/src';
+
+@layer base {
+  html {
+    color-scheme: light dark;
+  }
+
+  body {
+    background-color: var(--color-surface);
+    color: var(--color-foreground);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+}

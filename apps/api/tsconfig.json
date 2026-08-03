@@ -1,0 +1,11 @@
+{
+  "extends": "@tubi/config/tsconfig/nestjs.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "dist"
+  },
+  // `prisma.config.ts` is included so that the type-check task covers it, but
+  // it is excluded from the build project — it is tooling, not runtime code.
+  "include": ["src/**/*.ts", "prisma.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "display": "TUBI Node Library",
+  "extends": "./base.json",
+  "compilerOptions": {
+    // The API is a CommonJS NestJS process. Shared libraries it consumes are
+    // emitted as CommonJS so there is exactly one module format in the graph
+    // and no dual-package hazard. Next.js bundles CommonJS without issue.
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"]
+  }
+}

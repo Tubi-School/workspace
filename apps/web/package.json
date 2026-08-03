@@ -1,0 +1,29 @@
+{
+  "name": "@tubi/web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TUBI Workspace web client.",
+  "scripts": {
+    "build": "next build",
+    "dev": "next dev --port 3000",
+    "start": "next start --port 3000",
+    "typecheck": "next typegen && tsc --noEmit",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@tubi/ui": "workspace:*",
+    "next": "16.2.12",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.3.3",
+    "@tubi/config": "workspace:*",
+    "@types/node": "26.1.2",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "eslint": "9.39.5",
+    "tailwindcss": "4.3.3",
+    "typescript": "6.0.3"
+  }
+}

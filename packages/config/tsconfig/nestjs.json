@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "display": "TUBI NestJS",
+  "extends": "./node-library.json",
+  "compilerOptions": {
+    // NestJS dependency injection reads parameter types from the metadata that
+    // these two flags emit. Without them the container cannot resolve providers.
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+
+    // Decorated constructor parameters are legitimately "unused" as far as the
+    // compiler is concerned, and `strictPropertyInitialization` fights with
+    // properties that Nest injects after construction.
+    "strictPropertyInitialization": false,
+
+    "declaration": false,
+    "declarationMap": false
+  }
+}

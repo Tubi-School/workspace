@@ -1,0 +1,33 @@
+{
+  "name": "tubi-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TUBI Workspace — the operational platform for TUBI Online School.",
+  "license": "UNLICENSED",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=22.12.0",
+    "pnpm": ">=10.0.0"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint && eslint .",
+    "lint:fix": "turbo run lint -- --fix && eslint . --fix",
+    "typecheck": "turbo run typecheck",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "clean": "node scripts/clean.mjs",
+    "db:generate": "pnpm --filter @tubi/api run db:generate",
+    "db:migrate": "pnpm --filter @tubi/api run db:migrate",
+    "db:studio": "pnpm --filter @tubi/api run db:studio",
+    "preinstall": "node scripts/check-node.mjs"
+  },
+  "devDependencies": {
+    "@tubi/config": "workspace:*",
+    "eslint": "9.39.5",
+    "prettier": "3.9.6",
+    "turbo": "2.10.8",
+    "typescript": "6.0.3"
+  }
+}

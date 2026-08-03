@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "display": "TUBI React Library",
+  "extends": "./base.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "preserve",
+
+    // `@tubi/ui` ships TypeScript sources that Next.js compiles itself, so this
+    // project is only ever type-checked, never emitted.
+    "noEmit": true
+  }
+}

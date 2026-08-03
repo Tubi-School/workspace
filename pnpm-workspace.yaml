@@ -1,0 +1,14 @@
+packages:
+  - apps/*
+  - packages/*
+
+# pnpm >= 10 refuses to run dependency lifecycle scripts unless they are
+# explicitly allow-listed. Every entry below ships a native binary or a
+# generated artifact that the toolchain genuinely needs at build time.
+onlyBuiltDependencies:
+  - '@prisma/engines'
+  - '@tailwindcss/oxide'
+  - esbuild
+  - prisma
+  - sharp
+  - unrs-resolver

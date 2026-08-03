@@ -1,0 +1,21 @@
+// TUBI Workspace — database schema.
+//
+// M1 establishes the Prisma toolchain only; no domain models are defined yet.
+// Models arrive with the milestones that need them.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+
+  // The API is a CommonJS NestJS process. Without these, Prisma 7 emits an
+  // ESM-only client that uses `import.meta.url` and cannot be required.
+  moduleFormat           = "cjs"
+  generatedFileExtension = "ts"
+  importFileExtension    = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // Prisma 7 no longer accepts `url` here. The connection string is supplied
+  // by `prisma.config.ts` for the CLI, and by a driver adapter at runtime.
+}

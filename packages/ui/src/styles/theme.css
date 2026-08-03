@@ -1,0 +1,71 @@
+/*
+ * TUBI Workspace design tokens.
+ *
+ * Tailwind CSS v4 is configured in CSS rather than JavaScript, so this file is
+ * the design system's single source of truth. Applications import it once,
+ * immediately after `@import "tailwindcss"`, and every token below becomes an
+ * ordinary utility (`bg-surface`, `text-muted-foreground`, `rounded-lg`, ...).
+ *
+ * The palette is intentionally low-contrast and near-neutral: Workspace should
+ * read as calm and uncluttered, closer to Linear or Notion than to a
+ * traditional LMS.
+ */
+
+@theme {
+  /* Surfaces, from furthest back to closest to the reader. */
+  --color-surface: oklch(99% 0.002 258);
+  --color-surface-raised: oklch(97.2% 0.003 258);
+  --color-surface-hover: oklch(95.2% 0.004 258);
+
+  /* Text. */
+  --color-foreground: oklch(23% 0.012 258);
+  --color-muted-foreground: oklch(53% 0.014 258);
+
+  /* Lines and separators. */
+  --color-border: oklch(91% 0.005 258);
+
+  /* Brand accent — used sparingly, for a single primary action per view. */
+  --color-brand: oklch(54% 0.176 258);
+  --color-brand-hover: oklch(48% 0.176 258);
+  --color-brand-foreground: oklch(99% 0.002 258);
+
+  /* Status. */
+  --color-success: oklch(62% 0.15 152);
+  --color-warning: oklch(72% 0.15 76);
+  --color-danger: oklch(58% 0.2 27);
+
+  /* Typefaces. No webfont is fetched; Inter is used when locally available
+     and the platform UI font otherwise, which keeps builds hermetic. */
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Code', 'JetBrains Mono', monospace;
+
+  /* Corners. Slightly softer than Tailwind's defaults. */
+  --radius-lg: 0.625rem;
+  --radius-xl: 0.875rem;
+}
+
+/*
+ * Dark mode is driven by the OS preference.
+ *
+ * `@theme` only ever declares the light palette — Tailwind requires it at the
+ * top level and it is what generates the utility classes. Dark mode then
+ * re-points the same custom properties on `:root`, so every utility built from
+ * a token switches automatically and no component needs a `dark:` variant for
+ * its base appearance.
+ */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-surface: oklch(17% 0.008 258);
+    --color-surface-raised: oklch(21% 0.009 258);
+    --color-surface-hover: oklch(25% 0.01 258);
+
+    --color-foreground: oklch(96% 0.004 258);
+    --color-muted-foreground: oklch(70% 0.012 258);
+
+    --color-border: oklch(29% 0.01 258);
+
+    --color-brand: oklch(66% 0.16 258);
+    --color-brand-hover: oklch(72% 0.16 258);
+    --color-brand-foreground: oklch(17% 0.008 258);
+  }
+}

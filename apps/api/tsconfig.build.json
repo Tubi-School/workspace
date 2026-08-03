@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // The runtime bundle only contains `src/`, so `dist/main.js` stays the
+    // entry point regardless of what else the type-check project includes.
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "prisma.config.ts", "**/*.spec.ts"]
+}

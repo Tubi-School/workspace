@@ -1,0 +1,29 @@
+{
+  "name": "@tubi/types",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Types shared across the TUBI Workspace API and web boundary.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch --preserveWatchOutput",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint ."
+  },
+  "devDependencies": {
+    "@tubi/config": "workspace:*",
+    "@types/node": "26.1.2",
+    "eslint": "9.39.5",
+    "typescript": "6.0.3"
+  }
+}

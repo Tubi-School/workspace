@@ -1,0 +1,47 @@
+{
+  "name": "@tubi/api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TUBI Workspace API — NestJS service backed by PostgreSQL via Prisma.",
+  "scripts": {
+    "build": "nest build",
+    "dev": "nest start --watch",
+    "start": "node dist/main.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:studio": "prisma studio"
+  },
+  "dependencies": {
+    "@nestjs/common": "11.1.28",
+    "@nestjs/config": "4.0.4",
+    "@nestjs/core": "11.1.28",
+    "@nestjs/platform-express": "11.1.28",
+    "@prisma/adapter-pg": "7.9.1",
+    "@prisma/client": "7.9.1",
+    "@tubi/types": "workspace:*",
+    "@tubi/utils": "workspace:*",
+    "class-transformer": "0.5.1",
+    "class-validator": "0.15.1",
+    "helmet": "8.3.0",
+    "pg": "8.22.0",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "11.0.24",
+    "@nestjs/schematics": "11.1.0",
+    "@tubi/config": "workspace:*",
+    "@types/node": "26.1.2",
+    "@types/pg": "8.20.3",
+    "eslint": "9.39.5",
+    "prisma": "7.9.1",
+    "source-map-support": "0.5.21",
+    "ts-loader": "9.6.2",
+    "ts-node": "10.9.2",
+    "typescript": "6.0.3"
+  }
+}
