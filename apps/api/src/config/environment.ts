@@ -24,6 +24,18 @@ export const environmentSchema = z.object({
   CORS_ORIGINS: z.string().default('http://localhost:3000'),
 
   APP_VERSION: z.string().default('0.0.0-dev'),
+
+  /**
+   * Signing secret for authentication JWTs. Required in every environment —
+   * there is no safe default. A short/missing secret fails the deploy here
+   * rather than issuing tokens an attacker can forge or brute-force.
+   */
+  JWT_SECRET: z
+    .string({ error: 'JWT_SECRET is required — see apps/api/.env.example' })
+    .min(32, 'JWT_SECRET must be at least 32 characters'),
+
+  /** Passed straight to `jsonwebtoken` as the `expiresIn` option. */
+  JWT_EXPIRES_IN: z.string().default('1d'),
 });
 
 export type RawEnvironment = z.infer<typeof environmentSchema>;

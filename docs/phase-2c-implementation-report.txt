@@ -1,0 +1,1395 @@
+TUBI WORKSPACE — PHASE 2C IMPLEMENTATION REPORT
+Backend authentication and authorization foundation.
+Status: IMPLEMENTATION COMPLETE, UNCOMMITTED. Includes the post-review
+correction pass (founder ruling + three required hardening items). Prepared
+for final external architecture/security review. No commit, tag, or push
+has been made.
+
+================================================================================
+CORRECTION PASS SUMMARY (applied after the first external review)
+================================================================================
+
+FOUNDER RULING — account provisioning (now FROZEN):
+  Public self-registration may create LEARNER accounts only. TEACHER and
+  ADMIN accounts must NOT be publicly self-registerable; they will be
+  provisioned later through controlled, non-public administrative
+  workflows. The existing implementation (hardcoding public registration to
+  RoleName.LEARNER) already satisfied this and required no code change —
+  it is now approved and frozen rather than an open assumption (see the
+  superseded item in section I).
+
+REQUIRED HARDENING 1 — Explicit JWT algorithm (implemented):
+  JWT signing and verification are now both pinned to HS256 via a single
+  shared constant (JWT_ALGORITHM in jwt.constants.ts), rather than relying
+  on library defaults. A token signed with any other algorithm is rejected
+  even if it carries the correct secret. New tests prove both directions
+  (section E).
+
+REQUIRED HARDENING 2 — Email canonicalization (implemented):
+  AuthService now normalizes every email (trim + lowercase) via a single
+  `normalizeEmail()` function, applied identically before every lookup and
+  before every write, in both `register` and `login`. New tests prove
+  case/whitespace variations resolve to the same account. No change was
+  made to the frozen Prisma domain schema — normalization happens entirely
+  in the service layer, before the value ever reaches Prisma.
+
+REQUIRED HARDENING 3 — Duplicate registration race (implemented):
+  The friendly pre-check (`findUnique` before `create`) is retained, but
+  `register` now also wraps `prisma.user.create` in a try/catch that
+  detects a Prisma unique-constraint violation (error code P2002) and
+  translates it into the same `ConflictException` (409) the pre-check
+  would have produced. Any other database error is re-thrown unchanged —
+  it is not swallowed or reinterpreted as a duplicate. New tests cover both
+  the race itself and the passthrough of unrelated errors.
+
+NON-BLOCKING / DEFERRED, unchanged by this pass, per explicit instruction:
+  - bcryptjs at cost factor 12 was kept as-is.
+  - Rate limiting / brute-force protection remains an open item, required
+    before public production exposure, not blocking this freeze.
+  - The Turbo `spawn UNKNOWN` issue remains outside Phase 2C's scope.
+
+================================================================================
+A. FILES CREATED / MODIFIED
+================================================================================
+
+Created (all new, under apps/api/src/auth/):
+- apps/api/src/auth/auth.module.ts
+- apps/api/src/auth/auth.controller.ts
+- apps/api/src/auth/auth.service.ts
+- apps/api/src/auth/auth.service.spec.ts
+- apps/api/src/auth/auth.http.spec.ts
+- apps/api/src/auth/types.ts
+- apps/api/src/auth/jwt.constants.ts                    [added in the correction pass]
+- apps/api/src/auth/dto/register.dto.ts
+- apps/api/src/auth/dto/login.dto.ts
+- apps/api/src/auth/guards/jwt-auth.guard.ts
+- apps/api/src/auth/guards/roles.guard.ts
+- apps/api/src/auth/guards/roles.guard.spec.ts
+- apps/api/src/auth/decorators/roles.decorator.ts
+- apps/api/src/auth/decorators/current-user.decorator.ts
+- apps/api/src/auth/strategies/jwt.strategy.ts
+
+Modified (original Phase 2C pass):
+- apps/api/src/app.module.ts — registered AuthModule.
+- apps/api/src/config/environment.ts — added JWT_SECRET (required, min 32
+  chars) and JWT_EXPIRES_IN (default "1d").
+- apps/api/tsconfig.json — widened ambient `types` to ["node", "jest"] so
+  `pnpm typecheck` recognises Jest globals in spec files (spec files remain
+  excluded from the production build via tsconfig.build.json).
+- apps/api/.env.example — documented JWT_SECRET / JWT_EXPIRES_IN
+  (placeholders only).
+- apps/api/package.json — added jest config, `test` script, and the auth/
+  testing dependencies (see original dependency list below).
+- pnpm-lock.yaml — mechanical consequence of the dependency additions.
+
+Modified further, in the correction pass:
+- apps/api/src/auth/auth.module.ts — pinned signOptions.algorithm.
+- apps/api/src/auth/strategies/jwt.strategy.ts — added algorithms allow-list.
+- apps/api/src/auth/auth.service.ts — added normalizeEmail(), wrapped
+  prisma.user.create in try/catch for the P2002 race, added
+  isUniqueConstraintViolation() and DUPLICATE_EMAIL_MESSAGE /
+  PRISMA_UNIQUE_CONSTRAINT_ERROR_CODE constants.
+- apps/api/src/auth/auth.service.spec.ts — 6 tests added (email
+  normalization x2, duplicate race, unrelated-error passthrough — see
+  section E for the full list, some of which restate items already counted
+  elsewhere).
+- apps/api/src/auth/auth.http.spec.ts — 2 tests added (valid HS256 token
+  still authenticates; different-algorithm token rejected), plus the test
+  module's JwtModule.register now pins the same algorithm as production.
+
+Pre-existing / not part of Phase 2C:
+- apps/api/.env (git-ignored, never committed) received local-only
+  JWT_SECRET / JWT_EXPIRES_IN values so the dev server keeps working. Not
+  in git status, not part of this diff.
+- apps/api/prisma/schema.prisma and every file under
+  apps/api/prisma/migrations/ are unchanged from the Phase 2B commit
+  (ca1225dc28acae7b6e33d24e576f31c4ec0c1021) — including through this
+  correction pass. See section H.
+
+New dependencies added to apps/api/package.json (original pass; unchanged
+by the correction pass):
+  dependencies:    @nestjs/jwt@11.0.2, @nestjs/passport@11.0.5, passport@0.7.0,
+                   passport-jwt@4.0.1, bcryptjs@3.0.3
+  devDependencies: @types/express, @types/passport-jwt, @types/jest, jest,
+                   ts-jest, @nestjs/testing@11.1.28 (pinned to match the
+                   rest of the Nest 11 stack), supertest, @types/supertest
+
+================================================================================
+B. AUTHENTICATION ARCHITECTURE IMPLEMENTED
+================================================================================
+
+Module structure (apps/api/src/auth/):
+  auth.module.ts              Wires PassportModule + JwtModule (async,
+                               secret/expiry/algorithm from ConfigService)
+                               around the controller/service/strategy.
+  auth.controller.ts           HTTP surface: register, login, me.
+  auth.service.ts               All business logic: registration, credential
+                               verification, token issuance, current-user
+                               lookup, email canonicalization, duplicate-
+                               race handling. Owns the one function
+                               permitted to read `passwordHash` off a row
+                               (`sanitizeUser`).
+  jwt.constants.ts              Single source of truth for the pinned JWT
+                               algorithm (HS256), imported by both the
+                               signing module config and the verification
+                               strategy. [added in correction pass]
+  strategies/jwt.strategy.ts    Passport "jwt" strategy: verifies the bearer
+                               token's signature, expiry, AND algorithm
+                               (allow-list), then re-fetches the user from
+                               the database on every request.
+  guards/jwt-auth.guard.ts      Thin `AuthGuard('jwt')` wrapper — require a
+                               valid bearer token.
+  guards/roles.guard.ts         Reads `@Roles(...)` metadata and checks
+                               `request.user.role` against it.
+  decorators/roles.decorator.ts        `@Roles('ADMIN', ...)` — declares
+                               required roles via Nest metadata.
+  decorators/current-user.decorator.ts `@CurrentUser()` — pulls the
+                               authenticated user off the request.
+  dto/register.dto.ts, dto/login.dto.ts  class-validator input contracts.
+  types.ts                      JwtPayload / AuthenticatedUser /
+                               SanitizedUser — the only shapes that flow
+                               between layers.
+
+Registration flow (updated by the correction pass):
+  1. AuthController.register receives a validated RegisterDto (email,
+     password, fullName — no role field exists on the DTO at all).
+  2. AuthService.register normalizes the email (trim + lowercase) via
+     `normalizeEmail()`.
+  3. It checks for an existing user by the normalized email and throws
+     ConflictException (409) if found — this is the friendly pre-check,
+     not the sole protection (see step 5).
+  4. The password is hashed with bcryptjs at cost factor 12.
+  5. A User row is created with `role: RoleName.LEARNER` — hardcoded, never
+     read from the request — inside a try/catch. If Prisma reports a
+     unique-constraint violation (code P2002) on the insert itself (i.e.
+     the pre-check's race window was lost to a concurrent request), the
+     same ConflictException(409) is thrown. Any other error from `create`
+     is re-thrown unchanged, never masked as a duplicate.
+  6. The created row is passed through `sanitizeUser` (strips passwordHash)
+     before returning.
+  FOUNDER RULING: registration is LEARNER-only, and this is now frozen —
+  see the Correction Pass Summary above. This is no longer an open
+  assumption.
+
+Login flow (updated by the correction pass):
+  1. AuthController.login receives a validated LoginDto.
+  2. AuthService.login normalizes the submitted email the same way
+     registration does, then looks the user up by that normalized email.
+  3. If no user exists, or the user is `isActive: false`, the same
+     UnauthorizedException("Invalid email or password") is thrown as for a
+     wrong password — see section D.
+  4. Otherwise the submitted password is compared against the stored bcrypt
+     hash with `bcrypt.compare`. A mismatch throws the same 401 with the
+     same message.
+  5. On success, a JWT is signed (HS256, pinned) with `{ sub, email, role }`
+     and returned alongside the sanitized user.
+
+JWT issuance and validation (algorithm pinning added by the correction pass):
+  - Issuance: `JwtModule.registerAsync` configures `@nestjs/jwt`'s
+    `JwtService` with `secret`, `signOptions.algorithm: JWT_ALGORITHM`
+    (HS256), and `signOptions.expiresIn` sourced from `ConfigService`.
+    `AuthService` calls `jwtService.signAsync(payload)`, inheriting these
+    module defaults.
+  - Validation: `JwtStrategy` (passport-jwt `Strategy`) is now constructed
+    with `algorithms: [JWT_ALGORITHM]` in addition to the secret and
+    `ignoreExpiration: false`. It extracts the bearer token, verifies its
+    signature, expiry, AND algorithm using the same `JWT_SECRET`/
+    `JWT_ALGORITHM`, and on success invokes `validate(payload)`, which
+    re-fetches the user from PostgreSQL by `payload.sub` and re-checks
+    `isActive`. Only a minimal `AuthenticatedUser` (no passwordHash) is
+    attached to `request.user`. A token signed with any algorithm other
+    than HS256 — even carrying the correct secret — is rejected at
+    verification before `validate()` is ever invoked.
+
+/auth/me flow: unchanged by the correction pass. Guarded by `JwtAuthGuard`.
+  On success, `@CurrentUser()` supplies the already-verified
+  `AuthenticatedUser.id` to `AuthService.findSanitizedById`, which
+  re-reads the user and returns the sanitized shape.
+
+Password hashing approach: bcryptjs (pure-JavaScript bcrypt
+implementation), cost factor 12, applied in AuthService.register only.
+Unchanged by the correction pass, per explicit instruction (non-blocking/
+deferred).
+
+Authentication guard: `JwtAuthGuard` (`@nestjs/passport`'s
+`AuthGuard('jwt')`). Applied per-route via `@UseGuards(JwtAuthGuard)`
+(currently on `GET /auth/me` only).
+
+Role guard/decorator: `RolesGuard` + `@Roles(...)`. Unchanged by the
+correction pass. Not yet applied to any route (no role-restricted endpoint
+exists yet to protect) — implemented and unit-tested as reusable
+infrastructure.
+
+Inactive users: unchanged by the correction pass. Enforced in three
+independent places — AuthService.login, JwtStrategy.validate, and
+AuthService.findSanitizedById — all with the same outward rejection
+behavior.
+
+================================================================================
+C. ENDPOINTS IMPLEMENTED
+================================================================================
+
+Unchanged by the correction pass except where noted (email is now
+canonicalized server-side before lookup/storage; this is transparent to the
+request/response contract below — a client may still submit any casing/
+whitespace and will get the same outcome as if it had submitted the
+canonical form).
+
+1) POST /auth/register
+   Authentication required: No (public).
+   Authorization required: None.
+   Request body (application/json):
+     { "email": string, "password": string (8-72 chars), "fullName": string (1-200 chars) }
+   Success response: 201 Created
+     { "id", "email", "fullName", "role": "LEARNER", "isActive", "createdAt", "updatedAt" }
+     (never includes passwordHash; "email" reflects the normalized,
+     trimmed+lowercased value, not necessarily byte-identical to what the
+     client submitted)
+   Error responses:
+     400 Bad Request  — DTO validation failure (missing/invalid field, or an
+                        unrecognised field, since the global ValidationPipe
+                        uses whitelist + forbidNonWhitelisted; this is what
+                        stops a client-supplied "role" field from doing
+                        anything other than being rejected outright before
+                        it ever reaches the service).
+     409 Conflict      — email already registered, whether detected by the
+                        pre-check or by a database unique-constraint
+                        violation surfaced during a concurrent-registration
+                        race (both now produce the identical response —
+                        see Hardening 3).
+
+2) POST /auth/login
+   Authentication required: No (public).
+   Authorization required: None.
+   Request body: { "email": string, "password": string }
+   Success response: 200 OK
+     { "accessToken": string, "user": { ...sanitized user, no passwordHash } }
+   Error responses:
+     400 Bad Request     — DTO validation failure.
+     401 Unauthorized     — unknown email (post-normalization), wrong
+                            password, or inactive account — always the
+                            identical message "Invalid email or password"
+                            (see section D).
+
+3) GET /auth/me
+   Authentication required: Yes — `Authorization: Bearer <accessToken>`.
+   Authorization required: None beyond being authenticated (any role).
+   Request body: none.
+   Success response: 200 OK
+     { "id", "email", "fullName", "role", "isActive", "createdAt", "updatedAt" }
+     (never includes passwordHash)
+   Error responses:
+     401 Unauthorized — no token, malformed token, expired token, invalid
+                        signature, a token signed with an algorithm other
+                        than the pinned HS256 (new in this pass), or the
+                        token's subject no longer resolves to an active
+                        user.
+
+================================================================================
+D. SECURITY CONTROLS IMPLEMENTED
+================================================================================
+
+Password hashing algorithm/library: bcryptjs (pure-JS bcrypt), salt rounds =
+12. Unchanged by the correction pass (explicitly non-blocking/deferred).
+
+JWT algorithm/configuration: HS256, now EXPLICITLY PINNED on both sides via
+a single shared constant (`JWT_ALGORITHM` in jwt.constants.ts) — no longer
+relying on library defaults. `AuthModule`'s `JwtModule.registerAsync` sets
+`signOptions.algorithm: JWT_ALGORITHM`; `JwtStrategy` sets
+`algorithms: [JWT_ALGORITHM]`. A token signed with any other algorithm,
+including one an attacker crafts while knowing the correct secret, is
+rejected at verification. Proven by new tests (section E).
+
+JWT expiry: `JWT_EXPIRES_IN`, environment-configurable, default `"1d"`.
+Unchanged by the correction pass.
+
+Secret handling: unchanged by the correction pass — `JWT_SECRET` read only
+from `process.env` via `ConfigService`, validated at startup (min 32
+chars), never logged, `.env` git-ignored and uncommitted.
+
+Startup environment validation: unchanged — `JWT_SECRET`/`JWT_EXPIRES_IN`
+are part of `environmentSchema`, gating Nest's boot.
+
+passwordHash serialization protection: unchanged — enforced structurally
+via `sanitizeUser`, verified by tests at both unit and full-HTTP-response
+level.
+
+Duplicate-email handling — UPDATED by Hardening 3: the pre-check
+(`findUnique` before `create`) is retained as a fast, friendly path, but is
+no longer the sole protection. `prisma.user.create` is wrapped in a
+try/catch; a Prisma `PrismaClientKnownRequestError` with code `P2002`
+(unique-constraint violation) is caught and translated into the identical
+`ConflictException('An account with this email already exists')` the
+pre-check produces. This closes the TOCTOU race where two concurrent
+registration requests both pass the pre-check before either has written —
+previously this would have surfaced as an unhandled Prisma error (a 500
+with implementation details potentially leaking); now both concurrent
+callers see the same clean 409. Any other error from `create` is
+re-thrown as-is (verified by a dedicated test — see section E) so this
+change cannot accidentally mask a genuine database failure as "duplicate
+email".
+
+Invalid-credential handling: unchanged — a non-existent email (post-
+normalization), a wrong password, and an inactive account's correct
+password all throw the identical `UnauthorizedException('Invalid email or
+password')`.
+
+Inactive-user handling: unchanged — see section B.
+
+Public registration restrictions — NOW FOUNDER-APPROVED AND FROZEN:
+`RegisterDto` has no `role` field at all; `AuthService.register` hardcodes
+`role: RoleName.LEARNER` with no conditional path. The founder ruling in
+this correction pass makes this the confirmed, frozen behavior rather than
+an implementation assumption pending review (see section I — the prior
+open item is now closed).
+
+ADMIN creation protection: unchanged — no code path, public or otherwise,
+in this milestone can create a `RoleName.ADMIN` user.
+
+Role-based authorization behavior: unchanged — see section B/E.
+
+Email canonicalization — NEW, Hardening 2: `normalizeEmail(email)` (trim +
+lowercase) is applied by `AuthService` before every database lookup and
+every write, identically in `register` and `login`. This guarantees
+"Learner@Example.com", " learner@example.com ", and "learner@example.com"
+all resolve to exactly one account regardless of which endpoint or which
+casing/whitespace variant is used first. This was implemented entirely in
+the service layer — no change was made to the frozen Prisma schema
+(`User.email` remains a plain unique `String` column; normalization happens
+before the value ever reaches Prisma, so the column continues to store
+whatever canonical form the service decides, with no schema-level
+case-insensitive-collation requirement introduced).
+
+================================================================================
+E. TESTS ADDED AND RESULTS
+================================================================================
+
+Three spec files, 29 tests total (23 from the original pass + 6 new in the
+correction pass), all passing.
+
+apps/api/src/auth/auth.service.spec.ts (unit, mocked PrismaService, real
+bcryptjs, real JwtService instantiated directly with a test secret):
+  register
+    - creates a LEARNER account and never returns passwordHash        PASS
+    - stores a bcrypt hash of the password, never the plaintext        PASS
+    - rejects registration with an already-registered email            PASS
+    - normalizes email (trim + lowercase) before checking for a
+      duplicate and before storing it                          [NEW] PASS
+    - turns a database unique-constraint violation into the same
+      409 Conflict as the pre-check                             [NEW] PASS
+    - re-throws an unrelated database error rather than masking
+      it as a duplicate                                         [NEW] PASS
+  login
+    - logs in with correct credentials, returns token + sanitized user PASS
+    - logs in successfully when the email differs only by
+      case/whitespace from how it was stored                    [NEW] PASS
+    - rejects an unknown email with a generic message                 PASS
+    - rejects a wrong password with the same generic message          PASS
+    - rejects an inactive user even with the correct password          PASS
+    - raises UnauthorizedException (not some other error type)        PASS
+  findSanitizedById
+    - returns a sanitized user for an active account                  PASS
+    - rejects a deactivated account even if the id is valid            PASS
+    - rejects an id that no longer resolves to a user                 PASS
+
+apps/api/src/auth/auth.http.spec.ts (full HTTP surface via
+@nestjs/testing + supertest, real controller/guard/strategy/JwtModule,
+only PrismaService replaced by an in-memory fake):
+  - registers a new learner and never returns passwordHash             PASS
+  - rejects registering an email that already exists                  PASS
+  - logs in with correct credentials and returns a usable bearer token PASS
+  - rejects login with an incorrect password                          PASS
+  - rejects login for a deactivated account                           PASS
+  - returns the current user for a valid bearer token, w/o passwordHash PASS
+  - rejects /auth/me with no bearer token at all                      PASS
+  - rejects /auth/me with a malformed bearer token                    PASS
+  - accepts a token signed with the pinned HS256 algorithm       [NEW] PASS
+  - rejects a token signed with a different algorithm, even with
+    the correct secret                                           [NEW] PASS
+
+apps/api/src/auth/guards/roles.guard.spec.ts (unit, unchanged by this pass):
+  - allows access when the route declares no required roles           PASS
+  - allows access when the user holds one of the required roles       PASS
+  - denies access when the user holds none of the required roles      PASS
+  - denies access when roles are required but there is no user        PASS
+
+Coverage against the brief's required test list — unchanged items plus new
+hardening coverage:
+  successful registration            -> auth.service.spec + auth.http.spec
+  duplicate email rejection          -> auth.service.spec + auth.http.spec
+  password stored hashed             -> auth.service.spec
+  successful login                   -> auth.service.spec + auth.http.spec
+  invalid credentials                -> auth.service.spec + auth.http.spec
+  inactive-user rejection            -> auth.service.spec + auth.http.spec
+  authenticated /auth/me              -> auth.http.spec
+  unauthenticated /auth/me            -> auth.http.spec (no token AND
+                                         malformed token)
+  role guard allow behavior          -> roles.guard.spec
+  role guard deny behavior           -> roles.guard.spec
+  passwordHash never serialized      -> asserted in every test above that
+                                         returns a user body
+  [NEW] email canonicalization        -> auth.service.spec (register +
+                                         login cases)
+  [NEW] duplicate-registration race   -> auth.service.spec (P2002 case +
+                                         unrelated-error passthrough case)
+  [NEW] JWT algorithm pinning         -> auth.http.spec (accept HS256,
+                                         reject HS384-signed token)
+
+Exact totals (from the verification run in section G):
+  Test Suites: 3 passed, 3 total
+  Tests:       29 passed, 29 total
+  Snapshots:   0 total
+
+Note: one of the two full test runs performed for this correction pass
+printed a Jest infrastructure warning — "A worker process has failed to
+exit gracefully and has been force exited... Active timers can also cause
+this" — with exit code 0 and all 29 tests still reported passing. A second,
+identical run completed cleanly with no such warning. This appears to be
+non-deterministic teardown-timing noise from the test runner rather than a
+functional defect, and is flagged in section I as an unresolved,
+non-blocking observation rather than treated as a passing/failing
+distinction.
+
+================================================================================
+F. ENVIRONMENT VARIABLES
+================================================================================
+
+Unchanged by the correction pass.
+
+Added to environmentSchema (apps/api/src/config/environment.ts):
+  JWT_SECRET       — required, string, minimum 32 characters. No default;
+                     boot fails without it.
+  JWT_EXPIRES_IN   — string, default "1d".
+
+.env.example files modified:
+  apps/api/.env.example — added both variables with placeholder values.
+
+Root .env.example was NOT modified. No real secret value is recorded
+anywhere in this report or in any committed file.
+
+================================================================================
+G. COMMANDS RUN AND RESULTS
+================================================================================
+
+Original pass commands/results are unchanged and not repeated in full here
+(see the dependency-resolution notes about @nestjs/jwt / @nestjs/passport
+CJS-vs-ESM and @nestjs/testing peer-version pinning, which remain accurate
+and were not revisited in this pass). This section reports the correction
+pass's own verification run.
+
+From apps/api, after implementing the three hardening items:
+
+  pnpm run test   (jest)
+    -> Test Suites: 3 passed, 3 total
+       Tests:       29 passed, 29 total
+       Time:        ~66-72s
+       (One run of two printed a non-fatal worker-teardown warning; see
+       the note at the end of section E. Exit code 0 both times.)
+
+  pnpm run typecheck   (tsc --noEmit)
+    -> PASS, no errors.
+
+  pnpm exec eslint .   (run directly, bypassing Turbo — see the Turbo note
+  carried over from the original pass, unrelated to this correction)
+    -> 0 problems.
+
+  pnpm run build   (nest build)
+    -> PASS, exit code 0, no errors.
+
+  pnpm exec prisma validate
+    -> "The schema at prisma\schema.prisma is valid" — confirms this
+       correction pass introduced no schema drift (see section H).
+
+Turbo `spawn UNKNOWN` issue: unchanged, unrelated to this correction pass,
+carried over from the original Phase 2C report and the Phase 2B report
+before it. Documented separately per instruction; not a genuine application
+failure.
+
+================================================================================
+H. DATABASE/SCHEMA CHANGES OR DEVIATIONS
+================================================================================
+
+No Phase 2C database schema changes were required — including through this
+correction pass.
+
+apps/api/prisma/schema.prisma and every file under
+apps/api/prisma/migrations/ remain byte-for-byte unchanged from the Phase
+2B commit (tag v0.2.1-phase2b-database, commit
+ca1225dc28acae7b6e33d24e576f31c4ec0c1021). Both the original Phase 2C work
+and this correction pass were implemented entirely in the service/module
+layer against the existing frozen `User` model. Email canonicalization in
+particular was deliberately kept out of the schema (no case-insensitive
+collation, no generated/computed column) — it is pure application-layer
+normalization before Prisma ever sees the value, per the instruction not to
+alter frozen Prisma domain semantics merely to implement it. `prisma
+validate` was re-run and confirms no drift.
+
+================================================================================
+I. WARNINGS / UNRESOLVED ISSUES
+================================================================================
+
+Items resolved by this correction pass (kept here, marked resolved, rather
+than deleted, so the review trail stays intact):
+
+1. [RESOLVED — now a frozen founder ruling] Role self-registration: this
+   report previously flagged the LEARNER-only registration behavior as an
+   assumption made in the absence of an explicit founder decision. The
+   founder ruling accompanying this correction pass now freezes exactly
+   that behavior: public self-registration creates LEARNER accounts only;
+   TEACHER/ADMIN provisioning is explicitly deferred to a later, non-public
+   administrative workflow. No further ambiguity remains on this point.
+
+3. [RESOLVED] JWT signing algorithm is now explicitly pinned to HS256 on
+   both issuance and verification via a shared constant, closing the
+   algorithm-confusion gap previously flagged as a recommended hardening.
+
+Items carried over, unchanged by this pass:
+
+2. Password hashing library choice: bcryptjs (pure JavaScript) remains in
+   use instead of native `bcrypt`/`argon2`, per explicit instruction that
+   this stays non-blocking/deferred for Phase 2C. The original tradeoff
+   analysis (avoiding native-addon compilation risk in this Windows dev
+   environment; bcryptjs is slower and lacks native bcrypt's audit
+   history) still applies unchanged.
+
+4. No rate limiting / brute-force throttling exists on `POST /auth/login`
+   or `POST /auth/register`. Explicitly confirmed as required before public
+   production exposure but non-blocking for this freeze.
+
+5. No password complexity policy beyond length (8-72 characters). Unchanged.
+
+6. `RolesGuard`/`@Roles` remain implemented and unit-tested but not yet
+   attached to any real endpoint. Unchanged, expected per scope.
+
+7. `@nestjs/jwt`/`@nestjs/passport` remain pinned to their newest 11.x line
+   (not the latest 12.x) for CommonJS/Jest compatibility. Unchanged;
+   revisit if test tooling moves to native ESM.
+
+8. Turbo `spawn UNKNOWN` remains unresolved and explicitly out of scope for
+   Phase 2C, confirmed again by this correction pass's instructions.
+
+New from this pass:
+
+9. One of two full test runs during this correction pass printed a
+   non-fatal Jest "worker process failed to exit gracefully" warning (exit
+   code 0, all tests passing either way). Not reproduced on the immediately
+   following run. Flagged as an unresolved, low-severity observation for
+   awareness — possibly related to a lingering timer/handle in one of the
+   newly added tests (e.g. the ad hoc `JwtService` instance created inline
+   in the "different algorithm" test) — but not investigated further, as
+   it does not affect correctness or the exit code of the verification run.
+
+No new founder-decision-required blockers were identified while
+implementing these three hardening items.
+
+================================================================================
+J. GIT STATUS
+================================================================================
+
+$ git status
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   apps/api/.env.example
+	modified:   apps/api/package.json
+	modified:   apps/api/src/app.module.ts
+	modified:   apps/api/src/config/environment.ts
+	modified:   apps/api/tsconfig.json
+	modified:   pnpm-lock.yaml
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	apps/api/src/auth/
+	docs/phase-2c-implementation-report.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+
+$ git diff --stat
+ apps/api/.env.example              |    8 +
+ apps/api/package.json              |   36 +
+ apps/api/src/app.module.ts         |    2 +
+ apps/api/src/config/environment.ts |   12 +
+ apps/api/tsconfig.json             |    8 +-
+ pnpm-lock.yaml                     | 2421 +++++++++++++++++++++++++++++++++++-
+ 6 files changed, 2447 insertions(+), 40 deletions(-)
+
+Phase 2C uncommitted files, in full (unchanged in shape from the original
+pass — the correction pass only added/modified content inside the already-
+untracked apps/api/src/auth/ directory and this report file, neither of
+which changes the top-level git status categories above):
+  Modified:  apps/api/.env.example
+             apps/api/package.json
+             apps/api/src/app.module.ts
+             apps/api/src/config/environment.ts
+             apps/api/tsconfig.json
+             pnpm-lock.yaml
+  Untracked: apps/api/src/auth/ (now 15 files, including the new
+             jwt.constants.ts)
+             docs/phase-2c-implementation-report.txt (this file)
+
+Not part of git status (git-ignored, unchanged): apps/api/.env.
+
+No commit, tag, or push has been made. Phase 2C remains fully local and
+uncommitted.
+
+================================================================================
+EXTERNAL REVIEW SOURCE BUNDLE
+================================================================================
+Complete, unmodified current contents of every security-critical Phase 2C
+file, reflecting the correction pass. Files unchanged since the prior
+review (auth.controller.ts, dto/register.dto.ts, dto/login.dto.ts,
+guards/jwt-auth.guard.ts, guards/roles.guard.ts, guards/roles.guard.spec.ts,
+decorators/roles.decorator.ts, decorators/current-user.decorator.ts,
+types.ts, config/environment.ts, app.module.ts, .env.example, tsconfig.json)
+are omitted here for brevity — their content is unchanged from the version
+already reviewed and included in full in this same report prior to this
+pass. Only new or modified files are reproduced below. No node_modules,
+generated Prisma client files, build output, lockfile contents, or real
+secrets are included.
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/auth/jwt.constants.ts   [NEW]
+--------------------------------------------------------------------------------
+/**
+ * The single JWT signing/verification algorithm this service uses.
+ *
+ * Pinned explicitly, rather than left to library defaults, so that neither
+ * issuance nor verification can silently drift to a different algorithm —
+ * and so a token crafted with an unacceptable algorithm is rejected instead
+ * of accepted. `AuthModule` (signing) and `JwtStrategy` (verification) both
+ * import this constant rather than each hardcoding their own literal.
+ */
+export const JWT_ALGORITHM = 'HS256';
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/auth/auth.module.ts   [MODIFIED]
+--------------------------------------------------------------------------------
+import { Module } from '@nestjs/common';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { JwtModule } from '@nestjs/jwt';
+import { PassportModule } from '@nestjs/passport';
+
+import { AuthController } from './auth.controller.js';
+import { AuthService } from './auth.service.js';
+import { JWT_ALGORITHM } from './jwt.constants.js';
+import { JwtStrategy } from './strategies/jwt.strategy.js';
+
+@Module({
+  imports: [
+    PassportModule,
+    JwtModule.registerAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (configService: ConfigService) => ({
+        secret: configService.getOrThrow<string>('JWT_SECRET'),
+        // Pinned explicitly rather than left to the library default, so a
+        // token cannot be crafted with a different algorithm and accepted.
+        // Must match the `algorithms` allow-list passed to JwtStrategy.
+        signOptions: {
+          algorithm: JWT_ALGORITHM,
+          // `@nestjs/jwt`'s `expiresIn` type is a template-literal union
+          // (e.g. "1d") rather than plain `string`. JWT_EXPIRES_IN is
+          // validated by `environmentSchema` but not narrowed to that union
+          // at the type level, so this single, well-understood cast bridges
+          // the two.
+          expiresIn: configService.getOrThrow<string>('JWT_EXPIRES_IN') as unknown as number,
+        },
+      }),
+    }),
+  ],
+  controllers: [AuthController],
+  providers: [AuthService, JwtStrategy],
+  exports: [AuthService],
+})
+export class AuthModule {}
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/auth/strategies/jwt.strategy.ts   [MODIFIED]
+--------------------------------------------------------------------------------
+import { Injectable, UnauthorizedException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { PassportStrategy } from '@nestjs/passport';
+import { ExtractJwt, Strategy } from 'passport-jwt';
+
+import { PrismaService } from '../../prisma/prisma.service.js';
+import { JWT_ALGORITHM } from '../jwt.constants.js';
+import type { AuthenticatedUser, JwtPayload } from '../types.js';
+
+@Injectable()
+export class JwtStrategy extends PassportStrategy(Strategy) {
+  constructor(
+    configService: ConfigService,
+    private readonly prisma: PrismaService,
+  ) {
+    super({
+      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+      ignoreExpiration: false,
+      secretOrKey: configService.getOrThrow<string>('JWT_SECRET'),
+      // Explicit allow-list, matching AuthModule's signing algorithm. A
+      // token signed with any other algorithm — including one an attacker
+      // crafted to try to bypass verification — is rejected outright.
+      algorithms: [JWT_ALGORITHM],
+    });
+  }
+
+  /**
+   * Runs on every authenticated request. Re-checking the database — rather
+   * than trusting the token's claims for the whole of its lifetime — is what
+   * lets a deactivated account lose access immediately instead of waiting
+   * for its token to expire.
+   */
+  async validate(payload: JwtPayload): Promise<AuthenticatedUser> {
+    const user = await this.prisma.user.findUnique({ where: { id: payload.sub } });
+
+    if (!user || !user.isActive) {
+      // Same message whether the account was deleted, deactivated, or never
+      // existed — an authenticated caller learns nothing more specific.
+      throw new UnauthorizedException('Invalid or expired session');
+    }
+
+    return {
+      id: user.id,
+      email: user.email,
+      fullName: user.fullName,
+      role: user.role,
+      isActive: user.isActive,
+    };
+  }
+}
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/auth/auth.service.ts   [MODIFIED]
+--------------------------------------------------------------------------------
+import { ConflictException, Injectable, UnauthorizedException } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import * as bcrypt from 'bcryptjs';
+
+import { PrismaService } from '../prisma/prisma.service.js';
+import { Prisma, RoleName, type User } from '../generated/prisma/client.js';
+import type { LoginDto } from './dto/login.dto.js';
+import type { RegisterDto } from './dto/register.dto.js';
+import type { JwtPayload, SanitizedUser } from './types.js';
+
+/** Cost factor for bcrypt hashing. 12 is the current widely-recommended
+ * floor for production password storage as of this writing. */
+const BCRYPT_SALT_ROUNDS = 12;
+
+/** Generic message for every credential failure. Login and inactive-account
+ * rejection must be indistinguishable to the caller — telling an attacker
+ * "that email exists but the password is wrong" versus "no such account"
+ * hands them a free account-enumeration oracle. */
+const INVALID_CREDENTIALS_MESSAGE = 'Invalid email or password';
+
+const DUPLICATE_EMAIL_MESSAGE = 'An account with this email already exists';
+
+/** Prisma's error code for a unique-constraint violation. */
+const PRISMA_UNIQUE_CONSTRAINT_ERROR_CODE = 'P2002';
+
+/**
+ * Canonicalizes an email identifier before every lookup or write.
+ *
+ * Registration and login must apply the exact same rule, or
+ * "Learner@Example.com " and "learner@example.com" would silently behave as
+ * two different accounts depending on which endpoint happened to see which
+ * casing/whitespace first.
+ */
+function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+@Injectable()
+export class AuthService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly jwtService: JwtService,
+  ) {}
+
+  /**
+   * Public self-registration.
+   *
+   * Always creates a LEARNER account. There is no code path — regardless of
+   * what a request body contains — through which a public caller can create
+   * a TEACHER or ADMIN account. See the Phase 2C completion report for the
+   * founder-review item this reflects: TEACHER/ADMIN provisioning is
+   * deliberately out of scope here and belongs to a later, non-public flow.
+   */
+  async register(dto: RegisterDto): Promise<SanitizedUser> {
+    const email = normalizeEmail(dto.email);
+    const existing = await this.prisma.user.findUnique({ where: { email } });
+
+    if (existing) {
+      throw new ConflictException(DUPLICATE_EMAIL_MESSAGE);
+    }
+
+    const passwordHash = await bcrypt.hash(dto.password, BCRYPT_SALT_ROUNDS);
+
+    let user: User;
+    try {
+      user = await this.prisma.user.create({
+        data: {
+          email,
+          passwordHash,
+          fullName: dto.fullName,
+          role: RoleName.LEARNER,
+        },
+      });
+    } catch (error) {
+      // The findUnique check above narrows the window but does not close
+      // it — two requests can both pass it before either writes. Prisma's
+      // own unique-constraint violation is the authoritative guard; a
+      // caller must see the same 409 either way, never a raw database
+      // error.
+      if (isUniqueConstraintViolation(error)) {
+        throw new ConflictException(DUPLICATE_EMAIL_MESSAGE);
+      }
+      throw error;
+    }
+
+    return sanitizeUser(user);
+  }
+
+  async login(dto: LoginDto): Promise<{ accessToken: string; user: SanitizedUser }> {
+    const email = normalizeEmail(dto.email);
+    const user = await this.prisma.user.findUnique({ where: { email } });
+
+    // Reject a non-existent account and an inactive one with the same
+    // outcome and the same message — see INVALID_CREDENTIALS_MESSAGE.
+    if (!user || !user.isActive) {
+      throw new UnauthorizedException(INVALID_CREDENTIALS_MESSAGE);
+    }
+
+    const passwordMatches = await bcrypt.compare(dto.password, user.passwordHash);
+
+    if (!passwordMatches) {
+      throw new UnauthorizedException(INVALID_CREDENTIALS_MESSAGE);
+    }
+
+    const payload: JwtPayload = { sub: user.id, email: user.email, role: user.role };
+    const accessToken = await this.jwtService.signAsync(payload);
+
+    return { accessToken, user: sanitizeUser(user) };
+  }
+
+  async findSanitizedById(userId: string): Promise<SanitizedUser> {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+
+    if (!user || !user.isActive) {
+      throw new UnauthorizedException('Invalid or expired session');
+    }
+
+    return sanitizeUser(user);
+  }
+}
+
+/** True for a Prisma unique-constraint violation (e.g. two concurrent
+ * registrations racing on the same email) — the case `register` must fold
+ * into the same 409 Conflict a pre-check would have produced. */
+function isUniqueConstraintViolation(error: unknown): boolean {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === PRISMA_UNIQUE_CONSTRAINT_ERROR_CODE
+  );
+}
+
+/** The only function in this module allowed to read `passwordHash` off a
+ * `User` row — every value that leaves the service goes through this. */
+function sanitizeUser(user: User): SanitizedUser {
+  return {
+    id: user.id,
+    email: user.email,
+    fullName: user.fullName,
+    role: user.role,
+    isActive: user.isActive,
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt,
+  };
+}
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/auth/auth.service.spec.ts   [MODIFIED]
+--------------------------------------------------------------------------------
+import { ConflictException, UnauthorizedException } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import * as bcrypt from 'bcryptjs';
+
+import { Prisma, RoleName, type User } from '../generated/prisma/client.js';
+import type { PrismaService } from '../prisma/prisma.service.js';
+import { AuthService } from './auth.service.js';
+
+function buildUser(overrides: Partial<User> = {}): User {
+  const now = new Date();
+  return {
+    id: 'user-1',
+    email: 'learner@example.com',
+    passwordHash: 'irrelevant-placeholder',
+    role: RoleName.LEARNER,
+    fullName: 'Test Learner',
+    isActive: true,
+    createdAt: now,
+    updatedAt: now,
+    ...overrides,
+  };
+}
+
+describe('AuthService', () => {
+  let prisma: {
+    user: {
+      findUnique: jest.Mock;
+      create: jest.Mock;
+    };
+  };
+  let service: AuthService;
+
+  beforeEach(() => {
+    prisma = {
+      user: {
+        findUnique: jest.fn(),
+        create: jest.fn(),
+      },
+    };
+
+    const jwtService = new JwtService({ secret: 'test-secret' });
+    service = new AuthService(prisma as unknown as PrismaService, jwtService);
+  });
+
+  describe('register', () => {
+    it('creates a LEARNER account and never returns passwordHash', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+      prisma.user.create.mockImplementation(({ data }: { data: Partial<User> }) =>
+        Promise.resolve(buildUser({ email: data.email, fullName: data.fullName, passwordHash: data.passwordHash, role: data.role })),
+      );
+
+      const result = await service.register({
+        email: 'new@example.com',
+        password: 'correct-horse-battery-staple',
+        fullName: 'New Learner',
+      });
+
+      expect(result.role).toBe(RoleName.LEARNER);
+      expect(result).not.toHaveProperty('passwordHash');
+      // `expect.objectContaining` is typed `any` by @types/jest; the assertion
+      // itself is fully type-safe about what it checks.
+      expect(prisma.user.create).toHaveBeenCalledWith(
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        expect.objectContaining({ data: expect.objectContaining({ role: RoleName.LEARNER }) }),
+      );
+    });
+
+    it('stores a bcrypt hash of the password, never the plaintext', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+      let storedHash = '';
+      prisma.user.create.mockImplementation(({ data }: { data: Partial<User> }) => {
+        storedHash = data.passwordHash ?? '';
+        return Promise.resolve(buildUser({ passwordHash: storedHash }));
+      });
+
+      await service.register({
+        email: 'new@example.com',
+        password: 'correct-horse-battery-staple',
+        fullName: 'New Learner',
+      });
+
+      expect(storedHash).not.toBe('correct-horse-battery-staple');
+      expect(storedHash).toMatch(/^\$2[aby]\$/);
+      await expect(bcrypt.compare('correct-horse-battery-staple', storedHash)).resolves.toBe(true);
+    });
+
+    it('rejects registration with an already-registered email', async () => {
+      prisma.user.findUnique.mockResolvedValue(buildUser());
+
+      await expect(
+        service.register({ email: 'learner@example.com', password: 'whatever123', fullName: 'Dup' }),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(prisma.user.create).not.toHaveBeenCalled();
+    });
+
+    it('normalizes email (trim + lowercase) before checking for a duplicate and before storing it', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+      let capturedEmail = '';
+      prisma.user.create.mockImplementation(({ data }: { data: Partial<User> }) => {
+        capturedEmail = data.email ?? '';
+        return Promise.resolve(buildUser({ email: capturedEmail }));
+      });
+
+      await service.register({
+        email: '  Learner@Example.COM  ',
+        password: 'correct-horse-battery-staple',
+        fullName: 'Cased Learner',
+      });
+
+      expect(prisma.user.findUnique).toHaveBeenCalledWith({ where: { email: 'learner@example.com' } });
+      expect(capturedEmail).toBe('learner@example.com');
+    });
+
+    it('turns a database unique-constraint violation into the same 409 Conflict as the pre-check', async () => {
+      // Simulates a race: the pre-check sees no existing row, but a
+      // concurrent request wins the actual insert, so Prisma's own unique
+      // constraint is what fails.
+      prisma.user.findUnique.mockResolvedValue(null);
+      prisma.user.create.mockRejectedValue(
+        new Prisma.PrismaClientKnownRequestError('Unique constraint failed on the fields: (`email`)', {
+          code: 'P2002',
+          clientVersion: 'test',
+        }),
+      );
+
+      await expect(
+        service.register({ email: 'racing@example.com', password: 'correct-horse-battery-staple', fullName: 'Racer' }),
+      ).rejects.toBeInstanceOf(ConflictException);
+    });
+
+    it('re-throws an unrelated database error rather than masking it as a duplicate', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+      prisma.user.create.mockRejectedValue(new Error('connection reset'));
+
+      await expect(
+        service.register({ email: 'other-error@example.com', password: 'correct-horse-battery-staple', fullName: 'X' }),
+      ).rejects.toThrow('connection reset');
+    });
+  });
+
+  describe('login', () => {
+    it('logs in with correct credentials and returns a token plus a sanitized user', async () => {
+      const passwordHash = await bcrypt.hash('correct-password', 4);
+      prisma.user.findUnique.mockResolvedValue(buildUser({ passwordHash }));
+
+      const result = await service.login({ email: 'learner@example.com', password: 'correct-password' });
+
+      expect(typeof result.accessToken).toBe('string');
+      expect(result.accessToken.length).toBeGreaterThan(0);
+      expect(result.user).not.toHaveProperty('passwordHash');
+      expect(result.user.email).toBe('learner@example.com');
+    });
+
+    it('logs in successfully when the email differs only by case/whitespace from how it was stored', async () => {
+      const passwordHash = await bcrypt.hash('correct-password', 4);
+      prisma.user.findUnique.mockResolvedValue(buildUser({ email: 'learner@example.com', passwordHash }));
+
+      const result = await service.login({ email: '  Learner@Example.COM  ', password: 'correct-password' });
+
+      expect(prisma.user.findUnique).toHaveBeenCalledWith({ where: { email: 'learner@example.com' } });
+      expect(result.user.email).toBe('learner@example.com');
+    });
+
+    it('rejects an unknown email with a generic message', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+
+      await expect(service.login({ email: 'ghost@example.com', password: 'whatever' })).rejects.toMatchObject({
+        message: 'Invalid email or password',
+      });
+    });
+
+    it('rejects a wrong password with the same generic message', async () => {
+      const passwordHash = await bcrypt.hash('correct-password', 4);
+      prisma.user.findUnique.mockResolvedValue(buildUser({ passwordHash }));
+
+      await expect(
+        service.login({ email: 'learner@example.com', password: 'wrong-password' }),
+      ).rejects.toMatchObject({ message: 'Invalid email or password' });
+    });
+
+    it('rejects an inactive user even with the correct password, with the same generic message', async () => {
+      const passwordHash = await bcrypt.hash('correct-password', 4);
+      prisma.user.findUnique.mockResolvedValue(buildUser({ passwordHash, isActive: false }));
+
+      await expect(
+        service.login({ email: 'learner@example.com', password: 'correct-password' }),
+      ).rejects.toMatchObject({ message: 'Invalid email or password' });
+    });
+
+    it('raises UnauthorizedException (not some other error type) on failure', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+
+      await expect(service.login({ email: 'ghost@example.com', password: 'x' })).rejects.toBeInstanceOf(
+        UnauthorizedException,
+      );
+    });
+  });
+
+  describe('findSanitizedById', () => {
+    it('returns a sanitized user for an active account', async () => {
+      prisma.user.findUnique.mockResolvedValue(buildUser());
+
+      const result = await service.findSanitizedById('user-1');
+
+      expect(result).not.toHaveProperty('passwordHash');
+      expect(result.id).toBe('user-1');
+    });
+
+    it('rejects a deactivated account even if the id is valid', async () => {
+      prisma.user.findUnique.mockResolvedValue(buildUser({ isActive: false }));
+
+      await expect(service.findSanitizedById('user-1')).rejects.toBeInstanceOf(UnauthorizedException);
+    });
+
+    it('rejects an id that no longer resolves to a user', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+
+      await expect(service.findSanitizedById('does-not-exist')).rejects.toBeInstanceOf(UnauthorizedException);
+    });
+  });
+});
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/auth/auth.http.spec.ts   [MODIFIED]
+--------------------------------------------------------------------------------
+import type { Server } from 'node:http';
+
+import { ConfigService } from '@nestjs/config';
+import { JwtModule, JwtService } from '@nestjs/jwt';
+import type { INestApplication } from '@nestjs/common';
+import { Test } from '@nestjs/testing';
+import * as bcrypt from 'bcryptjs';
+import request from 'supertest';
+
+import { RoleName, type User } from '../generated/prisma/client.js';
+import { PrismaService } from '../prisma/prisma.service.js';
+import { AuthController } from './auth.controller.js';
+import { AuthService } from './auth.service.js';
+import { JWT_ALGORITHM } from './jwt.constants.js';
+import { JwtStrategy } from './strategies/jwt.strategy.js';
+
+/** Shape of the JSON bodies this suite asserts against. Supertest types
+ * `Response.body` as `any`; casting through this interface at the point of
+ * use is what keeps the assertions themselves type-safe. */
+interface AuthResponseBody {
+  role?: string;
+  email?: string;
+  accessToken?: string;
+  user?: { email?: string };
+}
+
+/**
+ * Exercises the auth HTTP surface end-to-end against a real Nest application
+ * — real controller, real guard, real strategy, real JWT signing/verification
+ * — with only PrismaService replaced by an in-memory fake. This is what
+ * proves the guard, decorator and strategy actually wire together, which the
+ * unit-level AuthService tests cannot show on their own.
+ */
+describe('Auth HTTP surface', () => {
+  let app: INestApplication;
+  let users: Map<string, User>;
+
+  const TEST_JWT_SECRET = 'test-only-secret-not-used-anywhere-real';
+
+  function buildUser(overrides: Partial<User> = {}): User {
+    const now = new Date();
+    return {
+      id: overrides.id ?? `user-${users.size + 1}`,
+      email: 'seed@example.com',
+      passwordHash: 'unset',
+      role: RoleName.LEARNER,
+      fullName: 'Seed User',
+      isActive: true,
+      createdAt: now,
+      updatedAt: now,
+      ...overrides,
+    };
+  }
+
+  /** `app.getHttpServer()` is typed loosely by Nest; supertest needs a
+   * concrete `http.Server`. Centralising the cast here keeps it out of every
+   * call site below. */
+  function server(): Server {
+    return app.getHttpServer() as Server;
+  }
+
+  function bodyOf(response: request.Response): AuthResponseBody {
+    return response.body as AuthResponseBody;
+  }
+
+  beforeEach(async () => {
+    users = new Map();
+
+    const fakePrisma = {
+      user: {
+        findUnique: jest.fn(({ where }: { where: { id?: string; email?: string } }) => {
+          if (where.id) return Promise.resolve(users.get(where.id) ?? null);
+          const found = [...users.values()].find((u) => u.email === where.email);
+          return Promise.resolve(found ?? null);
+        }),
+        create: jest.fn(({ data }: { data: Partial<User> }) => {
+          const user = buildUser({ ...data, id: `user-${users.size + 1}` });
+          users.set(user.id, user);
+          return Promise.resolve(user);
+        }),
+      },
+    };
+
+    const fakeConfigService = {
+      getOrThrow: (key: string) => (key === 'JWT_SECRET' ? TEST_JWT_SECRET : '1h'),
+    };
+
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        JwtModule.register({
+          secret: TEST_JWT_SECRET,
+          signOptions: { algorithm: JWT_ALGORITHM, expiresIn: '1h' },
+        }),
+      ],
+      controllers: [AuthController],
+      providers: [
+        AuthService,
+        JwtStrategy,
+        { provide: PrismaService, useValue: fakePrisma },
+        { provide: ConfigService, useValue: fakeConfigService },
+      ],
+    }).compile();
+
+    app = moduleRef.createNestApplication();
+    await app.init();
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  it('registers a new learner and never returns passwordHash', async () => {
+    const response = await request(server()).post('/auth/register').send({
+      email: 'learner@example.com',
+      password: 'correct-horse-battery-staple',
+      fullName: 'Learner One',
+    });
+
+    expect(response.status).toBe(201);
+    expect(bodyOf(response).role).toBe('LEARNER');
+    expect(response.body).not.toHaveProperty('passwordHash');
+  });
+
+  it('rejects registering an email that already exists', async () => {
+    await request(server()).post('/auth/register').send({
+      email: 'dup@example.com',
+      password: 'correct-horse-battery-staple',
+      fullName: 'First',
+    });
+
+    const second = await request(server()).post('/auth/register').send({
+      email: 'dup@example.com',
+      password: 'another-password-1',
+      fullName: 'Second',
+    });
+
+    expect(second.status).toBe(409);
+  });
+
+  it('logs in with correct credentials and returns a usable bearer token', async () => {
+    await request(server()).post('/auth/register').send({
+      email: 'learner2@example.com',
+      password: 'correct-horse-battery-staple',
+      fullName: 'Learner Two',
+    });
+
+    const response = await request(server())
+      .post('/auth/login')
+      .send({ email: 'learner2@example.com', password: 'correct-horse-battery-staple' });
+
+    expect(response.status).toBe(200);
+    expect(typeof bodyOf(response).accessToken).toBe('string');
+    expect(bodyOf(response).user).not.toHaveProperty('passwordHash');
+  });
+
+  it('rejects login with an incorrect password', async () => {
+    await request(server()).post('/auth/register').send({
+      email: 'learner3@example.com',
+      password: 'correct-horse-battery-staple',
+      fullName: 'Learner Three',
+    });
+
+    const response = await request(server())
+      .post('/auth/login')
+      .send({ email: 'learner3@example.com', password: 'wrong-password' });
+
+    expect(response.status).toBe(401);
+  });
+
+  it('rejects login for a deactivated account', async () => {
+    const passwordHash = await bcrypt.hash('correct-horse-battery-staple', 4);
+    const inactive = buildUser({ email: 'inactive@example.com', passwordHash, isActive: false });
+    users.set(inactive.id, inactive);
+
+    const response = await request(server())
+      .post('/auth/login')
+      .send({ email: 'inactive@example.com', password: 'correct-horse-battery-staple' });
+
+    expect(response.status).toBe(401);
+  });
+
+  it('returns the current user for a valid bearer token, without passwordHash', async () => {
+    await request(server()).post('/auth/register').send({
+      email: 'me@example.com',
+      password: 'correct-horse-battery-staple',
+      fullName: 'Me User',
+    });
+    const login = await request(server())
+      .post('/auth/login')
+      .send({ email: 'me@example.com', password: 'correct-horse-battery-staple' });
+
+    const response = await request(server())
+      .get('/auth/me')
+      .set('Authorization', `Bearer ${bodyOf(login).accessToken}`);
+
+    expect(response.status).toBe(200);
+    expect(bodyOf(response).email).toBe('me@example.com');
+    expect(response.body).not.toHaveProperty('passwordHash');
+  });
+
+  it('rejects /auth/me with no bearer token at all', async () => {
+    const response = await request(server()).get('/auth/me');
+
+    expect(response.status).toBe(401);
+  });
+
+  it('rejects /auth/me with a malformed bearer token', async () => {
+    const response = await request(server()).get('/auth/me').set('Authorization', 'Bearer not-a-real-token');
+
+    expect(response.status).toBe(401);
+  });
+
+  it('accepts a token signed with the pinned HS256 algorithm', async () => {
+    await request(server()).post('/auth/register').send({
+      email: 'algcheck@example.com',
+      password: 'correct-horse-battery-staple',
+      fullName: 'Alg Check',
+    });
+    const login = await request(server())
+      .post('/auth/login')
+      .send({ email: 'algcheck@example.com', password: 'correct-horse-battery-staple' });
+
+    const response = await request(server())
+      .get('/auth/me')
+      .set('Authorization', `Bearer ${bodyOf(login).accessToken}`);
+
+    expect(response.status).toBe(200);
+  });
+
+  it('rejects a token signed with a different algorithm, even with the correct secret', async () => {
+    await request(server()).post('/auth/register').send({
+      email: 'wrongalg@example.com',
+      password: 'correct-horse-battery-staple',
+      fullName: 'Wrong Alg',
+    });
+
+    // Same JwtService instance the app uses, but explicitly signed with a
+    // different algorithm than JwtStrategy's pinned allow-list (HS256).
+    // If verification only checked the secret, this token would pass; the
+    // algorithm allow-list is what must reject it.
+    const jwtService = new JwtService({ secret: TEST_JWT_SECRET });
+    const foreignAlgorithmToken = await jwtService.signAsync(
+      { sub: 'does-not-matter', email: 'wrongalg@example.com', role: RoleName.LEARNER },
+      { algorithm: 'HS384' },
+    );
+
+    const response = await request(server())
+      .get('/auth/me')
+      .set('Authorization', `Bearer ${foreignAlgorithmToken}`);
+
+    expect(response.status).toBe(401);
+  });
+});
+
+================================================================================
+END OF REPORT
+================================================================================

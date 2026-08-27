@@ -2,7 +2,13 @@
   "extends": "@tubi/config/tsconfig/nestjs.json",
   "compilerOptions": {
     "rootDir": ".",
-    "outDir": "dist"
+    "outDir": "dist",
+    // The shared node-library base restricts ambient types to `node` only.
+    // Jest's globals (`describe`, `it`, `expect`, ...) are used exclusively
+    // in `*.spec.ts` files, which are excluded from the production build
+    // (see tsconfig.build.json) — adding `jest` here only widens what
+    // `pnpm typecheck` accepts, it changes nothing about what ships.
+    "types": ["node", "jest"]
   },
   // `prisma.config.ts` is included so that the type-check task covers it, but
   // it is excluded from the build project — it is tooling, not runtime code.
