@@ -1,0 +1,932 @@
+TUBI WORKSPACE — PHASE 2A FINAL DOMAIN DESIGN (CORRECTED)
+Frozen for external architecture review.
+Status: DESIGN ONLY. No application code, Prisma schema, migrations, or configuration
+files have been created or modified as part of this document.
+
+This revision incorporates four external-architecture-review corrections on top of
+the previously approved design. All other previously frozen founder rulings remain
+authoritative and unchanged.
+
+================================================================================
+ALL PREVIOUSLY FROZEN FOUNDER RULINGS (AUTHORITATIVE, UNCHANGED)
+================================================================================
+
+1. GradeLevel is a first-class entity.
+2. AcademicTerm is a first-class entity.
+3. Multiple teachers are supported at the data-model level, with exactly one
+   PRIMARY teacher and optional ASSISTANT or SUBSTITUTE teachers.
+4. Canceled sessions normally result in replacement sessions, not prorated
+   subscription credits or "sessions owed."
+5. The canonical school timezone is Africa/Johannesburg. Timestamps are stored
+   in UTC; the academic calendar day and the 23:59 attendance cutoff are
+   derived using Africa/Johannesburg.
+6. The normal attendance cutoff is 23:59 on the same academic day. Departures
+   from this (e.g. a late-published recording) require an explicit,
+   auditable admin/system attendance-window exception rather than an
+   automatic recalculation of every cutoff.
+7. Recorded attendance requires 100% completion of the recording timeline.
+   Anything below 100% does not count as session completion.
+8. Actual recording progress is tracked — opening a recording is not
+   sufficient to earn attendance.
+9. Session entitlement is determined at the session's entitlement point and
+   is preserved through that session's attendance window even if the
+   learner's subscription later expires. (Refined by Correction 2 below to
+   define the entitlement point precisely for canceled sessions.)
+10. Monthly subscription grants access to the learner's subscribed Offering;
+    individual lessons are never purchased separately.
+11. Live and recorded participation are two completion pathways for the SAME
+    academic Session — not two parallel systems.
+12. Homework is communicated during the teaching session itself; it is not
+    modeled as a standalone LMS-style task/button.
+13. TUBI is the online-school delivery/operations platform.
+14. HAPS remains a fully separate system, owning diagnostics, adaptive
+    learning, misconceptions, performance intelligence, remediation and
+    related learning-intelligence functionality. HAPS concepts are not
+    introduced into TUBI's domain model.
+15. Exactly one PRIMARY teacher per session is enforced as an
+    APPLICATION-LAYER invariant in Phase 2, not a database constraint. No
+    custom PostgreSQL partial unique index is introduced for this in
+    Phase 2.
+16. If TUBI cancels a session and schedules a replacement, learners entitled
+    to the original canceled session retain entitlement to the replacement
+    even if their subscription expires before the replacement date. A
+    learner must never lose a class because TUBI moved it. (Mechanism
+    finalized by Correction 2 below.)
+17. Recorded attendance requires genuine 100% coverage of the required
+    recording timeline. Reaching the final timestamp alone is NOT
+    sufficient. Progress is modeled around watched-interval coverage, not a
+    per-second row or a single counter.
+18. Attendance-window exceptions are supported both session-wide (e.g. a
+    platform/processing failure delaying a recording) and learner-specific
+    (e.g. an individual documented circumstance). Both are explicit,
+    auditable records — never a silent change to the normal rule.
+19. Teacher assignment roles (PRIMARY / ASSISTANT / SUBSTITUTE) do not imply
+    identical authorization. The domain model must not prevent this
+    distinction, even though exact authorization policy is implemented in
+    a later authorization phase. Attendance ordinarily arises from actual
+    live/recorded completion; manual attendance alteration is an
+    exceptional, auditable override, not a normal teacher register.
+
+================================================================================
+EXTERNAL ARCHITECTURE REVIEW — FOUR REQUIRED CORRECTIONS (AUTHORITATIVE)
+================================================================================
+
+20. AttendanceRecord.completionMode and AttendanceRecord.completedAt are
+    NULLABLE. An ABSENT or PENDING learner has not completed the session and
+    must never be assigned an invented completion mode or timestamp.
+21. A session's entitlement point is the EARLIER of its scheduled start time
+    or its cancellation time. This guarantees every session — including one
+    canceled before it was ever due to start — produces entitlement
+    snapshots that a replacement session can deterministically inherit from.
+22. SessionEntitlementSnapshot.inheritedFromSnapshotId is an ordinary indexed
+    nullable self-reference, NOT unique. Replacement chains of arbitrary
+    length (Original → Replacement A → Replacement B → ...) remain fully
+    traceable without an artificial one-child restriction.
+23. LIVE attendance requires cumulative live participation, overlapping the
+    scheduled [startTime, endTime] interval, of at least 50% of the
+    session's scheduled duration. A single join event or a "joined" boolean
+    is never sufficient. Participation is tracked via merged
+    LiveAttendanceInterval rows, analogous to WatchedInterval, so temporary
+    disconnects do not penalize the learner and reconnected time accumulates
+    toward the threshold.
+
+================================================================================
+A. FINAL ENTITY LIST
+================================================================================
+
+1.  User
+2.  Role (enum)
+3.  LearnerProfile
+4.  TeacherProfile
+5.  GradeLevel
+6.  Subject
+7.  AcademicTerm
+8.  Course
+9.  SessionTeacher (join entity, carries teacherRole)
+10. Offering
+11. OfferingCourse (join entity)
+12. Session
+13. SessionRecording
+14. WatchedInterval
+15. LiveAttendanceInterval (new — Correction 4)
+16. AttendanceRecord (revised — Correction 1)
+17. AttendanceOverride
+18. AttendanceWindowException
+19. SessionEntitlementSnapshot (revised — Corrections 2 & 3)
+20. SubscriptionAccess
+
+================================================================================
+B. PURPOSE AND KEY FIELDS
+================================================================================
+
+User
+  Purpose: authentication identity, one per human, regardless of role.
+  Fields: id, email (unique), passwordHash, role, fullName, isActive,
+          createdAt, updatedAt.
+
+LearnerProfile
+  Purpose: learner-specific data, 1:1 with a User.
+  Fields: id, userId (unique FK), dateOfBirth, guardianContact, createdAt.
+
+TeacherProfile
+  Purpose: teacher-specific data, 1:1 with a User.
+  Fields: id, userId (unique FK), bio, createdAt.
+
+GradeLevel
+  Purpose: first-class curricular grade taxonomy (e.g. "Grade 8").
+  Fields: id, name (unique).
+
+Subject
+  Purpose: curricular category (e.g. "Mathematics").
+  Fields: id, name (unique).
+
+AcademicTerm
+  Purpose: first-class academic period anchoring the school calendar and
+  the canonical timezone used for academic-day calculations.
+  Fields: id, name, startDate, endDate, timezone (default "Africa/Johannesburg").
+
+Course
+  Purpose: a specific taught unit for a term, linking Subject, GradeLevel
+  and AcademicTerm.
+  Fields: id, subjectId, gradeLevelId, academicTermId, primaryTeacherId
+          (default assignment new sessions inherit), title.
+
+SessionTeacher
+  Purpose: per-session teacher roster, supporting multiple teachers with
+  distinct roles.
+  Fields: sessionId, teacherId, teacherRole (PRIMARY / ASSISTANT / SUBSTITUTE).
+  Note: exactly-one-PRIMARY is an application-layer invariant only (ruling 15).
+
+Offering
+  Purpose: the sellable subscription product (not the curricular unit).
+  Fields: id, name, deliveryMode (LIVE_AND_RECORDED / RECORDED_ONLY),
+          monthlyPrice.
+
+OfferingCourse
+  Purpose: M:N join between Offering and Course.
+  Fields: offeringId, courseId.
+
+Session
+  Purpose: the atomic teaching event — the core object of the system.
+  Fields: id, courseId, sessionDate, startTime (UTC), endTime (UTC),
+          attendanceCutoffAt (UTC; derived from 23:59 Africa/Johannesburg on
+          sessionDate), liveMeetingUrl, status, canceledAt (UTC, nullable —
+          required by Correction 2's entitlement-point rule),
+          replacementForSessionId (nullable self-relation, for cancellation
+          -> replacement).
+
+SessionRecording
+  Purpose: the recording artifact for a Session, with its own lifecycle
+  independent of the Session's own status.
+  Fields: id, sessionId (unique), recordingUrl, availableFrom (UTC),
+          totalSeconds (authoritative timeline length used for coverage).
+
+WatchedInterval
+  Purpose: compact, merged record of actually-watched playback ranges per
+  learner per recording — the mechanism behind genuine 100% coverage.
+  Fields: id, sessionRecordingId, learnerId, startSecond, endSecond.
+  Multiple merged, non-overlapping rows per (recording, learner) — never one
+  row per second.
+
+LiveAttendanceInterval (NEW — Correction 4)
+  Purpose: compact, merged record of actual live-session participation
+  ranges per learner per session, the mechanism behind the 50%
+  cumulative-duration LIVE attendance threshold.
+  Fields: id, sessionId, learnerId, joinedAt (UTC), leftAt (UTC, nullable
+          while the connection is still open).
+  Multiple merged, non-overlapping rows per (session, learner) — a
+  reconnect after a disconnect produces an additional interval that is
+  merged with adjacent ones, never a single "joined" boolean.
+
+AttendanceRecord (REVISED — Correction 1)
+  Purpose: the single record per learner per session representing whether
+  and how they completed it.
+  Fields: id, sessionId, learnerId, completionMode (LIVE / RECORDED,
+          NULLABLE), completedAt (NULLABLE), status, createdAt.
+  Note: completionMode and completedAt are populated ONLY when status
+        transitions to PRESENT. An ABSENT or PENDING record always carries
+        completionMode = null and completedAt = null — no invented
+        completion mode or timestamp is ever assigned to a learner who did
+        not complete the session.
+
+AttendanceOverride
+  Purpose: auditable manual correction to an AttendanceRecord's status.
+  Fields: id, attendanceRecordId, previousStatus, newStatus,
+          performedByUserId, reason, createdAt.
+  Note: never a silent mutation — always leaves an explicit trail.
+
+AttendanceWindowException
+  Purpose: auditable, explicit extension of a session's attendance cutoff,
+  either session-wide or learner-specific.
+  Fields: id, sessionId, learnerId (nullable — null = session-wide, set =
+          learner-specific), reason, extendedCutoffAt, grantedByUserId,
+          note, createdAt.
+
+SessionEntitlementSnapshot (REVISED — Corrections 2 & 3)
+  Purpose: freezes a learner's eligibility for a session at that session's
+  entitlement point, with an ordinary (non-unique) inheritance reference so
+  arbitrarily long replacement chains remain traceable.
+  Fields: id, sessionId, learnerId, subscriptionAccessId (nullable),
+          wasEntitled, snapshotAt, inheritedFromSnapshotId (nullable,
+          ordinary indexed self-reference — NOT unique; see Correction 3).
+  Note: snapshotAt reflects the session's entitlement point, defined as
+        MIN(session.startTime, session.canceledAt) — see Correction 2 and
+        section J.
+
+SubscriptionAccess
+  Purpose: the monthly subscription grant to an Offering — never a
+  per-lesson purchase.
+  Fields: id, learnerId, offeringId, status, currentPeriodStart,
+          currentPeriodEnd.
+
+================================================================================
+C. RELATIONSHIPS AND CARDINALITIES
+================================================================================
+
+User               1:1   LearnerProfile
+User               1:1   TeacherProfile
+
+GradeLevel         1:N   Course
+AcademicTerm       1:N   Course
+Subject            1:N   Course
+TeacherProfile     1:N   Course (as primaryTeacher)
+
+Course             1:N   Session
+Course             M:N   Offering (via OfferingCourse)
+
+Session            M:N   TeacherProfile (via SessionTeacher, carries teacherRole)
+Session            1:1   Session (self, replacementForSessionId, nullable)
+Session            1:1   SessionRecording (optional)
+Session            1:N   AttendanceRecord
+Session            1:N   AttendanceWindowException
+Session            1:N   SessionEntitlementSnapshot
+Session            1:N   LiveAttendanceInterval
+
+SessionRecording   1:N   WatchedInterval
+
+AttendanceRecord   1:N   AttendanceOverride
+
+LearnerProfile     1:N   AttendanceRecord
+LearnerProfile     1:N   WatchedInterval
+LearnerProfile     1:N   LiveAttendanceInterval
+LearnerProfile     1:N   SubscriptionAccess
+LearnerProfile     1:N   SessionEntitlementSnapshot
+LearnerProfile     1:N   AttendanceWindowException (when learner-specific)
+
+Offering           1:N   SubscriptionAccess
+
+SessionEntitlementSnapshot  1:N  SessionEntitlementSnapshot
+                                  (self, inheritedFromSnapshotId, nullable,
+                                  ordinary indexed reference — NOT unique;
+                                  see Correction 3. In practice each
+                                  snapshot typically has zero or one
+                                  child, mirroring the one-replacement-per-
+                                  session rule, but this is a data
+                                  consequence, not a schema constraint.)
+
+================================================================================
+D. ENUMS
+================================================================================
+
+RoleName:            ADMIN, TEACHER, LEARNER
+DeliveryMode:         LIVE_AND_RECORDED, RECORDED_ONLY
+SessionStatus:        SCHEDULED, LIVE, ENDED, CANCELED
+TeacherRole:          PRIMARY, ASSISTANT, SUBSTITUTE
+CompletionMode:       LIVE, RECORDED
+AttendanceStatus:     PENDING, PRESENT, ABSENT
+SubscriptionStatus:   ACTIVE, PAST_DUE, CANCELED, EXPIRED
+ExceptionReason:      RECORDING_PROCESSING_DELAY, PLATFORM_OUTAGE,
+                      LEARNER_CIRCUMSTANCE, OTHER
+
+================================================================================
+E. CONSTRAINTS, INDEXES, APPLICATION-LAYER INVARIANTS
+================================================================================
+
+Database-enforced:
+- User.email — unique
+- LearnerProfile.userId, TeacherProfile.userId — unique
+- SessionRecording.sessionId — unique
+- AttendanceRecord (sessionId, learnerId) — unique composite
+- SessionEntitlementSnapshot (sessionId, learnerId) — unique composite
+- Session.replacementForSessionId — unique (a canceled session has at most
+  one replacement)
+- Index: Session (courseId, sessionDate)
+- Index: WatchedInterval (sessionRecordingId, learnerId)
+- Index: LiveAttendanceInterval (sessionId, learnerId)
+- Index: AttendanceWindowException (sessionId, learnerId)
+- Index: SessionEntitlementSnapshot.inheritedFromSnapshotId (NOT unique —
+  Correction 3)
+
+Application-layer only (explicit founder ruling, not database constraints):
+- Exactly one SessionTeacher with teacherRole = PRIMARY per session — the
+  service layer rejects any write that would leave zero or more than one.
+  No custom PostgreSQL partial unique index is introduced for this in
+  Phase 2 (ruling 15).
+- WatchedInterval merge-on-write logic (no database-level interval
+  constraint).
+- LiveAttendanceInterval merge-on-write logic and 50%-of-scheduled-duration
+  threshold calculation (no database-level interval constraint).
+- AttendanceRecord: completionMode and completedAt must be set together
+  (both null, or both populated) and only in the transition to PRESENT —
+  enforced in the service layer (Correction 1).
+- AttendanceOverride must always be paired with a status change on
+  AttendanceRecord — never written standalone.
+- AttendanceWindowException: a learner-specific exception takes precedence
+  over a session-wide one for that learner, if both exist for the same
+  session.
+- A session's entitlement point (the moment SessionEntitlementSnapshot rows
+  are produced) is MIN(session.startTime, session.canceledAt) — computed
+  and enforced by the service layer, never left to a database trigger
+  (Correction 2).
+
+================================================================================
+F. SESSION LIFECYCLE
+================================================================================
+
+    SCHEDULED -> LIVE -> ENDED
+                       \-> CANCELED
+
+CANCELED is reachable from SCHEDULED or LIVE. Session.canceledAt is set the
+moment a session enters CANCELED, regardless of how close to or far from its
+scheduled startTime that occurs — including before the session was ever due
+to start. This field is what makes the entitlement point in Correction 2
+well-defined for every session, cancelled or not.
+
+CANCELED sessions produce no AttendanceRecord rows once canceled. Their
+entitlement snapshots ARE produced (see section I/J) — cancellation does not
+suppress entitlement evaluation, it only redefines when that evaluation
+happens.
+
+================================================================================
+G. ATTENDANCE LIFECYCLE — LIVE AND RECORDED
+================================================================================
+
+AttendanceRecord creation and states (Correction 1 fully applied):
+
+- At creation (the point a learner becomes eligible for tracking on a
+  session — see section I):
+      status = PENDING
+      completionMode = null
+      completedAt = null
+
+- If successful completion occurs before the effective cutoff:
+      status = PRESENT
+      completionMode = LIVE or RECORDED (whichever pathway qualified)
+      completedAt = the actual completion timestamp
+
+- If the effective cutoff passes without qualifying completion:
+      status = ABSENT
+      completionMode = null
+      completedAt = null
+
+No completion mode or timestamp is ever invented for an ABSENT or still-
+PENDING learner.
+
+Qualification for PRESENT:
+
+- LIVE: cumulative LiveAttendanceInterval coverage overlapping
+  [session.startTime, session.endTime] reaches at least 50% of the
+  session's scheduled duration (endTime - startTime). See section H2 for
+  the calculation mechanism. Reaching 50% at any point during or shortly
+  after the live window (before the effective cutoff) qualifies; a single
+  join, or a join lasting under the 50% threshold, does not.
+- RECORDED: merged WatchedInterval coverage for (recording, learner)
+  equals 100% of totalSeconds, AND the completion timestamp is at or
+  before the effective cutoff for that learner on that session
+  (unchanged from the prior design).
+
+Effective cutoff resolution (evaluated per learner, per session):
+  1. If a learner-specific AttendanceWindowException exists for
+     (sessionId, learnerId) -> use its extendedCutoffAt.
+  2. Else if a session-wide AttendanceWindowException exists
+     (learnerId IS NULL) -> use its extendedCutoffAt.
+  3. Else -> use Session.attendanceCutoffAt (the normal 23:59
+     Africa/Johannesburg rule).
+
+Manual correction: any change to AttendanceRecord.status outside the above
+derivation must be accompanied by an AttendanceOverride row (previous
+status, new status, who, why). An override that sets status to PRESENT
+must also supply completionMode and completedAt; an override that sets
+status to ABSENT or PENDING must null both — the same invariant from
+Correction 1 applies to overrides, not only to system-derived transitions.
+Overrides are exceptional — the ordinary path to PRESENT/ABSENT is always
+the derivation above, never a teacher "register" toggle (ruling 19).
+
+Exactly one AttendanceRecord exists per (session, learner) regardless of
+completion mode — live and recorded participation remain two pathways to
+the SAME record, not two parallel systems. A learner who qualifies live and
+later also rewatches the recording keeps one row; a later recording-watch
+must never downgrade an existing PRESENT.
+
+================================================================================
+H. RECORDING PROGRESS AND LIVE-PARTICIPATION TRACKING
+================================================================================
+
+H1. Recorded — genuine 100% timeline coverage (unchanged from prior design)
+
+Mechanism: WatchedInterval stores merged, non-overlapping [startSecond,
+endSecond) ranges per (sessionRecordingId, learnerId).
+
+Write path: the player periodically reports a played range. The service
+fetches existing intervals, merges the new range with any overlapping or
+adjacent ones, and replaces the affected rows in one transaction. A learner
+watching linearly ends up with one row; a learner who skips around ends up
+with a handful of merged rows — never thousands.
+
+Coverage calculation: sum(endSecond - startSecond) across all intervals,
+compared against totalSeconds. Jumping from minute 2 to minute 58 of a
+60-minute recording produces roughly 4 minutes of coverage, nowhere near
+100%, regardless of the playhead having touched the final timestamp.
+
+Completion event: the moment merged coverage first reaches >= totalSeconds,
+the service computes the RECORDED AttendanceRecord completion (subject to
+the effective cutoff in section G), setting completionMode = RECORDED and
+completedAt to that moment.
+
+H2. Live — cumulative 50%-of-scheduled-duration coverage (NEW — Correction 4)
+
+Mechanism: LiveAttendanceInterval stores merged, non-overlapping
+[joinedAt, leftAt) ranges per (sessionId, learnerId), directly analogous to
+WatchedInterval.
+
+Write path: the live-meeting integration reports join and leave events (or
+periodic heartbeats while connected). The service:
+  1. On join: opens a new interval with leftAt = null (connection currently
+     open).
+  2. On leave, disconnect, or heartbeat timeout: closes the open interval by
+     setting leftAt to the last-known-connected timestamp.
+  3. On reconnect: opens a new interval rather than reusing the closed one —
+     merge-on-write then coalesces adjacent/overlapping intervals exactly as
+     WatchedInterval does, so a brief disconnect-and-reconnect does not
+     fragment the record beyond what the merge collapses back down.
+
+A learner who stays connected throughout ends up with one interval; a
+learner who disconnects and reconnects several times ends up with a
+handful of merged intervals — never a row per heartbeat.
+
+Coverage calculation:
+  1. Clip every LiveAttendanceInterval to the scheduled window
+     [session.startTime, session.endTime] — participation before startTime
+     or after endTime does not count toward the threshold.
+  2. Sum the clipped, merged interval durations.
+  3. Compare against 50% of (session.endTime - session.startTime).
+
+Qualification event: the moment cumulative clipped coverage first reaches
+>= 50% of scheduled duration, the service computes the LIVE
+AttendanceRecord completion (subject to the effective cutoff in section G),
+setting completionMode = LIVE and completedAt to that moment. A single
+one-minute join, or any cumulative total under the 50% threshold, never
+qualifies — there is no "joined" boolean anywhere in this design.
+
+Temporary disconnects do not penalize the learner: because coverage is
+cumulative across all merged intervals rather than dependent on one
+continuous connection, a learner who is briefly dropped and reconnects
+keeps every minute already accumulated.
+
+================================================================================
+I. SUBSCRIPTION AND SESSIONENTITLEMENT LIFECYCLE
+================================================================================
+
+1. Every session has a well-defined entitlement point:
+       entitlementPoint = MIN(session.startTime, session.canceledAt)
+   For a session that is never canceled, this is simply session.startTime
+   (session.canceledAt is null, so the MIN degenerates to startTime). For a
+   session canceled before its scheduled start, this is session.canceledAt
+   — the entitlement point moves earlier rather than never occurring
+   (Correction 2).
+2. At the entitlement point, for each learner with an ACTIVE
+   SubscriptionAccess covering that session's Course (via
+   Offering/OfferingCourse) at that moment, the service writes a
+   SessionEntitlementSnapshot with wasEntitled = true, subscriptionAccessId
+   set, inheritedFromSnapshotId = null, snapshotAt = entitlementPoint.
+3. For the remainder of that session's attendance window (through its
+   effective cutoff), all access/attendance checks consult this snapshot,
+   not live SubscriptionAccess status — so a subscription lapsing
+   mid-window never revokes access to a session already entitled
+   (ruling 9).
+4. Live SubscriptionAccess status still governs entitlement for any future
+   session's own entitlement point.
+5. Because every session — cancelled or not, and regardless of how early
+   the cancellation occurred — has a deterministic entitlement point under
+   rule 1, every cancelled session is guaranteed to have produced
+   SessionEntitlementSnapshot rows that a replacement session can
+   deterministically inherit from (see section J). There is no scenario in
+   which a session is cancelled too early for entitlement to have been
+   evaluated.
+
+================================================================================
+J. CANCELLATION AND REPLACEMENT-SESSION LIFECYCLE
+================================================================================
+
+1. Session is marked CANCELED; session.canceledAt is set to the
+   cancellation timestamp.
+2. If the session's entitlement point (section I) had not yet been reached
+   under the old start-time-only rule, cancellation itself now retroactively
+   IS the entitlement point (entitlementPoint = MIN(startTime, canceledAt)),
+   and the service evaluates and writes SessionEntitlementSnapshot rows at
+   this moment for every learner who holds qualifying SubscriptionAccess —
+   exactly as it would have done at the original scheduled start. This
+   resolves Correction 2: cancellation before scheduled start no longer
+   skips entitlement evaluation, it simply relocates it.
+3. No AttendanceRecord rows are created for a CANCELED session.
+4. A replacement Session is created with replacementForSessionId pointing
+   at the canceled session.
+5. Entitlement carry-over (ruling 16, mechanism finalized): for each
+   learner who has SessionEntitlementSnapshot.wasEntitled = true on the
+   canceled session (guaranteed to exist per step 2), the service writes a
+   new SessionEntitlementSnapshot on the replacement session with
+   wasEntitled = true and inheritedFromSnapshotId pointing at the original
+   snapshot — copied, not recalculated from the learner's subscription
+   status as of the replacement date. This guarantees a learner never loses
+   access to the replacement merely because TUBI cancelled the original
+   before its scheduled start, or at all.
+6. inheritedFromSnapshotId is an ordinary indexed nullable self-reference,
+   not unique (Correction 3). This allows the chain Original → Replacement A
+   → Replacement B → ... to extend indefinitely: Replacement B's snapshot
+   inherits from Replacement A's snapshot, which itself inherits from the
+   Original's snapshot, and the full ancestry remains traceable by walking
+   inheritedFromSnapshotId however many levels deep the chain of
+   cancellations and replacements goes.
+7. Any learner who was not entitled to the canceled session is evaluated
+   fresh against their live SubscriptionAccess at the replacement session's
+   own entitlement point, exactly as for any ordinary new session.
+8. No prorated subscription credit or "sessions owed" concept exists
+   anywhere in this model (ruling 4) — the replacement session IS the
+   remedy.
+
+================================================================================
+K. ATTENDANCE-WINDOW EXCEPTION MODEL
+================================================================================
+
+- Single entity (AttendanceWindowException), disambiguated by nullable
+  learnerId:
+    * learnerId = NULL  -> session-wide exception (e.g. a platform-wide
+      recording-processing delay).
+    * learnerId set     -> exception for one specific learner (e.g. an
+      individual documented circumstance).
+- Both scopes carry reason (enum), extendedCutoffAt, grantedByUserId,
+  optional note, and createdAt — fully auditable, always an explicit row,
+  never a silent recalculation of Session.attendanceCutoffAt itself.
+- Resolution order when computing a learner's effective cutoff:
+  learner-specific exception first, then session-wide exception, then the
+  normal 23:59 Africa/Johannesburg rule (section G).
+
+================================================================================
+L. TEACHER-ASSIGNMENT AND AUTHORIZATION IMPLICATIONS
+================================================================================
+
+The domain model does not implement authorization (deferred to the
+authorization phase), but it does not foreclose the required distinctions:
+
+- SessionTeacher.teacherRole (PRIMARY / ASSISTANT / SUBSTITUTE) is
+  queryable per session independent of Course.primaryTeacherId, so a
+  future authorization layer can grant different capabilities per role,
+  per session, without a schema change.
+- SUBSTITUTE assignments are scoped to SessionTeacher rows (per-session),
+  never written to Course.primaryTeacherId — so a substitute never becomes
+  a permanent course owner structurally.
+- Manual attendance correction is modeled as AttendanceOverride, a
+  distinct, auditable entity from the ordinary derived AttendanceRecord —
+  so a future authorization policy can restrict who may create an override
+  (e.g. PRIMARY and ADMIN only) without that restriction needing to live in
+  the domain schema itself.
+- PRIMARY carries full operational responsibility for the assigned
+  session/course; ASSISTANT may participate in teaching and appropriate
+  operational activities without automatically receiving high-impact
+  administrative authority; SUBSTITUTE receives appropriate temporary
+  operational access to the assigned session without becoming a permanent
+  course owner (ruling 19). Exact authorization policies are implemented in
+  the authorization phase.
+
+================================================================================
+M. COMPLETE FINAL PRISMA-STYLE SCHEMA PROPOSAL (PLAIN TEXT — NOT IMPLEMENTED)
+================================================================================
+
+enum RoleName {
+  ADMIN
+  TEACHER
+  LEARNER
+}
+
+enum DeliveryMode {
+  LIVE_AND_RECORDED
+  RECORDED_ONLY
+}
+
+enum SessionStatus {
+  SCHEDULED
+  LIVE
+  ENDED
+  CANCELED
+}
+
+enum TeacherRole {
+  PRIMARY
+  ASSISTANT
+  SUBSTITUTE
+}
+
+enum CompletionMode {
+  LIVE
+  RECORDED
+}
+
+enum AttendanceStatus {
+  PENDING
+  PRESENT
+  ABSENT
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  EXPIRED
+}
+
+enum ExceptionReason {
+  RECORDING_PROCESSING_DELAY
+  PLATFORM_OUTAGE
+  LEARNER_CIRCUMSTANCE
+  OTHER
+}
+
+model User {
+  id             String   @id @default(uuid())
+  email          String   @unique
+  passwordHash   String
+  role           RoleName
+  fullName       String
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  learnerProfile LearnerProfile?
+  teacherProfile TeacherProfile?
+}
+
+model LearnerProfile {
+  id                   String   @id @default(uuid())
+  userId               String   @unique
+  user                 User     @relation(fields: [userId], references: [id])
+  dateOfBirth          DateTime?
+  guardianContact      String?
+  createdAt            DateTime @default(now())
+
+  attendanceRecords    AttendanceRecord[]
+  watchedIntervals     WatchedInterval[]
+  liveAttendanceIntervals LiveAttendanceInterval[]
+  subscriptionAccess   SubscriptionAccess[]
+  entitlementSnapshots SessionEntitlementSnapshot[]
+  windowExceptions     AttendanceWindowException[]
+}
+
+model TeacherProfile {
+  id              String   @id @default(uuid())
+  userId          String   @unique
+  user            User     @relation(fields: [userId], references: [id])
+  bio             String?
+  createdAt       DateTime @default(now())
+
+  primaryCourses  Course[]         @relation("CoursePrimaryTeacher")
+  sessionTeaching SessionTeacher[]
+}
+
+model GradeLevel {
+  id      String   @id @default(uuid())
+  name    String   @unique
+  courses Course[]
+}
+
+model AcademicTerm {
+  id        String   @id @default(uuid())
+  name      String
+  startDate DateTime @db.Date
+  endDate   DateTime @db.Date
+  timezone  String   @default("Africa/Johannesburg")
+  courses   Course[]
+}
+
+model Subject {
+  id      String   @id @default(uuid())
+  name    String   @unique
+  courses Course[]
+}
+
+model Course {
+  id               String       @id @default(uuid())
+  subjectId        String
+  subject          Subject      @relation(fields: [subjectId], references: [id])
+  gradeLevelId     String
+  gradeLevel       GradeLevel   @relation(fields: [gradeLevelId], references: [id])
+  academicTermId   String
+  academicTerm     AcademicTerm @relation(fields: [academicTermId], references: [id])
+  primaryTeacherId String
+  primaryTeacher   TeacherProfile @relation("CoursePrimaryTeacher", fields: [primaryTeacherId], references: [id])
+  title            String
+
+  sessions         Session[]
+  offerings        OfferingCourse[]
+}
+
+model Offering {
+  id            String       @id @default(uuid())
+  name          String
+  deliveryMode  DeliveryMode
+  monthlyPrice  Decimal
+
+  courses       OfferingCourse[]
+  subscriptions SubscriptionAccess[]
+}
+
+model OfferingCourse {
+  offeringId String
+  courseId   String
+  offering   Offering @relation(fields: [offeringId], references: [id])
+  course     Course   @relation(fields: [courseId], references: [id])
+
+  @@id([offeringId, courseId])
+}
+
+model Session {
+  id                      String        @id @default(uuid())
+  courseId                String
+  course                  Course        @relation(fields: [courseId], references: [id])
+  sessionDate             DateTime      @db.Date
+  startTime               DateTime               // UTC
+  endTime                 DateTime               // UTC
+  attendanceCutoffAt      DateTime               // UTC; derived from 23:59 Africa/Johannesburg on sessionDate
+  liveMeetingUrl          String
+  status                  SessionStatus @default(SCHEDULED)
+  canceledAt              DateTime?              // UTC; sets the entitlement point when set (Correction 2)
+
+  replacementForSessionId String?       @unique
+  replacementForSession   Session?      @relation("SessionReplacement", fields: [replacementForSessionId], references: [id])
+  replacementSession      Session?      @relation("SessionReplacement")
+
+  teachers                SessionTeacher[]
+  recording               SessionRecording?
+  attendanceRecords       AttendanceRecord[]
+  windowExceptions        AttendanceWindowException[]
+  entitlementSnapshots    SessionEntitlementSnapshot[]
+  liveAttendanceIntervals LiveAttendanceInterval[]
+
+  @@index([courseId, sessionDate])
+}
+
+model SessionTeacher {
+  sessionId   String
+  teacherId   String
+  teacherRole TeacherRole
+  session     Session        @relation(fields: [sessionId], references: [id])
+  teacher     TeacherProfile @relation(fields: [teacherId], references: [id])
+
+  @@id([sessionId, teacherId])
+  // Exactly-one-PRIMARY-per-session is enforced in the service layer, not the DB.
+}
+
+model SessionRecording {
+  id            String   @id @default(uuid())
+  sessionId     String   @unique
+  session       Session  @relation(fields: [sessionId], references: [id])
+  recordingUrl  String
+  availableFrom DateTime           // UTC
+  totalSeconds  Int
+
+  watchedIntervals WatchedInterval[]
+}
+
+model WatchedInterval {
+  id                 String   @id @default(uuid())
+  sessionRecordingId String
+  recording          SessionRecording @relation(fields: [sessionRecordingId], references: [id])
+  learnerId          String
+  learner            LearnerProfile   @relation(fields: [learnerId], references: [id])
+  startSecond        Int
+  endSecond          Int
+
+  @@index([sessionRecordingId, learnerId])
+  // Rows are merged/coalesced on write; coverage = sum(endSecond - startSecond) vs totalSeconds.
+}
+
+model LiveAttendanceInterval {
+  id        String    @id @default(uuid())
+  sessionId String
+  session   Session   @relation(fields: [sessionId], references: [id])
+  learnerId String
+  learner   LearnerProfile @relation(fields: [learnerId], references: [id])
+  joinedAt  DateTime            // UTC
+  leftAt    DateTime?           // UTC; null while the connection is open
+
+  @@index([sessionId, learnerId])
+  // Rows are merged/coalesced on write; coverage = sum of clipped, merged
+  // durations within [session.startTime, session.endTime], compared
+  // against 50% of scheduled duration.
+}
+
+model AttendanceRecord {
+  id             String            @id @default(uuid())
+  sessionId      String
+  session        Session           @relation(fields: [sessionId], references: [id])
+  learnerId      String
+  learner        LearnerProfile    @relation(fields: [learnerId], references: [id])
+  completionMode CompletionMode?              // nullable — Correction 1
+  completedAt    DateTime?                    // nullable — Correction 1
+  status         AttendanceStatus  @default(PENDING)
+  createdAt      DateTime          @default(now())
+
+  overrides      AttendanceOverride[]
+
+  @@unique([sessionId, learnerId])
+  @@index([status])
+  // completionMode and completedAt are set together only when status = PRESENT;
+  // both remain null for PENDING and ABSENT (service-layer invariant).
+}
+
+model AttendanceOverride {
+  id                 String           @id @default(uuid())
+  attendanceRecordId String
+  attendanceRecord   AttendanceRecord @relation(fields: [attendanceRecordId], references: [id])
+  previousStatus     AttendanceStatus
+  newStatus          AttendanceStatus
+  performedByUserId  String
+  reason             String
+  createdAt          DateTime         @default(now())
+}
+
+model AttendanceWindowException {
+  id               String          @id @default(uuid())
+  sessionId        String
+  session          Session         @relation(fields: [sessionId], references: [id])
+  learnerId        String?
+  learner          LearnerProfile? @relation(fields: [learnerId], references: [id])
+  reason           ExceptionReason
+  extendedCutoffAt DateTime               // UTC
+  grantedByUserId  String
+  note             String?
+  createdAt        DateTime        @default(now())
+
+  @@index([sessionId, learnerId])
+}
+
+model SessionEntitlementSnapshot {
+  id                      String   @id @default(uuid())
+  sessionId               String
+  session                 Session  @relation(fields: [sessionId], references: [id])
+  learnerId               String
+  learner                 LearnerProfile @relation(fields: [learnerId], references: [id])
+  subscriptionAccessId    String?
+  wasEntitled             Boolean
+  snapshotAt              DateTime @default(now())   // UTC; = MIN(session.startTime, session.canceledAt)
+
+  inheritedFromSnapshotId String?  // ordinary indexed self-reference — NOT unique (Correction 3)
+  inheritedFromSnapshot   SessionEntitlementSnapshot?  @relation("EntitlementInheritance", fields: [inheritedFromSnapshotId], references: [id])
+  inheritedBySnapshots    SessionEntitlementSnapshot[] @relation("EntitlementInheritance")
+
+  @@unique([sessionId, learnerId])
+  @@index([inheritedFromSnapshotId])
+}
+
+model SubscriptionAccess {
+  id                   String             @id @default(uuid())
+  learnerId            String
+  learner              LearnerProfile     @relation(fields: [learnerId], references: [id])
+  offeringId           String
+  offering             Offering           @relation(fields: [offeringId], references: [id])
+  status               SubscriptionStatus
+  currentPeriodStart   DateTime
+  currentPeriodEnd     DateTime
+
+  entitlementSnapshots SessionEntitlementSnapshot[]
+
+  @@index([learnerId, offeringId])
+}
+
+================================================================================
+N. FUNCTIONALITY DELIBERATELY EXCLUDED / DEFERRED FROM PHASE 2A
+================================================================================
+
+- HAPS (diagnostics, adaptive learning, misconceptions, performance
+  intelligence, remediation) — permanently out of TUBI's scope, not merely
+  deferred.
+- Homework as a standalone task/button entity — homework remains a
+  teaching-session concept, not modeled as domain data yet.
+- Billing/payment-processor internals (invoices, transactions, payment
+  methods) — SubscriptionAccess is the access grant only; a payment
+  processor feeds it, not part of this schema.
+- Grade/Term reporting rollups beyond direct foreign-key relationships
+  (e.g. cross-term analytics).
+- Waitlists, session capacity limits, scheduling-conflict detection.
+- Notifications, reminders, calendar sync/export.
+- Exact numeric tolerance for "100% watched" or "50% live" (e.g. player
+  buffering/heartbeat rounding at the boundary) — an implementation detail
+  for the build phase, not a schema concern.
+- Fine-grained authorization policy per TeacherRole (who can create
+  overrides, exceptions, edit courses) — the schema supports the
+  distinction; the policy itself is the authorization phase's job.
+- API endpoints, services, controllers, guards, frontend code, and
+  database migrations — none of this is implemented in Phase 2A.
+
+================================================================================
+
+PHASE 2A FINAL DESIGN CORRECTED AND READY FOR FREEZE
