@@ -27,9 +27,17 @@ function getTimezoneOffsetMinutes(timeZone: string, instant: Date): number {
   });
 
   const parts = formatter.formatToParts(instant);
-  const get = (type: string): number => Number(parts.find((part) => part.type === type)?.value ?? '0');
+  const get = (type: string): number =>
+    Number(parts.find((part) => part.type === type)?.value ?? '0');
 
-  const asIfUtc = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second'));
+  const asIfUtc = Date.UTC(
+    get('year'),
+    get('month') - 1,
+    get('day'),
+    get('hour'),
+    get('minute'),
+    get('second'),
+  );
 
   return (asIfUtc - instant.getTime()) / 60_000;
 }

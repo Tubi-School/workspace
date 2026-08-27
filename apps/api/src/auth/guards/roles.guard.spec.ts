@@ -41,7 +41,9 @@ describe('RolesGuard', () => {
     const reflector = { getAllAndOverride: () => [RoleName.ADMIN] } as unknown as Reflector;
     const guard = new RolesGuard(reflector);
 
-    expect(() => guard.canActivate(buildContext(buildUser(RoleName.LEARNER)))).toThrow(ForbiddenException);
+    expect(() => guard.canActivate(buildContext(buildUser(RoleName.LEARNER)))).toThrow(
+      ForbiddenException,
+    );
   });
 
   it('denies access when roles are required but there is no authenticated user', () => {

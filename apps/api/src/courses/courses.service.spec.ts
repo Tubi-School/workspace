@@ -16,7 +16,13 @@ describe('CoursesService', () => {
     gradeLevel: { findUnique: jest.Mock };
     academicTerm: { findUnique: jest.Mock };
     teacherProfile: { findUnique: jest.Mock };
-    course: { create: jest.Mock; findUnique: jest.Mock; findMany: jest.Mock; update: jest.Mock; delete: jest.Mock };
+    course: {
+      create: jest.Mock;
+      findUnique: jest.Mock;
+      findMany: jest.Mock;
+      update: jest.Mock;
+      delete: jest.Mock;
+    };
     session: { count: jest.Mock };
   };
   let service: CoursesService;
@@ -34,7 +40,13 @@ describe('CoursesService', () => {
       gradeLevel: { findUnique: jest.fn() },
       academicTerm: { findUnique: jest.fn() },
       teacherProfile: { findUnique: jest.fn() },
-      course: { create: jest.fn(), findUnique: jest.fn(), findMany: jest.fn(), update: jest.fn(), delete: jest.fn() },
+      course: {
+        create: jest.fn(),
+        findUnique: jest.fn(),
+        findMany: jest.fn(),
+        update: jest.fn(),
+        delete: jest.fn(),
+      },
       session: { count: jest.fn() },
     };
     service = new CoursesService(prisma as unknown as PrismaService);
@@ -43,7 +55,11 @@ describe('CoursesService', () => {
   describe('create', () => {
     it('creates a course when every referenced entity exists', async () => {
       mockAllReferencesExist();
-      prisma.course.create.mockResolvedValue({ id: 'course-1', title: 'Grade 8 Mathematics', ...VALID_IDS });
+      prisma.course.create.mockResolvedValue({
+        id: 'course-1',
+        title: 'Grade 8 Mathematics',
+        ...VALID_IDS,
+      });
 
       await expect(
         service.create({ ...VALID_IDS, title: 'Grade 8 Mathematics' }),
@@ -54,7 +70,9 @@ describe('CoursesService', () => {
       mockAllReferencesExist();
       prisma.teacherProfile.findUnique.mockResolvedValue(null);
 
-      await expect(service.create({ ...VALID_IDS, title: 'Course' })).rejects.toBeInstanceOf(NotFoundException);
+      await expect(service.create({ ...VALID_IDS, title: 'Course' })).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
       expect(prisma.course.create).not.toHaveBeenCalled();
     });
 
@@ -74,7 +92,10 @@ describe('CoursesService', () => {
       expect(caught).toBeInstanceOf(NotFoundException);
       const response = caught?.getResponse() as { message: string[] };
       expect(response.message).toEqual(
-        expect.arrayContaining([expect.stringContaining('subjectId'), expect.stringContaining('gradeLevelId')]),
+        expect.arrayContaining([
+          expect.stringContaining('subjectId'),
+          expect.stringContaining('gradeLevelId'),
+        ]),
       );
       expect(prisma.course.create).not.toHaveBeenCalled();
     });
@@ -93,9 +114,9 @@ describe('CoursesService', () => {
       prisma.course.findUnique.mockResolvedValue({ id: 'course-1', ...VALID_IDS, title: 'Course' });
       prisma.subject.findUnique.mockResolvedValue(null);
 
-      await expect(service.update('course-1', { subjectId: 'ghost-subject' })).rejects.toBeInstanceOf(
-        NotFoundException,
-      );
+      await expect(
+        service.update('course-1', { subjectId: 'ghost-subject' }),
+      ).rejects.toBeInstanceOf(NotFoundException);
     });
   });
 

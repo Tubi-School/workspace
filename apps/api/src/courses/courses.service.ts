@@ -131,7 +131,9 @@ export class CoursesService {
       checks.push(
         this.prisma.teacherProfile
           .findUnique({ where: { id: dto.primaryTeacherId } })
-          .then((found) => (found ? null : `primaryTeacherId ${dto.primaryTeacherId} does not exist`)),
+          .then((found) =>
+            found ? null : `primaryTeacherId ${dto.primaryTeacherId} does not exist`,
+          ),
       );
     }
 

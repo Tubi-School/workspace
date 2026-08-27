@@ -10,7 +10,13 @@ function buildGradeLevel(overrides: Partial<GradeLevel> = {}): GradeLevel {
 
 describe('GradeLevelsService', () => {
   let prisma: {
-    gradeLevel: { findUnique: jest.Mock; findMany: jest.Mock; create: jest.Mock; update: jest.Mock; delete: jest.Mock };
+    gradeLevel: {
+      findUnique: jest.Mock;
+      findMany: jest.Mock;
+      create: jest.Mock;
+      update: jest.Mock;
+      delete: jest.Mock;
+    };
     course: { count: jest.Mock };
   };
   let service: GradeLevelsService;
@@ -57,8 +63,11 @@ describe('GradeLevelsService', () => {
 
   describe('update', () => {
     it('allows renaming to the same name it already has', async () => {
-      prisma.gradeLevel.findUnique.mockImplementation(({ where }: { where: { id?: string; name?: string } }) =>
-        Promise.resolve(where.id === 'grade-1' || where.name === 'Grade 8' ? buildGradeLevel() : null),
+      prisma.gradeLevel.findUnique.mockImplementation(
+        ({ where }: { where: { id?: string; name?: string } }) =>
+          Promise.resolve(
+            where.id === 'grade-1' || where.name === 'Grade 8' ? buildGradeLevel() : null,
+          ),
       );
       prisma.gradeLevel.update.mockResolvedValue(buildGradeLevel({ name: 'Grade 8' }));
 
@@ -66,13 +75,18 @@ describe('GradeLevelsService', () => {
     });
 
     it('rejects renaming to a name already used by a different grade level', async () => {
-      prisma.gradeLevel.findUnique.mockImplementation(({ where }: { where: { id?: string; name?: string } }) => {
-        if (where.id === 'grade-1') return Promise.resolve(buildGradeLevel());
-        if (where.name === 'Grade 9') return Promise.resolve(buildGradeLevel({ id: 'grade-2', name: 'Grade 9' }));
-        return Promise.resolve(null);
-      });
+      prisma.gradeLevel.findUnique.mockImplementation(
+        ({ where }: { where: { id?: string; name?: string } }) => {
+          if (where.id === 'grade-1') return Promise.resolve(buildGradeLevel());
+          if (where.name === 'Grade 9')
+            return Promise.resolve(buildGradeLevel({ id: 'grade-2', name: 'Grade 9' }));
+          return Promise.resolve(null);
+        },
+      );
 
-      await expect(service.update('grade-1', { name: 'Grade 9' })).rejects.toBeInstanceOf(ConflictException);
+      await expect(service.update('grade-1', { name: 'Grade 9' })).rejects.toBeInstanceOf(
+        ConflictException,
+      );
     });
   });
 

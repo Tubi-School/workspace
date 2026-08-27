@@ -48,7 +48,10 @@ export class SessionsController {
 
   @Patch(':id')
   @Roles('ADMIN')
-  update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateSessionDto): Promise<SessionWithRelations> {
+  update(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateSessionDto,
+  ): Promise<SessionWithRelations> {
     return this.sessionsService.update(id, dto);
   }
 

@@ -46,7 +46,14 @@ describe('AuthService', () => {
     it('creates a LEARNER account and never returns passwordHash', async () => {
       prisma.user.findUnique.mockResolvedValue(null);
       prisma.user.create.mockImplementation(({ data }: { data: Partial<User> }) =>
-        Promise.resolve(buildUser({ email: data.email, fullName: data.fullName, passwordHash: data.passwordHash, role: data.role })),
+        Promise.resolve(
+          buildUser({
+            email: data.email,
+            fullName: data.fullName,
+            passwordHash: data.passwordHash,
+            role: data.role,
+          }),
+        ),
       );
 
       const result = await service.register({
@@ -88,7 +95,11 @@ describe('AuthService', () => {
       prisma.user.findUnique.mockResolvedValue(buildUser());
 
       await expect(
-        service.register({ email: 'learner@example.com', password: 'whatever123', fullName: 'Dup' }),
+        service.register({
+          email: 'learner@example.com',
+          password: 'whatever123',
+          fullName: 'Dup',
+        }),
       ).rejects.toBeInstanceOf(ConflictException);
       expect(prisma.user.create).not.toHaveBeenCalled();
     });
@@ -107,7 +118,9 @@ describe('AuthService', () => {
         fullName: 'Cased Learner',
       });
 
-      expect(prisma.user.findUnique).toHaveBeenCalledWith({ where: { email: 'learner@example.com' } });
+      expect(prisma.user.findUnique).toHaveBeenCalledWith({
+        where: { email: 'learner@example.com' },
+      });
       expect(capturedEmail).toBe('learner@example.com');
     });
 
@@ -117,14 +130,21 @@ describe('AuthService', () => {
       // constraint is what fails.
       prisma.user.findUnique.mockResolvedValue(null);
       prisma.user.create.mockRejectedValue(
-        new Prisma.PrismaClientKnownRequestError('Unique constraint failed on the fields: (`email`)', {
-          code: 'P2002',
-          clientVersion: 'test',
-        }),
+        new Prisma.PrismaClientKnownRequestError(
+          'Unique constraint failed on the fields: (`email`)',
+          {
+            code: 'P2002',
+            clientVersion: 'test',
+          },
+        ),
       );
 
       await expect(
-        service.register({ email: 'racing@example.com', password: 'correct-horse-battery-staple', fullName: 'Racer' }),
+        service.register({
+          email: 'racing@example.com',
+          password: 'correct-horse-battery-staple',
+          fullName: 'Racer',
+        }),
       ).rejects.toBeInstanceOf(ConflictException);
     });
 
@@ -133,7 +153,11 @@ describe('AuthService', () => {
       prisma.user.create.mockRejectedValue(new Error('connection reset'));
 
       await expect(
-        service.register({ email: 'other-error@example.com', password: 'correct-horse-battery-staple', fullName: 'X' }),
+        service.register({
+          email: 'other-error@example.com',
+          password: 'correct-horse-battery-staple',
+          fullName: 'X',
+        }),
       ).rejects.toThrow('connection reset');
     });
   });
@@ -143,7 +167,10 @@ describe('AuthService', () => {
       const passwordHash = await bcrypt.hash('correct-password', 4);
       prisma.user.findUnique.mockResolvedValue(buildUser({ passwordHash }));
 
-      const result = await service.login({ email: 'learner@example.com', password: 'correct-password' });
+      const result = await service.login({
+        email: 'learner@example.com',
+        password: 'correct-password',
+      });
 
       expect(typeof result.accessToken).toBe('string');
       expect(result.accessToken.length).toBeGreaterThan(0);
@@ -153,18 +180,27 @@ describe('AuthService', () => {
 
     it('logs in successfully when the email differs only by case/whitespace from how it was stored', async () => {
       const passwordHash = await bcrypt.hash('correct-password', 4);
-      prisma.user.findUnique.mockResolvedValue(buildUser({ email: 'learner@example.com', passwordHash }));
+      prisma.user.findUnique.mockResolvedValue(
+        buildUser({ email: 'learner@example.com', passwordHash }),
+      );
 
-      const result = await service.login({ email: '  Learner@Example.COM  ', password: 'correct-password' });
+      const result = await service.login({
+        email: '  Learner@Example.COM  ',
+        password: 'correct-password',
+      });
 
-      expect(prisma.user.findUnique).toHaveBeenCalledWith({ where: { email: 'learner@example.com' } });
+      expect(prisma.user.findUnique).toHaveBeenCalledWith({
+        where: { email: 'learner@example.com' },
+      });
       expect(result.user.email).toBe('learner@example.com');
     });
 
     it('rejects an unknown email with a generic message', async () => {
       prisma.user.findUnique.mockResolvedValue(null);
 
-      await expect(service.login({ email: 'ghost@example.com', password: 'whatever' })).rejects.toMatchObject({
+      await expect(
+        service.login({ email: 'ghost@example.com', password: 'whatever' }),
+      ).rejects.toMatchObject({
         message: 'Invalid email or password',
       });
     });
@@ -190,9 +226,9 @@ describe('AuthService', () => {
     it('raises UnauthorizedException (not some other error type) on failure', async () => {
       prisma.user.findUnique.mockResolvedValue(null);
 
-      await expect(service.login({ email: 'ghost@example.com', password: 'x' })).rejects.toBeInstanceOf(
-        UnauthorizedException,
-      );
+      await expect(
+        service.login({ email: 'ghost@example.com', password: 'x' }),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
     });
   });
 
@@ -209,13 +245,17 @@ describe('AuthService', () => {
     it('rejects a deactivated account even if the id is valid', async () => {
       prisma.user.findUnique.mockResolvedValue(buildUser({ isActive: false }));
 
-      await expect(service.findSanitizedById('user-1')).rejects.toBeInstanceOf(UnauthorizedException);
+      await expect(service.findSanitizedById('user-1')).rejects.toBeInstanceOf(
+        UnauthorizedException,
+      );
     });
 
     it('rejects an id that no longer resolves to a user', async () => {
       prisma.user.findUnique.mockResolvedValue(null);
 
-      await expect(service.findSanitizedById('does-not-exist')).rejects.toBeInstanceOf(UnauthorizedException);
+      await expect(service.findSanitizedById('does-not-exist')).rejects.toBeInstanceOf(
+        UnauthorizedException,
+      );
     });
   });
 });

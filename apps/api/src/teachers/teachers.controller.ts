@@ -1,4 +1,15 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Param, ParseUUIDPipe, Patch, Post, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  HttpStatus,
+  Param,
+  ParseUUIDPipe,
+  Patch,
+  Post,
+  UseGuards,
+} from '@nestjs/common';
 
 import { Roles } from '../auth/decorators/roles.decorator.js';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard.js';
@@ -33,7 +44,10 @@ export class TeachersController {
 
   @Patch(':id')
   @Roles('ADMIN')
-  update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateTeacherDto): Promise<TeacherWithUser> {
+  update(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateTeacherDto,
+  ): Promise<TeacherWithUser> {
     return this.teachersService.update(id, dto);
   }
 }

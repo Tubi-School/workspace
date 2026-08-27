@@ -102,7 +102,9 @@ describe('SessionsService', () => {
     // By default, run the transaction callback against the same mocked
     // client — individual tests only need to override this to simulate a
     // mid-transaction failure.
-    prisma.$transaction.mockImplementation((fn: (tx: typeof prisma) => Promise<unknown>) => fn(prisma));
+    prisma.$transaction.mockImplementation((fn: (tx: typeof prisma) => Promise<unknown>) =>
+      fn(prisma),
+    );
     service = new SessionsService(prisma as unknown as PrismaService);
   });
 
@@ -115,7 +117,9 @@ describe('SessionsService', () => {
       await service.create(validCreateDto);
 
       const createArgs = lastSessionCreateArgs();
-      expect(createArgs.data.teachers.create).toEqual([{ teacherId: PRIMARY_TEACHER_ID, teacherRole: TeacherRole.PRIMARY }]);
+      expect(createArgs.data.teachers.create).toEqual([
+        { teacherId: PRIMARY_TEACHER_ID, teacherRole: TeacherRole.PRIMARY },
+      ]);
     });
 
     it('derives attendanceCutoffAt as 21:59 UTC (23:59 Africa/Johannesburg) on sessionDate', async () => {
@@ -163,7 +167,11 @@ describe('SessionsService', () => {
       prisma.course.findUnique.mockResolvedValue(buildCourse());
 
       await expect(
-        service.create({ ...validCreateDto, startTime: '2026-07-01T12:00:00Z', endTime: '2026-07-01T11:00:00Z' }),
+        service.create({
+          ...validCreateDto,
+          startTime: '2026-07-01T12:00:00Z',
+          endTime: '2026-07-01T11:00:00Z',
+        }),
       ).rejects.toBeInstanceOf(BadRequestException);
       expect(prisma.session.create).not.toHaveBeenCalled();
     });
@@ -179,7 +187,11 @@ describe('SessionsService', () => {
     it('rejects a sessionDate outside the referenced academic term', async () => {
       prisma.course.findUnique.mockResolvedValue(
         buildCourse({
-          academicTerm: { id: TERM_ID, startDate: new Date('2027-01-01'), endDate: new Date('2027-12-31') },
+          academicTerm: {
+            id: TERM_ID,
+            startDate: new Date('2027-01-01'),
+            endDate: new Date('2027-12-31'),
+          },
         }),
       );
 
@@ -227,15 +239,17 @@ describe('SessionsService', () => {
     it('rejects editing a session that is no longer SCHEDULED', async () => {
       prisma.session.findUnique.mockResolvedValue(buildSession({ status: SessionStatus.LIVE }));
 
-      await expect(service.update('session-1', { liveMeetingUrl: 'https://example.com/new' })).rejects.toBeInstanceOf(
-        ConflictException,
-      );
+      await expect(
+        service.update('session-1', { liveMeetingUrl: 'https://example.com/new' }),
+      ).rejects.toBeInstanceOf(ConflictException);
     });
   });
 
   describe('lifecycle', () => {
     it('allows SCHEDULED -> LIVE', async () => {
-      prisma.session.findUnique.mockResolvedValue(buildSession({ status: SessionStatus.SCHEDULED }));
+      prisma.session.findUnique.mockResolvedValue(
+        buildSession({ status: SessionStatus.SCHEDULED }),
+      );
       prisma.session.update.mockResolvedValue(buildSession({ status: SessionStatus.LIVE }));
 
       const result = await service.markLive('session-1');
@@ -259,15 +273,21 @@ describe('SessionsService', () => {
     });
 
     it('rejects ENDED from a SCHEDULED session (must go via LIVE)', async () => {
-      prisma.session.findUnique.mockResolvedValue(buildSession({ status: SessionStatus.SCHEDULED }));
+      prisma.session.findUnique.mockResolvedValue(
+        buildSession({ status: SessionStatus.SCHEDULED }),
+      );
 
       await expect(service.markEnded('session-1')).rejects.toBeInstanceOf(ConflictException);
     });
 
     it('allows SCHEDULED -> CANCELED and sets canceledAt', async () => {
-      prisma.session.findUnique.mockResolvedValue(buildSession({ status: SessionStatus.SCHEDULED }));
+      prisma.session.findUnique.mockResolvedValue(
+        buildSession({ status: SessionStatus.SCHEDULED }),
+      );
       prisma.session.update.mockImplementation(({ data }: { data: { canceledAt: Date } }) =>
-        Promise.resolve(buildSession({ status: SessionStatus.CANCELED, canceledAt: data.canceledAt })),
+        Promise.resolve(
+          buildSession({ status: SessionStatus.CANCELED, canceledAt: data.canceledAt }),
+        ),
       );
 
       const result = await service.cancel('session-1');
@@ -278,7 +298,9 @@ describe('SessionsService', () => {
 
     it('allows LIVE -> CANCELED', async () => {
       prisma.session.findUnique.mockResolvedValue(buildSession({ status: SessionStatus.LIVE }));
-      prisma.session.update.mockResolvedValue(buildSession({ status: SessionStatus.CANCELED, canceledAt: new Date() }));
+      prisma.session.update.mockResolvedValue(
+        buildSession({ status: SessionStatus.CANCELED, canceledAt: new Date() }),
+      );
 
       const result = await service.cancel('session-1');
 
@@ -297,18 +319,29 @@ describe('SessionsService', () => {
       prisma.course.findUnique.mockResolvedValue(buildCourse());
       prisma.teacherProfile.findUnique.mockResolvedValue(activeTeacher(PRIMARY_TEACHER_ID));
       prisma.session.findUnique.mockResolvedValue(
-        buildSession({ id: 'original-session', status: SessionStatus.CANCELED, replacementForSessionId: null }),
+        buildSession({
+          id: 'original-session',
+          status: SessionStatus.CANCELED,
+          replacementForSessionId: null,
+        }),
       );
-      prisma.session.create.mockResolvedValue(buildSession({ replacementForSessionId: 'original-session' }));
+      prisma.session.create.mockResolvedValue(
+        buildSession({ replacementForSessionId: 'original-session' }),
+      );
 
-      const result = await service.create({ ...validCreateDto, replacementForSessionId: 'original-session' });
+      const result = await service.create({
+        ...validCreateDto,
+        replacementForSessionId: 'original-session',
+      });
 
       expect(result.replacementForSessionId).toBe('original-session');
     });
 
     it('rejects replacing a session that is not CANCELED', async () => {
       prisma.course.findUnique.mockResolvedValue(buildCourse());
-      prisma.session.findUnique.mockResolvedValue(buildSession({ id: 'original-session', status: SessionStatus.SCHEDULED }));
+      prisma.session.findUnique.mockResolvedValue(
+        buildSession({ id: 'original-session', status: SessionStatus.SCHEDULED }),
+      );
 
       await expect(
         service.create({ ...validCreateDto, replacementForSessionId: 'original-session' }),
@@ -332,10 +365,13 @@ describe('SessionsService', () => {
         buildSession({ id: 'original-session', status: SessionStatus.CANCELED }),
       );
       prisma.session.create.mockRejectedValue(
-        new Prisma.PrismaClientKnownRequestError('Unique constraint failed on the fields: (`replacementForSessionId`)', {
-          code: 'P2002',
-          clientVersion: 'test',
-        }),
+        new Prisma.PrismaClientKnownRequestError(
+          'Unique constraint failed on the fields: (`replacementForSessionId`)',
+          {
+            code: 'P2002',
+            clientVersion: 'test',
+          },
+        ),
       );
 
       await expect(
@@ -350,7 +386,11 @@ describe('SessionsService', () => {
       prisma.session.findUnique.mockImplementation(({ where }: { where: { id: string } }) => {
         if (where.id === 'original-session') {
           return Promise.resolve(
-            buildSession({ id: 'original-session', status: SessionStatus.CANCELED, replacementForSessionId: 'original-session' }),
+            buildSession({
+              id: 'original-session',
+              status: SessionStatus.CANCELED,
+              replacementForSessionId: 'original-session',
+            }),
           );
         }
         return Promise.resolve(null);
@@ -374,10 +414,17 @@ describe('SessionsService', () => {
       prisma.teacherProfile.findUnique.mockResolvedValue(activeTeacher(ASSISTANT_TEACHER_ID));
       prisma.sessionTeacher.findUnique.mockResolvedValue(null);
 
-      await service.addTeacher('session-1', { teacherId: ASSISTANT_TEACHER_ID, role: TeacherRole.ASSISTANT });
+      await service.addTeacher('session-1', {
+        teacherId: ASSISTANT_TEACHER_ID,
+        role: TeacherRole.ASSISTANT,
+      });
 
       expect(prisma.sessionTeacher.create).toHaveBeenCalledWith({
-        data: { sessionId: 'session-1', teacherId: ASSISTANT_TEACHER_ID, teacherRole: TeacherRole.ASSISTANT },
+        data: {
+          sessionId: 'session-1',
+          teacherId: ASSISTANT_TEACHER_ID,
+          teacherRole: TeacherRole.ASSISTANT,
+        },
       });
     });
 
@@ -388,10 +435,17 @@ describe('SessionsService', () => {
       prisma.teacherProfile.findUnique.mockResolvedValue(activeTeacher(SUBSTITUTE_TEACHER_ID));
       prisma.sessionTeacher.findUnique.mockResolvedValue(null);
 
-      await service.addTeacher('session-1', { teacherId: SUBSTITUTE_TEACHER_ID, role: TeacherRole.SUBSTITUTE });
+      await service.addTeacher('session-1', {
+        teacherId: SUBSTITUTE_TEACHER_ID,
+        role: TeacherRole.SUBSTITUTE,
+      });
 
       expect(prisma.sessionTeacher.create).toHaveBeenCalledWith({
-        data: { sessionId: 'session-1', teacherId: SUBSTITUTE_TEACHER_ID, teacherRole: TeacherRole.SUBSTITUTE },
+        data: {
+          sessionId: 'session-1',
+          teacherId: SUBSTITUTE_TEACHER_ID,
+          teacherRole: TeacherRole.SUBSTITUTE,
+        },
       });
     });
 
@@ -412,13 +466,18 @@ describe('SessionsService', () => {
       });
 
       await expect(
-        service.addTeacher('session-1', { teacherId: ASSISTANT_TEACHER_ID, role: TeacherRole.ASSISTANT }),
+        service.addTeacher('session-1', {
+          teacherId: ASSISTANT_TEACHER_ID,
+          role: TeacherRole.ASSISTANT,
+        }),
       ).rejects.toBeInstanceOf(ConflictException);
     });
 
     it('rejects a duplicate assignment of the same teacher to the same session', async () => {
       prisma.session.findUnique.mockResolvedValue(
-        sessionWithTeachers([{ teacherId: ASSISTANT_TEACHER_ID, teacherRole: TeacherRole.ASSISTANT }]),
+        sessionWithTeachers([
+          { teacherId: ASSISTANT_TEACHER_ID, teacherRole: TeacherRole.ASSISTANT },
+        ]),
       );
       prisma.teacherProfile.findUnique.mockResolvedValue(activeTeacher(ASSISTANT_TEACHER_ID));
       prisma.sessionTeacher.findUnique.mockResolvedValue({
@@ -428,7 +487,10 @@ describe('SessionsService', () => {
       });
 
       await expect(
-        service.addTeacher('session-1', { teacherId: ASSISTANT_TEACHER_ID, role: TeacherRole.SUBSTITUTE }),
+        service.addTeacher('session-1', {
+          teacherId: ASSISTANT_TEACHER_ID,
+          role: TeacherRole.SUBSTITUTE,
+        }),
       ).rejects.toBeInstanceOf(ConflictException);
       expect(prisma.sessionTeacher.create).not.toHaveBeenCalled();
     });
@@ -446,7 +508,10 @@ describe('SessionsService', () => {
       });
 
       await expect(
-        service.addTeacher('session-1', { teacherId: ASSISTANT_TEACHER_ID, role: TeacherRole.PRIMARY }),
+        service.addTeacher('session-1', {
+          teacherId: ASSISTANT_TEACHER_ID,
+          role: TeacherRole.PRIMARY,
+        }),
       ).rejects.toBeInstanceOf(ConflictException);
       expect(prisma.sessionTeacher.create).not.toHaveBeenCalled();
     });
@@ -461,7 +526,9 @@ describe('SessionsService', () => {
         teacherRole: TeacherRole.PRIMARY,
       });
 
-      await expect(service.removeTeacher('session-1', PRIMARY_TEACHER_ID)).rejects.toBeInstanceOf(ConflictException);
+      await expect(service.removeTeacher('session-1', PRIMARY_TEACHER_ID)).rejects.toBeInstanceOf(
+        ConflictException,
+      );
       expect(prisma.sessionTeacher.delete).not.toHaveBeenCalled();
     });
 
@@ -505,7 +572,9 @@ describe('SessionsService', () => {
       prisma.session.findUnique.mockResolvedValue(sessionWithTeachers([]));
       prisma.sessionTeacher.findUnique.mockResolvedValue(null);
 
-      await expect(service.removeTeacher('session-1', 'ghost-teacher')).rejects.toBeInstanceOf(NotFoundException);
+      await expect(service.removeTeacher('session-1', 'ghost-teacher')).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
     });
   });
 
@@ -537,7 +606,11 @@ describe('SessionsService', () => {
         data: { teacherRole: TeacherRole.ASSISTANT },
       });
       expect(prisma.sessionTeacher.create).toHaveBeenCalledWith({
-        data: { sessionId: 'session-1', teacherId: ASSISTANT_TEACHER_ID, teacherRole: TeacherRole.PRIMARY },
+        data: {
+          sessionId: 'session-1',
+          teacherId: ASSISTANT_TEACHER_ID,
+          teacherRole: TeacherRole.PRIMARY,
+        },
       });
       expect(prisma.sessionTeacher.delete).not.toHaveBeenCalled();
     });
@@ -559,7 +632,11 @@ describe('SessionsService', () => {
         data: { teacherRole: TeacherRole.SUBSTITUTE },
       });
       expect(prisma.sessionTeacher.create).toHaveBeenCalledWith({
-        data: { sessionId: 'session-1', teacherId: SUBSTITUTE_TEACHER_ID, teacherRole: TeacherRole.PRIMARY },
+        data: {
+          sessionId: 'session-1',
+          teacherId: SUBSTITUTE_TEACHER_ID,
+          teacherRole: TeacherRole.PRIMARY,
+        },
       });
     });
 
@@ -580,7 +657,11 @@ describe('SessionsService', () => {
       });
       expect(prisma.sessionTeacher.update).not.toHaveBeenCalled();
       expect(prisma.sessionTeacher.create).toHaveBeenCalledWith({
-        data: { sessionId: 'session-1', teacherId: ASSISTANT_TEACHER_ID, teacherRole: TeacherRole.PRIMARY },
+        data: {
+          sessionId: 'session-1',
+          teacherId: ASSISTANT_TEACHER_ID,
+          teacherRole: TeacherRole.PRIMARY,
+        },
       });
     });
 
@@ -699,7 +780,9 @@ describe('SessionsService', () => {
         outgoingTeacherAction: OutgoingPrimaryAction.BECOME_ASSISTANT,
       });
 
-      const primaryCount = result.teachers.filter((t) => t.teacherRole === TeacherRole.PRIMARY).length;
+      const primaryCount = result.teachers.filter(
+        (t) => t.teacherRole === TeacherRole.PRIMARY,
+      ).length;
       expect(primaryCount).toBe(1);
     });
   });

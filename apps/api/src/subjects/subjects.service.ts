@@ -53,7 +53,9 @@ export class SubjectsService {
     const coursesUsingIt = await this.prisma.course.count({ where: { subjectId: id } });
 
     if (coursesUsingIt > 0) {
-      throw new ConflictException(`Subject ${id} is referenced by ${coursesUsingIt} course(s) and cannot be deleted`);
+      throw new ConflictException(
+        `Subject ${id} is referenced by ${coursesUsingIt} course(s) and cannot be deleted`,
+      );
     }
 
     await this.prisma.subject.delete({ where: { id } });

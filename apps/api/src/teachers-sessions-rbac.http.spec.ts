@@ -61,7 +61,10 @@ describe('Teachers + Sessions RBAC', () => {
   }
 
   beforeAll(async () => {
-    jwtService = new JwtService({ secret: TEST_JWT_SECRET, signOptions: { algorithm: JWT_ALGORITHM } });
+    jwtService = new JwtService({
+      secret: TEST_JWT_SECRET,
+      signOptions: { algorithm: JWT_ALGORITHM },
+    });
 
     const teacherProfileId = randomUUID();
     const courseId = randomUUID();
@@ -116,7 +119,12 @@ describe('Teachers + Sessions RBAC', () => {
         findUnique: jest.fn(({ where }: { where: { id: string } }) =>
           Promise.resolve(
             where.id === teacherProfileId
-              ? { id: teacherProfileId, bio: null, createdAt: new Date(), user: { isActive: true, role: RoleName.TEACHER } }
+              ? {
+                  id: teacherProfileId,
+                  bio: null,
+                  createdAt: new Date(),
+                  user: { isActive: true, role: RoleName.TEACHER },
+                }
               : null,
           ),
         ),
@@ -129,7 +137,11 @@ describe('Teachers + Sessions RBAC', () => {
               ? {
                   id: courseId,
                   primaryTeacherId: teacherProfileId,
-                  academicTerm: { id: 'term-1', startDate: new Date('2026-01-01'), endDate: new Date('2026-12-31') },
+                  academicTerm: {
+                    id: 'term-1',
+                    startDate: new Date('2026-01-01'),
+                    endDate: new Date('2026-12-31'),
+                  },
                 }
               : null,
           ),
@@ -169,7 +181,10 @@ describe('Teachers + Sessions RBAC', () => {
     });
 
     @Global()
-    @Module({ providers: [{ provide: PrismaService, useValue: fakePrismaWithTransaction }], exports: [PrismaService] })
+    @Module({
+      providers: [{ provide: PrismaService, useValue: fakePrismaWithTransaction }],
+      exports: [PrismaService],
+    })
     class FakePrismaModule {}
 
     const fakeConfigService = {
@@ -179,7 +194,10 @@ describe('Teachers + Sessions RBAC', () => {
     const moduleRef = await Test.createTestingModule({
       imports: [
         FakePrismaModule,
-        JwtModule.register({ secret: TEST_JWT_SECRET, signOptions: { algorithm: JWT_ALGORITHM, expiresIn: '1h' } }),
+        JwtModule.register({
+          secret: TEST_JWT_SECRET,
+          signOptions: { algorithm: JWT_ALGORITHM, expiresIn: '1h' },
+        }),
         TeachersModule,
         SessionsModule,
       ],
@@ -187,7 +205,9 @@ describe('Teachers + Sessions RBAC', () => {
     }).compile();
 
     app = moduleRef.createNestApplication();
-    app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }));
+    app.useGlobalPipes(
+      new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
+    );
     await app.init();
 
     (app as unknown as { __courseId: string }).__courseId = courseId;
@@ -223,7 +243,11 @@ describe('Teachers + Sessions RBAC', () => {
       const response = await request(server())
         .post('/admin/teachers')
         .set('Authorization', `Bearer ${token}`)
-        .send({ email: 'new.teacher@example.com', password: 'correct-horse-battery-staple', fullName: 'New Teacher' });
+        .send({
+          email: 'new.teacher@example.com',
+          password: 'correct-horse-battery-staple',
+          fullName: 'New Teacher',
+        });
 
       expect(response.status).toBe(201);
       const body = response.body as { user?: { role?: string; passwordHash?: string } };
@@ -237,7 +261,11 @@ describe('Teachers + Sessions RBAC', () => {
       const response = await request(server())
         .post('/admin/teachers')
         .set('Authorization', `Bearer ${token}`)
-        .send({ email: 'blocked@example.com', password: 'correct-horse-battery-staple', fullName: 'Blocked' });
+        .send({
+          email: 'blocked@example.com',
+          password: 'correct-horse-battery-staple',
+          fullName: 'Blocked',
+        });
 
       expect(response.status).toBe(403);
     });
@@ -247,14 +275,20 @@ describe('Teachers + Sessions RBAC', () => {
       const response = await request(server())
         .post('/admin/teachers')
         .set('Authorization', `Bearer ${token}`)
-        .send({ email: 'blocked2@example.com', password: 'correct-horse-battery-staple', fullName: 'Blocked' });
+        .send({
+          email: 'blocked2@example.com',
+          password: 'correct-horse-battery-staple',
+          fullName: 'Blocked',
+        });
 
       expect(response.status).toBe(403);
     });
 
     it('TEACHER can read the teacher list', async () => {
       const token = await tokenFor(teacherCaller);
-      const response = await request(server()).get('/admin/teachers').set('Authorization', `Bearer ${token}`);
+      const response = await request(server())
+        .get('/admin/teachers')
+        .set('Authorization', `Bearer ${token}`);
 
       expect(response.status).toBe(200);
     });
@@ -275,7 +309,10 @@ describe('Teachers + Sessions RBAC', () => {
         });
 
       expect(response.status).toBe(201);
-      const body = response.body as { attendanceCutoffAt?: string; teachers?: { teacherRole: string }[] };
+      const body = response.body as {
+        attendanceCutoffAt?: string;
+        teachers?: { teacherRole: string }[];
+      };
       expect(body.attendanceCutoffAt).toBe('2026-07-01T21:59:00.000Z');
       expect(body.teachers?.[0]?.teacherRole).toBe('PRIMARY');
     });
@@ -314,40 +351,50 @@ describe('Teachers + Sessions RBAC', () => {
 
     it('rejects a malformed courseId with 400', async () => {
       const token = await tokenFor(admin);
-      const response = await request(server()).post('/admin/sessions').set('Authorization', `Bearer ${token}`).send({
-        courseId: 'not-a-uuid',
-        sessionDate: '2026-07-01',
-        startTime: '2026-07-01T11:00:00Z',
-        endTime: '2026-07-01T12:00:00Z',
-        liveMeetingUrl: 'https://example.com/meet',
-      });
+      const response = await request(server())
+        .post('/admin/sessions')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          courseId: 'not-a-uuid',
+          sessionDate: '2026-07-01',
+          startTime: '2026-07-01T11:00:00Z',
+          endTime: '2026-07-01T12:00:00Z',
+          liveMeetingUrl: 'https://example.com/meet',
+        });
 
       expect(response.status).toBe(400);
     });
 
     it('rejects a syntactically valid but non-existent courseId with 404', async () => {
       const token = await tokenFor(admin);
-      const response = await request(server()).post('/admin/sessions').set('Authorization', `Bearer ${token}`).send({
-        courseId: randomUUID(),
-        sessionDate: '2026-07-01',
-        startTime: '2026-07-01T11:00:00Z',
-        endTime: '2026-07-01T12:00:00Z',
-        liveMeetingUrl: 'https://example.com/meet',
-      });
+      const response = await request(server())
+        .post('/admin/sessions')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          courseId: randomUUID(),
+          sessionDate: '2026-07-01',
+          startTime: '2026-07-01T11:00:00Z',
+          endTime: '2026-07-01T12:00:00Z',
+          liveMeetingUrl: 'https://example.com/meet',
+        });
 
       expect(response.status).toBe(404);
     });
 
     it('TEACHER can read the session list', async () => {
       const token = await tokenFor(teacherCaller);
-      const response = await request(server()).get('/admin/sessions').set('Authorization', `Bearer ${token}`);
+      const response = await request(server())
+        .get('/admin/sessions')
+        .set('Authorization', `Bearer ${token}`);
 
       expect(response.status).toBe(200);
     });
 
     it('LEARNER cannot read the session list', async () => {
       const token = await tokenFor(learner);
-      const response = await request(server()).get('/admin/sessions').set('Authorization', `Bearer ${token}`);
+      const response = await request(server())
+        .get('/admin/sessions')
+        .set('Authorization', `Bearer ${token}`);
 
       expect(response.status).toBe(403);
     });

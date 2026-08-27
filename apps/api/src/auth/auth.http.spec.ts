@@ -205,7 +205,9 @@ describe('Auth HTTP surface', () => {
   });
 
   it('rejects /auth/me with a malformed bearer token', async () => {
-    const response = await request(server()).get('/auth/me').set('Authorization', 'Bearer not-a-real-token');
+    const response = await request(server())
+      .get('/auth/me')
+      .set('Authorization', 'Bearer not-a-real-token');
 
     expect(response.status).toBe(401);
   });

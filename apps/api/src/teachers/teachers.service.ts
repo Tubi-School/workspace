@@ -98,11 +98,17 @@ export class TeachersService {
   }
 
   findAll(): Promise<TeacherWithUser[]> {
-    return this.prisma.teacherProfile.findMany({ include: teacherInclude, orderBy: { createdAt: 'asc' } });
+    return this.prisma.teacherProfile.findMany({
+      include: teacherInclude,
+      orderBy: { createdAt: 'asc' },
+    });
   }
 
   async findOne(id: string): Promise<TeacherWithUser> {
-    const teacher = await this.prisma.teacherProfile.findUnique({ where: { id }, include: teacherInclude });
+    const teacher = await this.prisma.teacherProfile.findUnique({
+      where: { id },
+      include: teacherInclude,
+    });
 
     if (!teacher) {
       throw new NotFoundException(`Teacher ${id} not found`);

@@ -17,7 +17,13 @@ function buildTerm(overrides: Partial<AcademicTerm> = {}): AcademicTerm {
 
 describe('AcademicTermsService', () => {
   let prisma: {
-    academicTerm: { findUnique: jest.Mock; findMany: jest.Mock; create: jest.Mock; update: jest.Mock; delete: jest.Mock };
+    academicTerm: {
+      findUnique: jest.Mock;
+      findMany: jest.Mock;
+      create: jest.Mock;
+      update: jest.Mock;
+      delete: jest.Mock;
+    };
     course: { count: jest.Mock };
   };
   let service: AcademicTermsService;
@@ -63,7 +69,9 @@ describe('AcademicTermsService', () => {
 
       await service.create({ name: '2026 Term 3', startDate: '2026-07-01', endDate: '2026-09-30' });
 
-      const calls = prisma.academicTerm.create.mock.calls as unknown as { data: Record<string, unknown> }[][];
+      const calls = prisma.academicTerm.create.mock.calls as unknown as {
+        data: Record<string, unknown>;
+      }[][];
       expect(calls[0]?.[0]?.data).not.toHaveProperty('timezone');
     });
   });

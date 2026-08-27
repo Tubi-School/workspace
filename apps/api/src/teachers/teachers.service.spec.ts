@@ -47,14 +47,16 @@ describe('TeachersService', () => {
       prisma.user.findUnique.mockResolvedValue(null);
       let capturedPasswordHash = '';
 
-      prisma.$transaction.mockImplementation(async (fn: (tx: typeof prisma) => Promise<unknown>) => {
-        prisma.user.create.mockImplementation(({ data }: { data: { passwordHash: string } }) => {
-          capturedPasswordHash = data.passwordHash;
-          return Promise.resolve({ id: 'user-1' });
-        });
-        prisma.teacherProfile.create.mockResolvedValue(buildTeacherProfile());
-        return fn(prisma);
-      });
+      prisma.$transaction.mockImplementation(
+        async (fn: (tx: typeof prisma) => Promise<unknown>) => {
+          prisma.user.create.mockImplementation(({ data }: { data: { passwordHash: string } }) => {
+            capturedPasswordHash = data.passwordHash;
+            return Promise.resolve({ id: 'user-1' });
+          });
+          prisma.teacherProfile.create.mockResolvedValue(buildTeacherProfile());
+          return fn(prisma);
+        },
+      );
 
       const result = await service.create({
         email: 'teacher@example.com',
@@ -66,16 +68,20 @@ describe('TeachersService', () => {
       expect(result).not.toHaveProperty('passwordHash');
       expect(result.user).not.toHaveProperty('passwordHash');
       expect(capturedPasswordHash).not.toBe('correct-horse-battery-staple');
-      await expect(bcrypt.compare('correct-horse-battery-staple', capturedPasswordHash)).resolves.toBe(true);
+      await expect(
+        bcrypt.compare('correct-horse-battery-staple', capturedPasswordHash),
+      ).resolves.toBe(true);
     });
 
     it('normalizes email (trim + lowercase) before checking for a duplicate', async () => {
       prisma.user.findUnique.mockResolvedValue(null);
-      prisma.$transaction.mockImplementation(async (fn: (tx: typeof prisma) => Promise<unknown>) => {
-        prisma.user.create.mockResolvedValue({ id: 'user-1' });
-        prisma.teacherProfile.create.mockResolvedValue(buildTeacherProfile());
-        return fn(prisma);
-      });
+      prisma.$transaction.mockImplementation(
+        async (fn: (tx: typeof prisma) => Promise<unknown>) => {
+          prisma.user.create.mockResolvedValue({ id: 'user-1' });
+          prisma.teacherProfile.create.mockResolvedValue(buildTeacherProfile());
+          return fn(prisma);
+        },
+      );
 
       await service.create({
         email: '  Teacher@Example.COM  ',
@@ -83,14 +89,20 @@ describe('TeachersService', () => {
         fullName: 'Teacher One',
       });
 
-      expect(prisma.user.findUnique).toHaveBeenCalledWith({ where: { email: 'teacher@example.com' } });
+      expect(prisma.user.findUnique).toHaveBeenCalledWith({
+        where: { email: 'teacher@example.com' },
+      });
     });
 
     it('rejects an already-registered email with 409, without starting a transaction', async () => {
       prisma.user.findUnique.mockResolvedValue({ id: 'existing-user' });
 
       await expect(
-        service.create({ email: 'teacher@example.com', password: 'correct-horse-battery-staple', fullName: 'X' }),
+        service.create({
+          email: 'teacher@example.com',
+          password: 'correct-horse-battery-staple',
+          fullName: 'X',
+        }),
       ).rejects.toBeInstanceOf(ConflictException);
       expect(prisma.$transaction).not.toHaveBeenCalled();
     });
@@ -98,21 +110,30 @@ describe('TeachersService', () => {
     it('turns a database unique-constraint violation (race) into the same 409', async () => {
       prisma.user.findUnique.mockResolvedValue(null);
       prisma.$transaction.mockRejectedValue(
-        new Prisma.PrismaClientKnownRequestError('Unique constraint failed on the fields: (`email`)', {
-          code: 'P2002',
-          clientVersion: 'test',
-        }),
+        new Prisma.PrismaClientKnownRequestError(
+          'Unique constraint failed on the fields: (`email`)',
+          {
+            code: 'P2002',
+            clientVersion: 'test',
+          },
+        ),
       );
 
       await expect(
-        service.create({ email: 'racing@example.com', password: 'correct-horse-battery-staple', fullName: 'X' }),
+        service.create({
+          email: 'racing@example.com',
+          password: 'correct-horse-battery-staple',
+          fullName: 'X',
+        }),
       ).rejects.toBeInstanceOf(ConflictException);
     });
   });
 
   describe('findOne', () => {
     it('throws NotFoundException for a missing teacher id', async () => {
-      (prisma.teacherProfile as unknown as { findUnique: jest.Mock }).findUnique = jest.fn().mockResolvedValue(null);
+      (prisma.teacherProfile as unknown as { findUnique: jest.Mock }).findUnique = jest
+        .fn()
+        .mockResolvedValue(null);
 
       await expect(service.findOne('missing')).rejects.toBeInstanceOf(NotFoundException);
     });
@@ -125,14 +146,22 @@ describe('TeachersService', () => {
       const findUnique = jest.fn().mockResolvedValue(buildTeacherProfile());
       (prisma.teacherProfile as unknown as { findUnique: jest.Mock }).findUnique = findUnique;
 
-      prisma.$transaction.mockImplementation(async (fn: (tx: typeof prisma) => Promise<unknown>) => {
-        prisma.teacherProfile.findUniqueOrThrow.mockResolvedValue(
-          buildTeacherProfile({ bio: 'Updated bio', user: { ...buildTeacherProfile().user, isActive: false } }),
-        );
-        return fn(prisma);
-      });
+      prisma.$transaction.mockImplementation(
+        async (fn: (tx: typeof prisma) => Promise<unknown>) => {
+          prisma.teacherProfile.findUniqueOrThrow.mockResolvedValue(
+            buildTeacherProfile({
+              bio: 'Updated bio',
+              user: { ...buildTeacherProfile().user, isActive: false },
+            }),
+          );
+          return fn(prisma);
+        },
+      );
 
-      const result = await service.update('teacher-profile-1', { bio: 'Updated bio', isActive: false });
+      const result = await service.update('teacher-profile-1', {
+        bio: 'Updated bio',
+        isActive: false,
+      });
 
       expect(prisma.user.update).toHaveBeenCalledWith({
         where: { id: 'user-1' },

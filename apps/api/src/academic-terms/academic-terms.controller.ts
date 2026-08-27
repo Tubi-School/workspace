@@ -46,7 +46,10 @@ export class AcademicTermsController {
 
   @Patch(':id')
   @Roles('ADMIN')
-  update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateAcademicTermDto): Promise<AcademicTerm> {
+  update(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateAcademicTermDto,
+  ): Promise<AcademicTerm> {
     return this.academicTermsService.update(id, dto);
   }
 

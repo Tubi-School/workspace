@@ -46,7 +46,10 @@ export class CoursesController {
 
   @Patch(':id')
   @Roles('ADMIN')
-  update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateCourseDto): Promise<CourseWithRelations> {
+  update(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateCourseDto,
+  ): Promise<CourseWithRelations> {
     return this.coursesService.update(id, dto);
   }
 

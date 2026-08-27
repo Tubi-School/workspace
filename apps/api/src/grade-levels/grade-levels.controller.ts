@@ -46,7 +46,10 @@ export class GradeLevelsController {
 
   @Patch(':id')
   @Roles('ADMIN')
-  update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateGradeLevelDto): Promise<GradeLevel> {
+  update(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateGradeLevelDto,
+  ): Promise<GradeLevel> {
     return this.gradeLevelsService.update(id, dto);
   }
 

@@ -27,7 +27,9 @@ describe('SubjectsService', () => {
     prisma.subject.findUnique.mockResolvedValue(null);
     prisma.subject.create.mockResolvedValue(buildSubject());
 
-    await expect(service.create({ name: 'Mathematics' })).resolves.toMatchObject({ name: 'Mathematics' });
+    await expect(service.create({ name: 'Mathematics' })).resolves.toMatchObject({
+      name: 'Mathematics',
+    });
   });
 
   it('rejects a duplicate subject name with 409 Conflict', async () => {

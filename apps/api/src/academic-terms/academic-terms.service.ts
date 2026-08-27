@@ -1,4 +1,9 @@
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 
 import { PrismaService } from '../prisma/prisma.service.js';
 import type { AcademicTerm } from '../generated/prisma/client.js';
@@ -52,7 +57,8 @@ export class AcademicTermsService {
   async update(id: string, dto: UpdateAcademicTermDto): Promise<AcademicTerm> {
     const existing = await this.findOne(id);
 
-    const nextStartDate = dto.startDate !== undefined ? new Date(dto.startDate) : existing.startDate;
+    const nextStartDate =
+      dto.startDate !== undefined ? new Date(dto.startDate) : existing.startDate;
     const nextEndDate = dto.endDate !== undefined ? new Date(dto.endDate) : existing.endDate;
     assertValidDateRange(nextStartDate, nextEndDate);
 

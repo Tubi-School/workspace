@@ -68,11 +68,16 @@ describe('Admin academic-structure RBAC', () => {
   }
 
   beforeAll(async () => {
-    jwtService = new JwtService({ secret: TEST_JWT_SECRET, signOptions: { algorithm: JWT_ALGORITHM } });
+    jwtService = new JwtService({
+      secret: TEST_JWT_SECRET,
+      signOptions: { algorithm: JWT_ALGORITHM },
+    });
 
     const fakePrisma = {
       user: {
-        findUnique: jest.fn(({ where }: { where: { id: string } }) => Promise.resolve(users.get(where.id) ?? null)),
+        findUnique: jest.fn(({ where }: { where: { id: string } }) =>
+          Promise.resolve(users.get(where.id) ?? null),
+        ),
       },
       gradeLevel: {
         // Called with { where: { name } } for the duplicate-name pre-check
@@ -102,7 +107,11 @@ describe('Admin academic-structure RBAC', () => {
         ),
         findMany: jest.fn(() => Promise.resolve([])),
         create: jest.fn(
-          ({ data }: { data: { name: string; startDate: Date; endDate: Date; timezone?: string } }) =>
+          ({
+            data,
+          }: {
+            data: { name: string; startDate: Date; endDate: Date; timezone?: string };
+          }) =>
             Promise.resolve({
               id: 'term-1',
               name: data.name,
@@ -121,21 +130,39 @@ describe('Admin academic-structure RBAC', () => {
         findUnique: jest.fn(() => Promise.resolve(null)),
         findMany: jest.fn(() => Promise.resolve([])),
         create: jest.fn(
-          ({ data }: { data: { title: string; subjectId: string; gradeLevelId: string; academicTermId: string; primaryTeacherId: string } }) =>
+          ({
+            data,
+          }: {
+            data: {
+              title: string;
+              subjectId: string;
+              gradeLevelId: string;
+              academicTermId: string;
+              primaryTeacherId: string;
+            };
+          }) =>
             Promise.resolve({
               id: 'course-1',
               title: data.title,
               subject: { id: data.subjectId, name: 'Mathematics' },
               gradeLevel: { id: data.gradeLevelId, name: 'Grade 8' },
               academicTerm: { id: data.academicTermId, name: '2026 Term 3' },
-              primaryTeacher: { id: data.primaryTeacherId, bio: null, createdAt: new Date(), userId: 'teacher-1' },
+              primaryTeacher: {
+                id: data.primaryTeacherId,
+                bio: null,
+                createdAt: new Date(),
+                userId: 'teacher-1',
+              },
             }),
         ),
       },
     };
 
     @Global()
-    @Module({ providers: [{ provide: PrismaService, useValue: fakePrisma }], exports: [PrismaService] })
+    @Module({
+      providers: [{ provide: PrismaService, useValue: fakePrisma }],
+      exports: [PrismaService],
+    })
     class FakePrismaModule {}
 
     const fakeConfigService = {
@@ -145,7 +172,10 @@ describe('Admin academic-structure RBAC', () => {
     const moduleRef = await Test.createTestingModule({
       imports: [
         FakePrismaModule,
-        JwtModule.register({ secret: TEST_JWT_SECRET, signOptions: { algorithm: JWT_ALGORITHM, expiresIn: '1h' } }),
+        JwtModule.register({
+          secret: TEST_JWT_SECRET,
+          signOptions: { algorithm: JWT_ALGORITHM, expiresIn: '1h' },
+        }),
         GradeLevelsModule,
         SubjectsModule,
         AcademicTermsModule,
@@ -155,7 +185,9 @@ describe('Admin academic-structure RBAC', () => {
     }).compile();
 
     app = moduleRef.createNestApplication();
-    app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }));
+    app.useGlobalPipes(
+      new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
+    );
     await app.init();
   });
 
@@ -170,7 +202,9 @@ describe('Admin academic-structure RBAC', () => {
     });
 
     it('rejects a write request with no bearer token', async () => {
-      const response = await request(server()).post('/admin/grade-levels').send({ name: 'Grade 9' });
+      const response = await request(server())
+        .post('/admin/grade-levels')
+        .send({ name: 'Grade 9' });
       expect(response.status).toBe(401);
     });
   });
@@ -237,7 +271,9 @@ describe('Admin academic-structure RBAC', () => {
 
     it('is allowed to read GradeLevels', async () => {
       const token = await tokenFor(teacher);
-      const response = await request(server()).get('/admin/grade-levels').set('Authorization', `Bearer ${token}`);
+      const response = await request(server())
+        .get('/admin/grade-levels')
+        .set('Authorization', `Bearer ${token}`);
 
       expect(response.status).toBe(200);
     });
@@ -256,7 +292,9 @@ describe('Admin academic-structure RBAC', () => {
 
     it('is forbidden from reading GradeLevels', async () => {
       const token = await tokenFor(learner);
-      const response = await request(server()).get('/admin/grade-levels').set('Authorization', `Bearer ${token}`);
+      const response = await request(server())
+        .get('/admin/grade-levels')
+        .set('Authorization', `Bearer ${token}`);
 
       expect(response.status).toBe(403);
     });
@@ -265,7 +303,9 @@ describe('Admin academic-structure RBAC', () => {
   describe('ADMIN is allowed on permitted read endpoints', () => {
     it('reads the Subject list', async () => {
       const token = await tokenFor(admin);
-      const response = await request(server()).get('/admin/subjects').set('Authorization', `Bearer ${token}`);
+      const response = await request(server())
+        .get('/admin/subjects')
+        .set('Authorization', `Bearer ${token}`);
 
       expect(response.status).toBe(200);
     });

@@ -1,11 +1,19 @@
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 
 import { Prisma, RoleName, SessionStatus, TeacherRole } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { computeAttendanceCutoffAtUtc, toAcademicDateString } from './academic-timezone.util.js';
 import type { AssignSessionTeacherDto } from './dto/assign-session-teacher.dto.js';
 import type { CreateSessionDto } from './dto/create-session.dto.js';
-import { OutgoingPrimaryAction, type ReassignPrimaryTeacherDto } from './dto/reassign-primary-teacher.dto.js';
+import {
+  OutgoingPrimaryAction,
+  type ReassignPrimaryTeacherDto,
+} from './dto/reassign-primary-teacher.dto.js';
 import type { UpdateSessionDto } from './dto/update-session.dto.js';
 import type { UpdateSessionTeacherDto } from './dto/update-session-teacher.dto.js';
 
@@ -107,7 +115,10 @@ export class SessionsService {
   }
 
   async findOne(id: string): Promise<SessionWithRelations> {
-    const session = await this.prisma.session.findUnique({ where: { id }, include: sessionInclude });
+    const session = await this.prisma.session.findUnique({
+      where: { id },
+      include: sessionInclude,
+    });
 
     if (!session) {
       throw new NotFoundException(`Session ${id} not found`);
@@ -126,17 +137,23 @@ export class SessionsService {
     const existing = await this.findOne(id);
 
     if (existing.status !== SessionStatus.SCHEDULED) {
-      throw new ConflictException(`Session ${id} is ${existing.status} and can no longer be edited`);
+      throw new ConflictException(
+        `Session ${id} is ${existing.status} and can no longer be edited`,
+      );
     }
 
     const courseId = dto.courseId ?? existing.courseId;
-    const course = await this.prisma.course.findUnique({ where: { id: courseId }, include: { academicTerm: true } });
+    const course = await this.prisma.course.findUnique({
+      where: { id: courseId },
+      include: { academicTerm: true },
+    });
 
     if (!course) {
       throw new NotFoundException(`Course ${courseId} not found`);
     }
 
-    const sessionDate = dto.sessionDate !== undefined ? new Date(dto.sessionDate) : existing.sessionDate;
+    const sessionDate =
+      dto.sessionDate !== undefined ? new Date(dto.sessionDate) : existing.sessionDate;
     const startTime = dto.startTime !== undefined ? new Date(dto.startTime) : existing.startTime;
     const endTime = dto.endTime !== undefined ? new Date(dto.endTime) : existing.endTime;
 
@@ -224,7 +241,9 @@ export class SessionsService {
     });
 
     if (existingAssignment) {
-      throw new ConflictException(`Teacher ${dto.teacherId} is already assigned to session ${sessionId}`);
+      throw new ConflictException(
+        `Teacher ${dto.teacherId} is already assigned to session ${sessionId}`,
+      );
     }
 
     if (dto.role === TeacherRole.PRIMARY) {
@@ -282,7 +301,9 @@ export class SessionsService {
       );
     }
 
-    await this.prisma.sessionTeacher.delete({ where: { sessionId_teacherId: { sessionId, teacherId } } });
+    await this.prisma.sessionTeacher.delete({
+      where: { sessionId_teacherId: { sessionId, teacherId } },
+    });
 
     return this.findOne(sessionId);
   }
@@ -321,7 +342,9 @@ export class SessionsService {
     const outgoingTeacherId = primaryAssignments[0]!.teacherId;
 
     if (outgoingTeacherId === dto.incomingTeacherId) {
-      throw new ConflictException(`Teacher ${dto.incomingTeacherId} is already the PRIMARY teacher`);
+      throw new ConflictException(
+        `Teacher ${dto.incomingTeacherId} is already the PRIMARY teacher`,
+      );
     }
 
     const incomingExistingAssignment = await this.prisma.sessionTeacher.findUnique({
@@ -418,16 +441,25 @@ export class SessionsService {
     sessionDate: Date,
     academicTerm: { id: string; startDate: Date; endDate: Date },
   ): void {
-    if (sessionDate.getTime() < academicTerm.startDate.getTime() || sessionDate.getTime() > academicTerm.endDate.getTime()) {
+    if (
+      sessionDate.getTime() < academicTerm.startDate.getTime() ||
+      sessionDate.getTime() > academicTerm.endDate.getTime()
+    ) {
       throw new BadRequestException(
         `sessionDate must fall within the referenced course's academic term (${academicTerm.id})`,
       );
     }
   }
 
-  private assertTransition(current: SessionStatus, requiredFrom: SessionStatus, to: SessionStatus): void {
+  private assertTransition(
+    current: SessionStatus,
+    requiredFrom: SessionStatus,
+    to: SessionStatus,
+  ): void {
     if (current !== requiredFrom) {
-      throw new ConflictException(`Cannot move session from ${current} to ${to} (requires ${requiredFrom})`);
+      throw new ConflictException(
+        `Cannot move session from ${current} to ${to} (requires ${requiredFrom})`,
+      );
     }
   }
 
@@ -458,10 +490,11 @@ export class SessionsService {
       }
       visited.add(cursor);
 
-      const ancestor: { replacementForSessionId: string | null } | null = await this.prisma.session.findUnique({
-        where: { id: cursor },
-        select: { replacementForSessionId: true },
-      });
+      const ancestor: { replacementForSessionId: string | null } | null =
+        await this.prisma.session.findUnique({
+          where: { id: cursor },
+          select: { replacementForSessionId: true },
+        });
 
       cursor = ancestor?.replacementForSessionId ?? null;
       hops += 1;
@@ -511,7 +544,9 @@ export class SessionsService {
     }
 
     if (!teacher.user.isActive || teacher.user.role !== RoleName.TEACHER) {
-      throw new ConflictException(`Teacher ${teacherId} does not belong to an active TEACHER account`);
+      throw new ConflictException(
+        `Teacher ${teacherId} does not belong to an active TEACHER account`,
+      );
     }
   }
 
