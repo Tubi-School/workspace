@@ -1,5 +1,6 @@
 import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
 
+import type { EntitlementService } from '../entitlements/entitlement.service.js';
 import { Prisma, RoleName, SessionStatus, TeacherRole } from '../generated/prisma/client.js';
 import type { PrismaService } from '../prisma/prisma.service.js';
 import { OutgoingPrimaryAction } from './dto/reassign-primary-teacher.dto.js';
@@ -67,6 +68,7 @@ describe('SessionsService', () => {
     teacherProfile: { findUnique: jest.Mock };
     $transaction: jest.Mock;
   };
+  let entitlementService: { evaluateForSession: jest.Mock; inheritForReplacement: jest.Mock };
   let service: SessionsService;
 
   function lastSessionCreateArgs(): SessionCreateCallArgs {
@@ -105,7 +107,14 @@ describe('SessionsService', () => {
     prisma.$transaction.mockImplementation((fn: (tx: typeof prisma) => Promise<unknown>) =>
       fn(prisma),
     );
-    service = new SessionsService(prisma as unknown as PrismaService);
+    entitlementService = {
+      evaluateForSession: jest.fn().mockResolvedValue(undefined),
+      inheritForReplacement: jest.fn().mockResolvedValue(undefined),
+    };
+    service = new SessionsService(
+      prisma as unknown as PrismaService,
+      entitlementService as unknown as EntitlementService,
+    );
   });
 
   describe('create', () => {
@@ -255,6 +264,41 @@ describe('SessionsService', () => {
       const result = await service.markLive('session-1');
 
       expect(result.status).toBe(SessionStatus.LIVE);
+      expect(entitlementService.evaluateForSession).toHaveBeenCalledWith(
+        'session-1',
+        expect.any(Date),
+      );
+    });
+
+    it('evaluates entitlement at session.startTime, not the markLive call time, when markLive is pressed late (session scheduled 11:00, markLive at 11:07)', async () => {
+      const startTime = new Date('2026-07-01T11:00:00Z');
+      prisma.session.findUnique.mockResolvedValue(
+        buildSession({ status: SessionStatus.SCHEDULED, startTime }),
+      );
+      prisma.session.update.mockResolvedValue(buildSession({ status: SessionStatus.LIVE }));
+
+      await service.markLive('session-1');
+
+      expect(entitlementService.evaluateForSession).toHaveBeenCalledWith('session-1', startTime);
+    });
+
+    it('evaluates entitlement at session.startTime, not the markLive call time, when markLive is pressed early (button pressed well before the scheduled start)', async () => {
+      // A startTime far in the future stands in for "markLive fired before
+      // the scheduled start" — if the call time (now) leaked through
+      // instead of startTime, this would fail because now is nowhere near
+      // this value.
+      const startTime = new Date('2099-01-01T11:00:00Z');
+      prisma.session.findUnique.mockResolvedValue(
+        buildSession({ status: SessionStatus.SCHEDULED, startTime }),
+      );
+      prisma.session.update.mockResolvedValue(buildSession({ status: SessionStatus.LIVE }));
+
+      await service.markLive('session-1');
+
+      const calledWith = (
+        entitlementService.evaluateForSession.mock.calls[0] as unknown as [string, Date]
+      )[1];
+      expect(calledWith.getTime()).toBe(startTime.getTime());
     });
 
     it('rejects LIVE from a non-SCHEDULED session', async () => {
@@ -294,6 +338,50 @@ describe('SessionsService', () => {
 
       expect(result.status).toBe(SessionStatus.CANCELED);
       expect(result.canceledAt).toBeInstanceOf(Date);
+      // Canceled before ever going LIVE — entitlement must still be
+      // evaluated, at the cancellation moment (frozen design section J).
+      expect(entitlementService.evaluateForSession).toHaveBeenCalledWith(
+        'session-1',
+        expect.any(Date),
+      );
+    });
+
+    it('evaluates entitlement at the cancellation timestamp when a session is canceled before its scheduled start (startTime is in the future)', async () => {
+      const startTime = new Date('2099-01-01T11:00:00Z');
+      prisma.session.findUnique.mockResolvedValue(
+        buildSession({ status: SessionStatus.SCHEDULED, startTime }),
+      );
+      prisma.session.update.mockResolvedValue(
+        buildSession({ status: SessionStatus.CANCELED, canceledAt: new Date() }),
+      );
+
+      const before = Date.now();
+      await service.cancel('session-1');
+      const after = Date.now();
+
+      const calledWith = (
+        entitlementService.evaluateForSession.mock.calls[0] as unknown as [string, Date]
+      )[1];
+      expect(calledWith.getTime()).not.toBe(startTime.getTime());
+      expect(calledWith.getTime()).toBeGreaterThanOrEqual(before);
+      expect(calledWith.getTime()).toBeLessThanOrEqual(after);
+    });
+
+    it('evaluates entitlement at session.startTime (not the cancellation timestamp) when a session is canceled after its scheduled start', async () => {
+      const startTime = new Date('2020-01-01T11:00:00Z');
+      prisma.session.findUnique.mockResolvedValue(
+        buildSession({ status: SessionStatus.SCHEDULED, startTime }),
+      );
+      prisma.session.update.mockResolvedValue(
+        buildSession({ status: SessionStatus.CANCELED, canceledAt: new Date() }),
+      );
+
+      await service.cancel('session-1');
+
+      const calledWith = (
+        entitlementService.evaluateForSession.mock.calls[0] as unknown as [string, Date]
+      )[1];
+      expect(calledWith.getTime()).toBe(startTime.getTime());
     });
 
     it('allows LIVE -> CANCELED', async () => {
@@ -335,6 +423,20 @@ describe('SessionsService', () => {
       });
 
       expect(result.replacementForSessionId).toBe('original-session');
+      expect(entitlementService.inheritForReplacement).toHaveBeenCalledWith(
+        'original-session',
+        result.id,
+      );
+    });
+
+    it('does not attempt entitlement inheritance for an ordinary (non-replacement) session', async () => {
+      prisma.course.findUnique.mockResolvedValue(buildCourse());
+      prisma.teacherProfile.findUnique.mockResolvedValue(activeTeacher(PRIMARY_TEACHER_ID));
+      prisma.session.create.mockResolvedValue(buildSession());
+
+      await service.create(validCreateDto);
+
+      expect(entitlementService.inheritForReplacement).not.toHaveBeenCalled();
     });
 
     it('rejects replacing a session that is not CANCELED', async () => {

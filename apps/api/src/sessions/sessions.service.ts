@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 
+import { EntitlementService } from '../entitlements/entitlement.service.js';
 import { Prisma, RoleName, SessionStatus, TeacherRole } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { computeAttendanceCutoffAtUtc, toAcademicDateString } from './academic-timezone.util.js';
@@ -45,7 +46,10 @@ interface TeacherAssignmentPlan {
 
 @Injectable()
 export class SessionsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly entitlementService: EntitlementService,
+  ) {}
 
   async create(dto: CreateSessionDto): Promise<SessionWithRelations> {
     const course = await this.prisma.course.findUnique({
@@ -98,6 +102,20 @@ export class SessionsService {
         },
         include: sessionInclude,
       });
+
+      if (dto.replacementForSessionId !== undefined) {
+        // Replacement entitlement is inherited from the canceled original's
+        // snapshots, never recalculated from today's subscription state
+        // (frozen design section J). The original is guaranteed to already
+        // have entitlement snapshots — assertValidReplacementTarget above
+        // required it to be CANCELED, and every path that cancels a
+        // session (markLive's evaluation, or cancel's own evaluation for a
+        // session canceled before going live) evaluates entitlement first.
+        await this.entitlementService.inheritForReplacement(
+          dto.replacementForSessionId,
+          created.id,
+        );
+      }
 
       return created;
     } catch (error) {
@@ -177,9 +195,18 @@ export class SessionsService {
     });
   }
 
+  /**
+   * SCHEDULED -> LIVE is the normal entitlement trigger, but the frozen
+   * entitlement point itself is always `session.startTime` — never the
+   * timestamp an ADMIN happens to press the LIVE button at. Whether
+   * markLive fires early or late, entitlement is evaluated as of the
+   * session's own scheduled start.
+   */
   async markLive(id: string): Promise<SessionWithRelations> {
     const existing = await this.findOne(id);
     this.assertTransition(existing.status, SessionStatus.SCHEDULED, SessionStatus.LIVE);
+
+    await this.entitlementService.evaluateForSession(id, existing.startTime);
 
     return this.prisma.session.update({
       where: { id },
@@ -199,6 +226,16 @@ export class SessionsService {
     });
   }
 
+  /**
+   * Frozen rule: entitlementPoint = MIN(session.startTime,
+   * cancellationTime). A session canceled before its scheduled start
+   * relocates the entitlement point to the cancellation moment; a session
+   * canceled after its scheduled start (including one already LIVE) keeps
+   * the entitlement point at the scheduled start, exactly as markLive
+   * would have evaluated it. evaluateForSession is idempotent, so calling
+   * it again here for a session already evaluated by markLive is always
+   * safe and only ever does real work the first time.
+   */
   async cancel(id: string): Promise<SessionWithRelations> {
     const existing = await this.findOne(id);
 
@@ -207,6 +244,14 @@ export class SessionsService {
         `Session ${id} is ${existing.status} and cannot be canceled (only SCHEDULED or LIVE sessions can be)`,
       );
     }
+
+    const cancellationTime = new Date();
+    const entitlementPoint =
+      cancellationTime.getTime() < existing.startTime.getTime()
+        ? cancellationTime
+        : existing.startTime;
+
+    await this.entitlementService.evaluateForSession(id, entitlementPoint);
 
     return this.prisma.session.update({
       where: { id },

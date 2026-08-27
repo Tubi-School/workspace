@@ -1,0 +1,2083 @@
+TUBI WORKSPACE — PHASE 2F EXTERNAL ARCHITECTURE REVIEW HANDOFF
+Learner Access, Session Entitlement & Attendance Engine.
+Status: CORRECTED per external review verdict "APPROVED SUBJECT TO TWO
+PRE-COMMIT CORRECTIONS." Both corrections have been applied and verified.
+Nothing has been committed, tagged, or pushed; Phase 2G has not begun.
+
+================================================================================
+POST-REVIEW CORRECTIONS (applied after the external reviewer's verdict)
+================================================================================
+
+The external reviewer approved Phase 2F subject to two corrections. Both
+are now applied, tested, and verified. Everything below this point in the
+document describes the CORRECTED implementation (the body of sections A-Q
+has been updated in place rather than left as a stale pre-correction
+snapshot — where a correction changed a fact stated elsewhere in this
+document, that section was rewritten to match).
+
+CORRECTION 1 — exact frozen entitlement point (no longer new Date()):
+  SessionsService.markLive() now evaluates entitlement at
+  `existing.startTime` (the session's own scheduled start), not at the
+  moment the LIVE transition is requested. SessionsService.cancel() now
+  computes `entitlementPoint = MIN(session.startTime, cancellationTime)`
+  explicitly and passes that to EntitlementService.evaluateForSession —
+  never a bare `new Date()`. See sections D/E/P for the corrected
+  wording and source.
+
+CORRECTION 2 — interval-ingestion concurrency gap closed:
+  A new shared helper, `withLearnerSessionLock` (apps/api/src/attendance/
+  learner-session-lock.util.ts), wraps the create-reread-recompute-qualify
+  sequence in both LiveAttendanceIntervalService.ingest and
+  WatchedIntervalService.ingest inside one `prisma.$transaction` that
+  first takes a Postgres transaction-scoped advisory lock
+  (`pg_advisory_xact_lock`) keyed by (sessionId, learnerId). This
+  serializes concurrent ingestion for the same learner+session pair
+  without any schema change. See sections D/F/G/M/P for the corrected
+  wording and source.
+
+================================================================================
+A. PHASE 2F SCOPE
+================================================================================
+
+Exact mission implemented (verbatim intent from the Phase 2F brief):
+
+  Implement the real backend chain: Learner -> SubscriptionAccess ->
+  SessionEntitlementSnapshot -> participation -> AttendanceRecord.
+
+  Make TUBI capable of determining: which learner is entitled to which
+  sessions, why they are entitled, whether they attended LIVE or RECORDED,
+  whether they met the attendance threshold, whether they ultimately
+  become PRESENT or ABSENT.
+
+Concretely, this milestone implemented:
+  A. LearnerProfile creation, wired atomically into public registration.
+  B. SubscriptionAccess as an operational ADMIN-managed access grant.
+  C. SessionEntitlementSnapshot generation at the entitlement point.
+  D. Learner-facing session/attendance read API (identity from JWT only).
+  E. Replacement-session entitlement inheritance across arbitrary chains.
+  F. LiveAttendanceInterval ingestion + merged-coverage 50% LIVE engine.
+  G. SessionRecording publication (ADMIN) + WatchedInterval ingestion
+     (learner) + merged-coverage genuine-100% RECORDED engine.
+  H. Effective attendance cutoff resolution, including
+     AttendanceWindowException (session-wide and learner-specific).
+  I. Idempotent absence finalization (PENDING -> ABSENT after cutoff).
+  J. AttendanceRecord(PENDING) creation at entitlement time (not first
+     participation).
+  K. ADMIN (school-wide) and TEACHER (assignment-scoped) attendance reads.
+  L. ADMIN-only manual attendance override with audit trail.
+
+Deliberately excluded (per the brief's explicit "NOT IN PHASE 2F" list,
+and confirmed still true after implementation):
+  - Payment processor integration; no invoice/card/bank/payment-transaction
+    ledger of any kind exists anywhere in the new code.
+  - Zoom API integration and automatic webhook processing. LIVE interval
+    ingestion is an internal HTTP endpoint a future adapter will call; no
+    Zoom SDK/client exists.
+  - Video hosting integration. SessionRecording.recordingUrl is stored and
+    returned as an opaque string; nothing in this codebase uploads,
+    transcodes, or streams video.
+  - Frontend/UI. Backend only, as instructed.
+  - HAPS, homework, notifications/email/SMS. Not referenced anywhere.
+
+Assumptions used (each is a deliberate, documented engineering decision
+made under the brief's "accelerated execution" instruction to resolve
+non-semantic questions without stopping):
+  1. [CORRECTED per external review Correction 1 — no longer an
+     assumption] The session's frozen "entitlement point" (MIN(
+     session.startTime, cancellationTime)) is now computed and supplied
+     literally, not approximated by a button-press timestamp:
+     SessionsService.markLive() (SCHEDULED -> LIVE) evaluates entitlement
+     at `existing.startTime`, and SessionsService.cancel() evaluates it
+     at `MIN(existing.startTime, new Date())` computed explicitly. The
+     real system events (markLive/cancel being called) remain the
+     triggers that decide WHEN evaluation runs — there is still no
+     scheduler that fires exactly at startTime — but the VALUE passed to
+     evaluateForSession is now the frozen entitlement point itself, not
+     the trigger's own timestamp. For a session canceled directly from
+     SCHEDULED (never having gone LIVE) whose scheduled start has not yet
+     passed, this evaluates to the cancellation instant, matching the
+     frozen rule. For a session canceled from LIVE, or canceled after its
+     scheduled start has passed, this evaluates to session.startTime,
+     matching what markLive would (or already did) evaluate — cancel()
+     still calls evaluateForSession unconditionally in both cases, and
+     evaluateForSession's upsert-based idempotency makes any redundant
+     call a harmless no-op.
+  2. LIVE interval ingestion (POST /admin/sessions/:id/live-intervals) is
+     ADMIN-only in this phase, standing in for a future Zoom adapter or
+     webhook processor — there is no distinct "system"/"service" role in
+     the RBAC model yet.
+  3. AttendanceWindowException precedence follows the frozen domain
+     design's explicit stated order (learner-specific always wins over
+     session-wide, regardless of which was granted more recently or has a
+     later extendedCutoffAt) rather than a general "prefer the latest
+     value" comparison — the frozen design document states an explicit
+     order, which this implementation treats as authoritative over the
+     brief's more general fallback wording.
+  4. Multiple AttendanceWindowException rows may exist at the same scope
+     over time (they are append-only, never updated in place); when more
+     than one applies, the most recently created one is authoritative.
+  5. A learner attempting to read a session/attendance record they are
+     not entitled to receives 404 Not Found, never 403 Forbidden — so a
+     caller cannot distinguish "this session does not exist" from "you
+     have no relationship to it." (Internal, ADMIN-facing entitlement
+     checks in the ingestion services still use 403, since an ADMIN
+     already knows the session exists.)
+  6. No DeliveryMode-based (LIVE_AND_RECORDED vs RECORDED_ONLY) filtering
+     is applied to what a learner's session response exposes — see
+     section M for why this was deferred rather than guessed at.
+
+================================================================================
+B. FILES CREATED / MODIFIED
+================================================================================
+
+--- Created ---
+
+apps/api/src/learners/dto/update-learner.dto.ts
+  DTO: fullName?, isActive? (no email/password).
+
+apps/api/src/learners/learners.controller.ts
+  ADMIN-only: GET /admin/learners, GET /admin/learners/:id,
+  PATCH /admin/learners/:id.
+
+apps/api/src/learners/learners.service.ts
+  findAll/findOne/update over LearnerProfile, always joined to User via an
+  explicit safe `select` (passwordHash never selected).
+
+apps/api/src/learners/learners.module.ts
+  Nest module wiring for the above.
+
+apps/api/src/subscription-access/dto/create-subscription-access.dto.ts
+  learnerId, offeringId, status?, currentPeriodStart, currentPeriodEnd.
+
+apps/api/src/subscription-access/dto/update-subscription-access.dto.ts
+  status?, currentPeriodStart?, currentPeriodEnd? (all optional).
+
+apps/api/src/subscription-access/subscription-access.controller.ts
+  ADMIN-only: POST/GET/GET-one/PATCH /admin/subscription-access[/:id],
+  POST /admin/subscription-access/:id/revoke.
+
+apps/api/src/subscription-access/subscription-access.service.ts
+  create/findAll/findOne/update/revoke with learner-role validation,
+  date-window validation, and overlapping-ACTIVE-grant conflict detection.
+
+apps/api/src/subscription-access/subscription-access.service.spec.ts
+  8 unit tests.
+
+apps/api/src/subscription-access/subscription-access.module.ts
+  Nest module wiring.
+
+apps/api/src/entitlements/entitlement.service.ts
+  Core entitlement engine: evaluateForSession, inheritForReplacement (full
+  source in section P).
+
+apps/api/src/entitlements/entitlement.service.spec.ts
+  10 unit tests.
+
+apps/api/src/entitlements/entitlement.module.ts
+  Nest module wiring; exports EntitlementService for SessionsModule.
+
+apps/api/src/attendance/attendance.service.ts
+  Core attendance engine: assertEntitled, assertTeacherAssignedToSession,
+  getEffectiveCutoff, qualifyLive, qualifyRecorded, finalizeDueRecords,
+  override, and reads (full source in section P).
+  [CORRECTION 2, applied post-review] getEffectiveCutoff, qualifyLive,
+  qualifyRecorded, and markPresentIfPending each gained an optional
+  trailing `db` parameter (type `Db = PrismaService |
+  Prisma.TransactionClient`, defaulting to `this.prisma`) so a caller
+  already inside a transaction (the interval-ingestion services, via
+  withLearnerSessionLock) can run qualification against that same
+  transaction instead of a separate, unlocked connection. No behavior
+  changes for any existing caller that omits the parameter.
+
+apps/api/src/attendance/attendance.service.spec.ts
+  24 unit tests.
+
+apps/api/src/attendance/attendance.controller.ts
+  ADMIN school-wide reads + override + finalize; TEACHER scoped read.
+
+apps/api/src/attendance/attendance-admin.controller.ts
+  ADMIN-only: LIVE interval ingestion, recording publish, window
+  exceptions create/list.
+
+apps/api/src/attendance/attendance.module.ts
+  Nest module wiring; exports AttendanceService, WatchedIntervalService,
+  RecordingService for LearnerPortalModule.
+
+apps/api/src/attendance/live-attendance.service.ts
+  LIVE interval ingestion + coverage recompute + qualification trigger
+  (full source in section P).
+  [CORRECTION 2, applied post-review] The insert-reread-recompute-qualify
+  sequence is now wrapped in `withLearnerSessionLock`, running entirely
+  inside one prisma.$transaction guarded by a per-(sessionId, learnerId)
+  Postgres advisory lock, closing the concurrency gap the review flagged.
+
+apps/api/src/attendance/live-attendance.service.spec.ts
+  7 unit tests (6 pre-existing + 1 new concurrency-locking test).
+  [CORRECTION 2, applied post-review] Added a test asserting exactly one
+  $transaction call and one advisory-lock $queryRaw call per ingest(),
+  and that the reread used for qualification reflects the row just
+  created inside that same locked transaction.
+
+apps/api/src/attendance/watched-interval.service.ts
+  RECORDED interval ingestion + coverage recompute + qualification
+  trigger (full source in section P).
+  [CORRECTION 2, applied post-review] Same withLearnerSessionLock wrapping
+  as LiveAttendanceIntervalService, for the same reason.
+
+apps/api/src/attendance/watched-interval.service.spec.ts
+  8 unit tests (7 pre-existing + 1 new concurrency-locking test).
+  [CORRECTION 2, applied post-review] Added a test asserting exactly one
+  $transaction call and one advisory-lock $queryRaw call per ingest(), and
+  that the lock/transaction is acquired before the create.
+
+apps/api/src/attendance/recording.service.ts
+  SessionRecording publish (ENDED-only, one-per-session) + lookup.
+
+apps/api/src/attendance/recording.service.spec.ts
+  5 unit tests.
+
+apps/api/src/attendance/window-exception.service.ts
+  AttendanceWindowException create/list (full source in section P).
+
+apps/api/src/attendance/interval-merge.util.ts
+  Shared interval union/coverage math (full source in section P).
+
+apps/api/src/attendance/interval-merge.util.spec.ts
+  7 unit tests.
+
+apps/api/src/attendance/learner-session-lock.util.ts  [ADDED — CORRECTION 2]
+  withLearnerSessionLock: runs a callback inside a prisma.$transaction
+  after taking a transaction-scoped Postgres advisory lock keyed by
+  (sessionId, learnerId) — the fix for the concurrency gap the review
+  identified. Full source in section P.
+
+apps/api/src/attendance/learner-session-lock.util.spec.ts  [ADDED — CORRECTION 2]
+  3 unit tests (lock-before-callback ordering, return-value passthrough,
+  failure propagation).
+
+apps/api/src/attendance/dto/create-live-interval.dto.ts
+  learnerId, joinedAt, leftAt.
+
+apps/api/src/attendance/dto/create-watched-interval.dto.ts
+  startSecond, endSecond (no learnerId — derived from JWT by the caller).
+
+apps/api/src/attendance/dto/create-window-exception.dto.ts
+  learnerId?, reason, extendedCutoffAt, note?.
+
+apps/api/src/attendance/dto/publish-recording.dto.ts
+  recordingUrl, availableFrom?, totalSeconds.
+
+apps/api/src/attendance/dto/override-attendance.dto.ts
+  newStatus, completionMode?/completedAt? (required together only when
+  newStatus is PRESENT, via @ValidateIf), reason (always required).
+
+apps/api/src/learner-portal/learner-portal.service.ts
+  resolveLearnerProfileId, listEntitledSessions, getEntitledSession — all
+  entitlement-filtered (full source referenced in section P/F).
+
+apps/api/src/learner-portal/learner-portal.controller.ts
+  LEARNER-only: GET sessions, GET sessions/:id, GET sessions/:id/attendance,
+  POST sessions/:id/recording/watched-intervals.
+
+apps/api/src/learner-portal/learner-portal.module.ts
+  Nest module wiring; imports AttendanceModule.
+
+apps/api/src/attendance-rbac.http.spec.ts
+  10 integration tests (real guards/strategy/signed tokens, faked Prisma)
+  covering the full RBAC/privacy matrix.
+
+--- Modified ---
+
+apps/api/src/app.module.ts
+  Registered LearnersModule, SubscriptionAccessModule, EntitlementModule,
+  AttendanceModule, LearnerPortalModule (10 lines added).
+
+apps/api/src/auth/auth.service.ts
+  register() now wraps User creation + LearnerProfile creation in
+  prisma.$transaction (26 lines changed — see section P for full diff
+  context, section E note in the completion report family).
+
+apps/api/src/auth/auth.service.spec.ts
+  +47 lines: two new tests (atomic LearnerProfile creation; no
+  LearnerProfile/User created on duplicate-email rejection) plus
+  $transaction/learnerProfile mock plumbing.
+
+apps/api/src/auth/auth.http.spec.ts
+  +8 lines: fake Prisma extended with $transaction/learnerProfile so the
+  existing HTTP-level registration/login tests keep passing against the
+  new transactional register() path.
+
+apps/api/src/sessions/sessions.service.ts
+  Injected EntitlementService; markLive() calls evaluateForSession before
+  transitioning to LIVE; cancel() calls evaluateForSession before
+  transitioning to CANCELED; create() calls inheritForReplacement when
+  replacementForSessionId is supplied.
+  [CORRECTION 1, applied post-review] markLive() now passes
+  `existing.startTime` — the session's own scheduled start — instead of
+  `new Date()`, so entitlement is evaluated at the frozen entitlement
+  point regardless of when the LIVE button is actually pressed. cancel()
+  now computes `entitlementPoint = MIN(session.startTime,
+  cancellationTime)` explicitly and passes that value, instead of a bare
+  `new Date()`.
+
+apps/api/src/sessions/sessions.module.ts
+  Imports EntitlementModule.
+
+apps/api/src/sessions/sessions.service.spec.ts
+  EntitlementService mock wiring; assertions that markLive/cancel/
+  replacement-create call it with the expected arguments; a test proving
+  an ordinary (non-replacement) session never triggers
+  inheritForReplacement.
+  [CORRECTION 1, applied post-review] Added: a test proving markLive
+  evaluates entitlement at session.startTime when pressed late (11:07 for
+  an 11:00 session); a test proving markLive evaluates at startTime when
+  pressed early (startTime set far in the future, so a leaked `now` would
+  fail the assertion); a test proving cancel() before the scheduled start
+  evaluates at the cancellation timestamp (not startTime); a test proving
+  cancel() after the scheduled start evaluates at startTime (not the
+  cancellation timestamp).
+
+================================================================================
+C. DATABASE / PRISMA CHANGES
+================================================================================
+
+NONE. No model was added or changed. No field was added or changed. No
+enum was added or changed. No relation was added or changed. No index was
+added or changed. No unique constraint was added or changed. No migration
+file was created.
+
+apps/api/prisma/schema.prisma and every file under
+apps/api/prisma/migrations/ are byte-for-byte identical to the Phase 2E
+commit (cf06ab1c358542ff1d7c9014edddbef91ecabe32). `prisma validate`
+(section L) confirms no drift. `git status`/`git diff` (section N) confirm
+neither the schema file nor any migration file appears in the Phase 2F
+working-tree changes at all.
+
+The frozen Phase 2A schema semantics were not changed in any respect.
+Every model this milestone needed — LearnerProfile, SubscriptionAccess,
+SessionEntitlementSnapshot, AttendanceRecord, AttendanceOverride,
+AttendanceWindowException, SessionRecording, WatchedInterval,
+LiveAttendanceInterval, Offering, OfferingCourse — already existed with
+every field this implementation required (including the
+sessionId_learnerId and sessionId_teacherId compound-unique lookups this
+milestone relies on for upsert/idempotency, all pre-existing).
+
+No mechanical Prisma adaptation was necessary (unlike the Phase 2A -> 2B
+transition, which needed one for a missing relation object on
+SessionEntitlementSnapshot.subscriptionAccessId). The frozen schema was
+already complete for Phase 2F's purposes.
+
+================================================================================
+D. BACKEND IMPLEMENTATION
+================================================================================
+
+--- LearnersService (apps/api/src/learners/learners.service.ts) ---
+Purpose: ADMIN read/management surface over LearnerProfile rows created by
+public registration.
+Public methods: findAll(), findOne(id), update(id, dto).
+Business rules: passwordHash never selected (explicit Prisma `select` on
+the `user` relation); no create endpoint (learners are created only via
+AuthService.register); no delete endpoint (a LearnerProfile may already be
+referenced by SubscriptionAccess/SessionEntitlementSnapshot/
+AttendanceRecord/interval tables) — `isActive` on the underlying User row
+is the supported deactivation path.
+Transactions: none needed (single-table reads/updates plus one User
+update).
+Authorization: ADMIN-only, class-level `@Roles('ADMIN')` on
+LearnersController.
+Failure behavior: findOne/update throw NotFoundException (404) for a
+missing id.
+
+--- SubscriptionAccessService (apps/api/src/subscription-access/subscription-access.service.ts) ---
+Purpose: operational surface for the SubscriptionAccess access-grant
+model.
+Public methods: create(dto), findAll(), findOne(id), update(id, dto),
+revoke(id).
+Business rules: learner must exist (404) and hold role LEARNER (409);
+offering must exist (404); currentPeriodStart strictly before
+currentPeriodEnd (400, `assertValidWindow`); for any grant whose resulting
+status is ACTIVE, no overlapping ACTIVE grant may already exist for the
+same (learnerId, offeringId) pair (409, `assertNoOverlappingActiveGrant`)
+— checked on create and on update whenever the post-update status is
+ACTIVE; non-ACTIVE grants (e.g. importing historical CANCELED/EXPIRED
+records) skip the overlap check entirely; revoke() moves ACTIVE/PAST_DUE
+to CANCELED (409 if already CANCELED/EXPIRED) — never a delete.
+Transactions: none — the service relies on the pre-check plus the
+downstream 404/409 semantics rather than a transactional write (a genuine
+concurrent-duplicate-grant race is not fully closed by this
+implementation — see section M).
+Authorization: ADMIN-only for every method, including reads (class-level
+`@Roles('ADMIN')`).
+Failure behavior: NotFoundException (404) for missing learner/offering/
+grant id; BadRequestException (400) for an invalid date window;
+ConflictException (409) for an overlapping grant or an already-terminal
+revoke target.
+
+--- EntitlementService (apps/api/src/entitlements/entitlement.service.ts) ---
+See section E for full behavioral documentation and section P for full
+source. Public methods: evaluateForSession(sessionId, entitlementPoint),
+inheritForReplacement(originalSessionId, replacementSessionId). Private:
+writeEntitlementAndPendingAttendance (the shared idempotent-upsert
+primitive both public methods funnel through). Transaction boundary: each
+learner's (SessionEntitlementSnapshot upsert + AttendanceRecord upsert)
+pair is one prisma.$transaction — the smallest unit that must be atomic;
+the loop across learners is not itself one big transaction (each
+learner's write is independently idempotent, so partial completion across
+learners on a crash is safe to resume by re-running). No controller
+directly exposes this service — it is called only from SessionsService.
+No direct HTTP authorization surface of its own.
+
+--- AttendanceService (apps/api/src/attendance/attendance.service.ts) ---
+See sections F, G, H, I, K, L for full behavioral documentation and
+section P for full source. Public methods: assertEntitled,
+assertTeacherAssignedToSession, getEffectiveCutoff, qualifyLive,
+qualifyRecorded, finalizeDueRecords, override, getSessionAttendance,
+getLearnerAttendanceHistory, getOneAttendanceRecord, getCoverageSummary.
+Transaction boundary: override() wraps the AttendanceOverride insert and
+the AttendanceRecord update in one prisma.$transaction. qualifyLive/
+qualifyRecorded use `updateMany` with a `status: PENDING` guard instead of
+a transaction — this is a deliberate compare-and-swap pattern, not an
+oversight (see section E/F concurrency notes). Authorization: enforced by
+the controllers that call this service (AttendanceController,
+AttendanceAdminController, LearnerPortalController), not by
+AttendanceService itself, which is a plain injectable with no guard
+awareness — see section J.
+
+--- LiveAttendanceIntervalService / WatchedIntervalService ---
+Purpose: interval ingestion (LIVE and RECORDED respectively) plus coverage
+recompute and qualification triggering. Neither owns any attendance-state
+logic itself — both end by calling into AttendanceService.qualifyLive/
+qualifyRecorded. Full source and behavior in sections F, G, P.
+
+--- RecordingService (apps/api/src/attendance/recording.service.ts) ---
+Purpose: publish/read SessionRecording. publish(sessionId, dto) requires
+the session to exist (404) and be ENDED (409 otherwise); the schema's
+`sessionId @unique` constraint is the actual "one recording per session"
+enforcement — a second publish attempt is caught (Prisma P2002) and
+translated to 409 rather than surfacing a raw database error.
+findForSession(sessionId) throws NotFoundException (404) if no recording
+has been published yet — used by WatchedIntervalService before any
+interval can be ingested. No transaction needed (single insert).
+Authorization: ADMIN-only (publish, via AttendanceAdminController).
+
+--- WindowExceptionService (apps/api/src/attendance/window-exception.service.ts) ---
+Purpose: create/list AttendanceWindowException rows. create() validates
+the session exists (404) and, if learnerId is supplied, that the
+LearnerProfile exists (404). grantedByUserId is always the authenticated
+caller's User id (never client-supplied). No transaction needed (single
+insert). Authorization: ADMIN-only (AttendanceAdminController).
+
+--- LearnerPortalService (apps/api/src/learner-portal/learner-portal.service.ts) ---
+Purpose: learner-facing session/attendance visibility, entirely filtered
+through SessionEntitlementSnapshot.wasEntitled. resolveLearnerProfileId
+throws ForbiddenException (403) if the authenticated User has no
+LearnerProfile at all (should be unreachable for a normal LEARNER account
+post-Phase-2F, but defensive). listEntitledSessions/getEntitledSession
+both throw NotFoundException (404) — never 403 — for a session the caller
+is not entitled to, so existence is never confirmed to an unrelated
+caller. No transactions (read-only).
+
+================================================================================
+E. SESSION ENTITLEMENT
+================================================================================
+
+Entitlement point [CORRECTED per external review Correction 1]: the
+frozen entitlement point is now supplied literally rather than
+approximated by a button-press timestamp.
+
+  - Normal session: SessionsService.markLive() is the trigger, but the
+    value passed is `existing.startTime` — the session's own scheduled
+    start — not the moment the LIVE transition happens to be requested.
+    `evaluateForSession(id, existing.startTime)`. Whether an ADMIN
+    presses LIVE seven minutes late or twenty minutes early, entitlement
+    is evaluated as of the session's scheduled start either way.
+
+  - Cancellation before scheduled start: SessionsService.cancel()
+    computes `entitlementPoint = cancellationTime.getTime() <
+    existing.startTime.getTime() ? cancellationTime : existing.startTime`
+    — i.e. `MIN(session.startTime, cancellationTime)` — and passes that
+    computed value to evaluateForSession. When cancellation happens before
+    the scheduled start, this evaluates to the cancellation instant.
+
+  - Cancellation after scheduled start (including a session already
+    LIVE): the same MIN expression evaluates to `existing.startTime`,
+    matching what markLive would already have evaluated. cancel() still
+    calls evaluateForSession unconditionally in this case (no branch
+    distinguishes "already evaluated by markLive" from "not yet
+    evaluated") — evaluateForSession's upsert-based idempotency (see
+    below) makes this a harmless no-op when redundant.
+
+This exactly matches the reviewer's required formula: entitlementPoint =
+MIN(session.startTime, cancellationTime), where cancellationTime exists
+only for a cancellation event, and the normal (non-canceled) case
+resolves to session.startTime with no dependency on when markLive is
+actually invoked.
+
+Subscription eligibility: evaluateForSession resolves every Offering
+covering the session's Course via OfferingCourse, then queries
+SubscriptionAccess rows with status ACTIVE, offeringId in that set, and
+currentPeriodStart <= entitlementPoint <= currentPeriodEnd. A learner
+holding more than one qualifying grant still gets exactly one snapshot
+(first-seen-wins, deterministic via Map insertion order).
+
+Persistence: one SessionEntitlementSnapshot row per (sessionId,
+learnerId), written via `upsert` with `update: {}` (a deliberate no-op) —
+an existing snapshot's wasEntitled/subscriptionAccessId is never
+overwritten once written, preserving it as historical truth. One
+AttendanceRecord(PENDING) row is written in the same upsert step, same
+guarantee.
+
+Replacement-session inheritance: SessionsService.create(), when given
+replacementForSessionId, validates the target is CANCELED (pre-existing
+Phase 2E logic, unchanged) and then calls
+`entitlementService.inheritForReplacement(target.id, newSession.id)`.
+inheritForReplacement reads every wasEntitled snapshot on the original and
+upserts a corresponding snapshot on the replacement, with
+inheritedFromSnapshotId pointing at the exact snapshot it copied from —
+never recalculated from current SubscriptionAccess state (the method
+contains no query against subscriptionAccess at all).
+
+Repeated replacement chains: because inheritForReplacement always reads
+its immediate input session's own snapshots (not a globally-resolved
+"original"), a chain Original -> Replacement A -> Replacement B produces
+inheritedFromSnapshotId links where B's snapshot points at A's snapshot
+and A's snapshot points at Original's snapshot — full ancestry is
+recoverable by walking the chain. Verified directly by
+entitlement.service.spec.ts's "preserves inheritance across a
+multi-generation chain" test.
+
+Protection against duplicate entitlement creation / idempotency &
+concurrency: the unique constraint on SessionEntitlementSnapshot
+(sessionId, learnerId) — pre-existing, frozen schema — is the actual
+backstop; `upsert` is the application-level mechanism that makes repeated
+or concurrent calls to evaluateForSession/inheritForReplacement for the
+same session converge on the same row rather than erroring or duplicating.
+Each learner's snapshot+attendance pair is written inside its own
+`prisma.$transaction`, so a crash partway through a multi-learner
+evaluation leaves only fully-consistent (snapshot, attendance-record)
+pairs behind — never a snapshot with no matching attendance record or vice
+versa.
+
+================================================================================
+F. LIVE ATTENDANCE ENGINE
+================================================================================
+
+Interval creation/storage: LiveAttendanceIntervalService.ingest(sessionId,
+dto) — dto is `{ learnerId, joinedAt, leftAt }` (both required in this
+phase; see section M for the "no open interval" simplification). Each
+ingested interval is a complete, closed LiveAttendanceInterval row.
+
+[CORRECTED per external review Correction 2] The insert, the full reread
+of that learner's intervals, the coverage recompute, and the
+qualification call are now all performed inside one
+`withLearnerSessionLock(prisma, sessionId, learnerId, ...)` call — a
+single `prisma.$transaction` that first takes a transaction-scoped
+Postgres advisory lock (`pg_advisory_xact_lock(hashtext(sessionId + ':' +
+learnerId)::bigint)`) before running the create/reread/recompute/qualify
+sequence. Two concurrent ingest() calls for the same (sessionId,
+learnerId) pair are now fully serialized — the second call's transaction
+blocks until the first commits (releasing the lock), so it always rereads
+the first call's already-committed interval, and coverage is never
+computed from a stale pre-insert snapshot. Concurrent calls for different
+learners or different sessions never contend with each other (different
+hash keys, no shared lock). See section P for the exact source of
+`withLearnerSessionLock`.
+
+Validation before write: session must exist (404); joinedAt strictly
+before leftAt (400); learner must have an entitlement snapshot with
+wasEntitled true (403, via AttendanceService.assertEntitled).
+
+Cumulative interval calculation: after inserting the new row, ALL of that
+learner's LiveAttendanceInterval rows for the session are re-read from the
+database (never accumulated incrementally in memory across calls). Each
+raw [joinedAt, leftAt] range is clipped to `[session.startTime,
+session.endTime]` via `clipInterval` (open connections — `leftAt: null` —
+are treated as open-until-now via `leftAt ?? new Date()`, though this
+phase's DTO requires leftAt, so this branch exists for
+defensiveness/forward-compatibility). Clipped ranges are then merged via
+`mergeIntervals` (sorts by start, coalesces any overlap or adjacency) and
+summed via `totalCoverage`.
+
+Clipping to official session start/end: performed before merging, via
+`clipInterval(rawInterval, { start: session.startTime, end:
+session.endTime })` — a raw interval extending before startTime or after
+endTime is truncated to the overlap only; an interval with no overlap at
+all is dropped (`clipInterval` returns null, filtered out).
+
+Overlap handling / reconnect handling / duplicates: because coverage is
+always recomputed from the full merged set of ALL rows (not accumulated
+per-call), two overlapping intervals collapse into their union
+(mergeIntervals), so overlap never double-counts; two genuinely
+disconnected intervals (a reconnect after a drop) both survive the merge
+as separate spans and their durations both contribute to the sum — this is
+what "temporary disconnects accumulate" means concretely. An exact
+duplicate interval merges into the same single span as the original,
+contributing no extra coverage.
+
+Scheduled-duration calculation:
+`session.endTime.getTime() - session.startTime.getTime()`, in
+milliseconds.
+
+>= 50% threshold: AttendanceService.qualifyLive is called with the
+recomputed `coverageMs` and `scheduledDurationMs`; it returns immediately
+(no-op) if `coverageMs < scheduledDurationMs * 0.5` — a strict
+less-than, so coverage exactly equal to 50% passes through to
+qualification (verified by test with an exact-boundary case).
+
+When AttendanceRecord becomes PRESENT: qualifyLive calls
+`markPresentIfPending(sessionId, learnerId, CompletionMode.LIVE,
+qualifiedAt)`, where `qualifiedAt` is the `leftAt` timestamp of the
+interval that was just ingested (i.e. the moment the learner's connection
+that pushed cumulative coverage over the threshold ended). This is a
+reasonable, documented choice for "timestamp when qualification was
+achieved" given intervals are ingested as already-closed spans rather than
+streamed live.
+
+completionMode/completedAt behavior: `markPresentIfPending` first
+resolves the effective cutoff (section H); if `qualifiedAt` is after that
+cutoff, it returns without writing anything — the record stays PENDING
+(to be finalized ABSENT later by section I's finalizer, exactly as if
+nothing had happened). Otherwise it performs
+`attendanceRecord.updateMany({ where: { sessionId, learnerId, status:
+PENDING }, data: { status: PRESENT, completionMode: LIVE, completedAt:
+qualifiedAt } })` — the `status: PENDING` guard in the WHERE clause is
+what makes this safe under concurrent qualification attempts and
+guarantees an already-PRESENT record is never re-written or downgraded.
+
+Behavior after cutoff: covered above — a genuine qualification event
+after the effective cutoff is silently discarded (the record is left
+exactly as it was), never treated as attendance.
+
+================================================================================
+G. RECORDED ATTENDANCE ENGINE
+================================================================================
+
+Recording availability: RecordingService.publish (ADMIN-only) requires
+the session to be ENDED; the resulting SessionRecording row (recordingUrl,
+availableFrom, totalSeconds) is what WatchedIntervalService.ingest reads
+via RecordingService.findForSession(sessionId), which throws
+NotFoundException (404) if no recording has been published yet — so
+progress cannot be ingested against a session with no recording at all.
+
+Progress interval storage: WatchedIntervalService.ingest(sessionId,
+learnerId, dto) — dto is `{ startSecond, endSecond }`, integers, no
+learnerId field (always the value the controller resolved from the JWT).
+Validation: startSecond strictly less than endSecond (400); learner
+entitled (403, assertEntitled); recording exists (404, via
+findForSession); interval falls within `[0, recording.totalSeconds]`
+(400) — both a negative startSecond and an endSecond beyond the recording
+duration are rejected. The interval is then inserted as a WatchedInterval
+row scoped to `sessionRecordingId` + `learnerId`.
+
+[CORRECTED per external review Correction 2] As with the LIVE engine, the
+insert/reread/recompute/qualify sequence now runs inside
+`withLearnerSessionLock`, under the same per-(sessionId, learnerId)
+Postgres advisory lock, closing the same concurrency gap for RECORDED
+ingestion.
+
+Unique timeline coverage calculation: identical pattern to the LIVE
+engine — after insert, ALL of that learner's WatchedInterval rows for this
+recording are re-read, mapped to `{start: startSecond, end: endSecond}`,
+merged via `mergeIntervals`, and summed via `totalCoverage`. No
+client-supplied percentage is ever accepted (CreateWatchedIntervalDto has
+no such field).
+
+Overlap/duplicate handling: identical to LIVE — merge collapses
+overlapping or duplicate ranges into their union, so they cannot inflate
+the coverage sum.
+
+Skipped portions: because coverage is the sum of the *merged* set, not
+"latest timestamp reached," a client that jumps from second 120 to second
+3480 (skipping the middle of an hour-long recording) produces two
+disjoint merged intervals whose combined duration is nowhere near
+totalSeconds — the brief's own example (0-15 + 30-60 of a 60-minute
+recording = 45 minutes, not 100%) is a direct, named test case in
+watched-interval.service.spec.ts.
+
+Genuine 100% coverage requirement: AttendanceService.qualifyRecorded
+returns (no-op) if `coverageSeconds < totalSeconds` — a strict less-than,
+so anything short of the full integer-second duration fails; there is no
+tolerance constant anywhere in this code, because WatchedInterval.
+startSecond/endSecond are already whole integers (`Int` in the frozen
+schema) — there is no sub-second rounding question to tolerate in the
+first place, so no tolerance was introduced.
+
+Cutoff enforcement: identical mechanism to LIVE — qualifyRecorded calls
+the same `markPresentIfPending`, which resolves the effective cutoff and
+discards (leaves PENDING) any qualification event timestamped after it.
+
+AttendanceRecord transition to PRESENT / completionMode/completedAt: same
+`markPresentIfPending` path as LIVE, with `CompletionMode.RECORDED` and
+`qualifiedAt = new Date()` (the moment the ingest call that pushed
+coverage to 100% was processed) as the timestamp, guarded by the same
+`status: PENDING` compare-and-swap update.
+
+================================================================================
+H. ATTENDANCE CUTOFF AND ABSENCE
+================================================================================
+
+Africa/Johannesburg academic-day handling and the normal 23:59 cutoff:
+unchanged from Phase 2E — `Session.attendanceCutoffAt` is computed at
+session-creation/update time by `computeAttendanceCutoffAtUtc` (apps/api/
+src/sessions/academic-timezone.util.ts, not modified in Phase 2F) and
+stored as a plain UTC DateTime column. Phase 2F reads this column as the
+fallback tier of `AttendanceService.getEffectiveCutoff` — it does not
+recompute or reinterpret it.
+
+Session-wide exceptions: an AttendanceWindowException row with `learnerId:
+null`, created via WindowExceptionService.create (ADMIN-only,
+`POST /admin/sessions/:id/window-exceptions` with no learnerId in the
+body).
+
+Learner-specific exceptions: the same entity/endpoint with `learnerId` set
+to a specific LearnerProfile id (validated to exist, 404 otherwise).
+
+Precedence: `AttendanceService.getEffectiveCutoff(sessionId, learnerId)`
+checks, in this exact order: (1) the most recent learner-specific
+exception for this (session, learner) pair — if found, its
+`extendedCutoffAt` is returned immediately, full stop; (2) else the most
+recent session-wide exception for this session — if found, its
+`extendedCutoffAt` is returned; (3) else `session.attendanceCutoffAt`.
+This is a strict override hierarchy, not a "pick whichever value is
+chronologically latest" comparison — verified directly by a test where the
+session-wide grant's extendedCutoffAt is chronologically later than the
+learner-specific one, and the learner-specific one still wins.
+
+How PENDING becomes ABSENT: `AttendanceService.finalizeDueRecords()`
+reads every AttendanceRecord currently `status: PENDING`, computes each
+one's effective cutoff, and for any where `now > effectiveCutoff`,
+executes `attendanceRecord.updateMany({ where: { sessionId, learnerId,
+status: PENDING }, data: { status: ABSENT, completionMode: null,
+completedAt: null } })`.
+
+Confirmation that ABSENT has completionMode = null and completedAt =
+null: yes — both are explicitly set to `null` in the same `updateMany`
+call that sets `status: ABSENT`; there is no code path anywhere that sets
+ABSENT with either field populated.
+
+Idempotency of finalization: the `status: PENDING` guard in every
+`updateMany`'s WHERE clause means a record already moved off PENDING (by
+this same finalizer on a prior run, by a concurrent run, or by having
+qualified PRESENT in the interim) contributes 0 to the affected-row count
+and is never touched again. `finalizeDueRecords` is exposed as
+`POST /admin/attendance/finalize` (ADMIN-only) — a plain, repeatable,
+side-effect-safe call, with no scheduler wired to it yet (deliberately, per
+the brief).
+
+================================================================================
+I. API ENDPOINTS
+================================================================================
+
+Learners:
+  GET    /admin/learners                 ADMIN   list
+  GET    /admin/learners/:id              ADMIN   get one (404 if missing)
+  PATCH  /admin/learners/:id              ADMIN   body: UpdateLearnerDto
+                                                   (fullName?, isActive?)
+
+Subscription access:
+  POST   /admin/subscription-access                  ADMIN   body: CreateSubscriptionAccessDto
+                                                              201; 404 learner/offering missing;
+                                                              400 invalid window; 409 overlap
+  GET    /admin/subscription-access                   ADMIN   list
+  GET    /admin/subscription-access/:id                ADMIN   get one (404)
+  PATCH  /admin/subscription-access/:id                ADMIN   body: UpdateSubscriptionAccessDto
+  POST   /admin/subscription-access/:id/revoke         ADMIN   409 if already CANCELED/EXPIRED
+
+Attendance operational (all ADMIN-only):
+  POST   /admin/sessions/:sessionId/live-intervals             body: CreateLiveIntervalDto
+                                                                 201; 404 session; 400 malformed
+                                                                 interval; 403 learner not entitled
+  POST   /admin/sessions/:sessionId/recording                   body: PublishRecordingDto
+                                                                 201; 404 session; 409 not ENDED or
+                                                                 already published
+  GET    /admin/sessions/:sessionId/window-exceptions            list
+  POST   /admin/sessions/:sessionId/window-exceptions            body: CreateWindowExceptionDto
+                                                                 201; 404 session/learner
+  GET    /admin/attendance/sessions/:sessionId                    all records for a session
+  GET    /admin/attendance/learners/:learnerId                    one learner's full history
+  GET    /admin/attendance/sessions/:sessionId/learners/:learnerId/coverage
+                                                                 liveCoverageMs/recordedCoverageSeconds
+  POST   /admin/attendance/:attendanceRecordId/override           body: OverrideAttendanceDto
+                                                                 200; 404 missing record; 400 no
+                                                                 reason / missing completionMode+
+                                                                 completedAt when newStatus=PRESENT
+  POST   /admin/attendance/finalize                               200; { finalizedCount }
+
+Teacher (assignment-scoped):
+  GET    /teacher/attendance/sessions/:sessionId          TEACHER  403 if not assigned to the
+                                                                    session (any role)
+
+Learner (identity always from JWT, never from a path/body param):
+  GET    /learner/sessions                                 LEARNER  entitled sessions only
+  GET    /learner/sessions/:id                              LEARNER  404 if not entitled
+  GET    /learner/sessions/:id/attendance                    LEARNER  404 if not entitled; own
+                                                                       AttendanceRecord + coverage
+  POST   /learner/sessions/:id/recording/watched-intervals    LEARNER  body: CreateWatchedIntervalDto
+                                                                       (startSecond, endSecond only)
+                                                                       201; 404 not entitled/no
+                                                                       recording; 400 malformed/
+                                                                       out-of-range interval
+
+All routes above are additionally gated by JwtAuthGuard (401 with no/
+invalid/expired/wrong-algorithm token) before RolesGuard is ever
+evaluated — unchanged Phase 2C infrastructure, reused as-is.
+
+================================================================================
+J. AUTHORIZATION
+================================================================================
+
+ADMIN can:
+  - Read and manage LearnerProfiles (list/get/deactivate; never delete).
+  - Create/read/update/revoke SubscriptionAccess grants.
+  - Ingest LIVE intervals on behalf of the (future) Zoom adapter.
+  - Publish recordings.
+  - Create and list AttendanceWindowException rows, session-wide or
+    learner-specific.
+  - Read attendance school-wide, by session or by learner, including
+    coverage summaries.
+  - Perform manual attendance overrides (with mandatory reason and
+    automatic audit attribution).
+  - Trigger absence finalization on demand.
+  - Everything TEACHER/LEARNER can do is a strict subset of ADMIN's
+    access in this milestone — there is no ADMIN-exclusive learner-portal
+    or teacher-portal route ADMIN is blocked from; ADMIN simply has its
+    own separate, broader `/admin/*` surface instead.
+
+TEACHER can:
+  - Read attendance for a session ONLY if their own TeacherProfile has a
+    SessionTeacher row for that session, in ANY of the three roles
+    (PRIMARY, ASSISTANT, or SUBSTITUTE) — `assertTeacherAssignedToSession`
+    does not distinguish between the three roles for this read-scoping
+    check; all three grant the same attendance-read visibility for that
+    session. A TEACHER with no SessionTeacher row for a session gets 403.
+  - Cannot mutate anything in this module: no TEACHER route exists for
+    subscription access, window exceptions, recording publication, LIVE
+    ingestion, or override — TEACHER-role requests to any ADMIN-only route
+    are rejected by RolesGuard before reaching a controller method (403).
+  - No PRIMARY/ASSISTANT/SUBSTITUTE distinction is implemented for
+    authorization purposes in Phase 2F beyond "assigned in any role
+    grants the same read access" — the brief's staffing-role distinctions
+    (from Phase 2E) are not further refined here; Phase 2F does not
+    introduce any new role-specific permission tied to PRIMARY vs
+    ASSISTANT vs SUBSTITUTE.
+
+LEARNER can:
+  - List and read only sessions they hold a `wasEntitled: true`
+    SessionEntitlementSnapshot for; anything else reads as 404.
+  - Read only their own AttendanceRecord and coverage summary, for an
+    entitled session; the learnerId used is always resolved from the JWT,
+    never accepted from the client.
+  - Submit their own WatchedInterval progress for an entitled session with
+    a published recording; cannot submit on behalf of another learner
+    (no learnerId field exists in the DTO to do so).
+  - Cannot create/read AttendanceWindowException rows, cannot ingest LIVE
+    intervals, cannot publish recordings, cannot perform overrides, cannot
+    trigger finalization, cannot read another learner's data in any form.
+
+================================================================================
+K. TEST COVERAGE
+================================================================================
+
+Totals [CORRECTED after post-review fixes]: 223 tests across 21 suites
+(143 pre-existing before Phase 2F + 71 from the original Phase 2F
+implementation + 9 added for the two post-review corrections). The 9 new
+tests break down as: 4 in sessions.service.spec.ts for Correction 1's
+exact entitlement-timing (markLive late, markLive early, cancel before
+scheduled start, cancel after scheduled start); 1 new concurrency-locking
+test in live-attendance.service.spec.ts and 1 in
+watched-interval.service.spec.ts for Correction 2; 3 in the new
+learner-session-lock.util.spec.ts covering the lock utility itself
+(lock-before-callback ordering, return-value passthrough, failure
+propagation). New suites and what each proves:
+
+entitlement.service.spec.ts (10 tests)
+  - snapshot + PENDING attendance created for a learner with a valid
+    ACTIVE grant
+  - no snapshot for a learner with no qualifying grant
+  - query correctness (offeringId in-set, status ACTIVE, period covers
+    entitlementPoint)
+  - IDEMPOTENCY: calling evaluateForSession twice upserts (never
+    duplicates), asserting the `update: {}` no-op on both calls
+  - no-op when the course is covered by no Offering at all
+  - REPLACEMENT INHERITANCE: copies wasEntitled snapshots with
+    inheritedFromSnapshotId set
+  - REPEATED REPLACEMENT CHAIN: each link points only to its immediate
+    parent (Replacement B -> Replacement A's snapshot, not the Original's)
+  - no inheritance for snapshots the original never had (wasEntitled:
+    false excluded by query)
+  - CANCELLATION/EXPIRED-SUBSCRIPTION-DOES-NOT-BLOCK-INHERITANCE:
+    inheritForReplacement never queries subscriptionAccess at all —
+    asserted directly
+
+attendance.service.spec.ts (24 tests)
+  - assertEntitled: pass/ForbiddenException
+  - CUTOFF PRECEDENCE: normal-only, session-wide-only, and
+    learner-specific-overrides-session-wide-even-when-chronologically-later
+    (3 tests)
+  - LIVE 50% THRESHOLD: just-under-50% (29m59s of 60min) stays PENDING;
+    EXACTLY 50% (30/60) qualifies PRESENT; ABOVE 50% (45/60) qualifies;
+    qualification after effective cutoff is discarded (4 tests)
+  - RECORDED 100% THRESHOLD: partial (59/60) stays PENDING; genuine 100%
+    (3600/3600) qualifies PRESENT; genuine 100% after cutoff is discarded
+    (3 tests)
+  - ABSENCE FINALIZATION: PENDING past cutoff -> ABSENT with null
+    completion fields; PENDING before cutoff untouched; IDEMPOTENCY
+    (second run reports 0 additional finalized) (3 tests)
+  - OVERRIDE: requires reason + records audit attribution; 404 for
+    missing record; never touches LiveAttendanceInterval/WatchedInterval
+    tables (asserted via not-called mocks) (3 tests)
+  - assertTeacherAssignedToSession: pass/ForbiddenException (2 tests)
+
+interval-merge.util.spec.ts (7 tests)
+  - OVERLAPPING intervals merge (union, not sum)
+  - exact DUPLICATE interval does not inflate coverage
+  - SKIPPED span (0-15 + 30-60 of 60) leaves a genuine 45-minute gap, not
+    100%
+  - disconnected/RECONNECT intervals accumulate correctly
+  - empty-input edge case
+  - clipInterval bounds-clipping and outside-bounds-returns-null (2 tests)
+
+live-attendance.service.spec.ts (7 tests — 6 original + 1 added for
+Correction 2)
+  - 404 for a nonexistent session
+  - 400 for a malformed interval (joinedAt >= leftAt)
+  - 403 for a non-entitled learner
+  - INTERVAL CLIPPING: an interval extending 30 minutes before/after the
+    scheduled window is clipped to exactly the 60-minute scheduled window
+    before qualifyLive is called
+  - RECONNECT/ACCUMULATION: two disconnected intervals (20min + 15min)
+    sum correctly (not just the latest one)
+  - CONCURRENCY [added, Correction 2]: ingest() calls $transaction and the
+    advisory-lock $queryRaw exactly once each, and the reread used for
+    qualification reflects the row created inside that same locked
+    transaction (proving the create-reread-qualify sequence runs against
+    one consistent, locked context rather than separate unlocked reads)
+
+watched-interval.service.spec.ts (8 tests — 7 original + 1 added for
+Correction 2)
+  - partial coverage alone does not qualify
+  - 400 for startSecond >= endSecond
+  - 403 for a non-entitled learner
+  - 400 for an interval extending past the recording duration
+  - SKIPPED SECTION: the brief's exact example (0-15 + 30-60 of 60 min =
+    45 min, not 100%)
+  - OVERLAPPING interval does not inflate coverage
+  - GENUINE 100%: full timeline merged across two intervals qualifies
+  - CONCURRENCY [added, Correction 2]: ingest() calls $transaction and the
+    advisory-lock $queryRaw exactly once each, and the transaction/lock is
+    acquired before the create runs
+
+learner-session-lock.util.spec.ts (3 tests — new, Correction 2)
+  - the advisory lock ($queryRaw) is taken before the callback runs, both
+    inside one $transaction call
+  - the callback's return value is passed through unchanged
+  - a callback failure propagates (is not swallowed) so the surrounding
+    transaction rolls back and the lock releases
+
+recording.service.spec.ts (5 tests)
+  - publish succeeds for an ENDED session
+  - 404 for a nonexistent session
+  - 409 for a non-ENDED session
+  - 409 for a second publish attempt (P2002 translated)
+  - publishing has no AttendanceRecord dependency at all (structural
+    assertion that it cannot mark anyone PRESENT)
+
+subscription-access.service.spec.ts (8 tests)
+  - grant success; 404 missing learner; 404 missing offering; 400 invalid
+    window; 409 overlapping ACTIVE grant; non-ACTIVE grant skips overlap
+    check; revoke ACTIVE -> CANCELED; 409 revoking an already-terminal
+    grant
+
+attendance-rbac.http.spec.ts (10 integration tests, real guards/strategy/
+signed JWTs)
+  - LEARNER A reads own entitled attendance (200)
+  - LEARNER B cannot read a session only LEARNER A is entitled to (404 —
+    UNAUTHORIZED ACCESS / privacy)
+  - assigned TEACHER reads session attendance (200)
+  - unassigned TEACHER cannot (403 — teacher scoping)
+  - ADMIN school-wide read (200)
+  - override: ADMIN 200 / TEACHER 403 / LEARNER 403 (3 tests)
+  - override without a reason: 400
+  - unauthenticated request: 401
+
+sessions.service.spec.ts additions (7 tests — 3 original entitlement-
+wiring tests + 4 added for Correction 1's exact entitlement-timing)
+  - markLive calls evaluateForSession with the session id and a Date
+  - cancel (from SCHEDULED) calls evaluateForSession
+  - replacement create calls inheritForReplacement with (originalId,
+    newSessionId); an ordinary session create does NOT call it
+  - EXACT ENTITLEMENT POINT [added, Correction 1]: markLive on a session
+    scheduled for 11:00, called at a simulated 11:07, evaluates
+    entitlement at 11:00 (session.startTime), not 11:07
+  - EXACT ENTITLEMENT POINT [added, Correction 1]: markLive called before
+    the scheduled start (startTime set far in the future as a stand-in)
+    still evaluates entitlement at session.startTime, not the early call
+    time
+  - EXACT ENTITLEMENT POINT [added, Correction 1]: cancel() on a session
+    whose scheduled start is in the future evaluates entitlement at the
+    cancellation timestamp (asserted to fall within a [before, after]
+    window bracketing the call, and to differ from startTime)
+  - EXACT ENTITLEMENT POINT [added, Correction 1]: cancel() on a session
+    whose scheduled start is in the past evaluates entitlement at
+    session.startTime, not the cancellation timestamp
+
+auth.service.spec.ts additions (2 tests)
+  - register creates exactly one LearnerProfile, atomically, with the new
+    User's id
+  - a duplicate-email rejection creates neither a User nor a
+    LearnerProfile
+
+Explicit cross-reference against this task's requested coverage list:
+  50% live threshold                    -> attendance.service.spec.ts
+  49.x% failure (29m59s)                -> attendance.service.spec.ts
+  reconnects                            -> live-attendance.service.spec.ts,
+                                            interval-merge.util.spec.ts
+  overlapping live intervals            -> interval-merge.util.spec.ts
+  interval clipping                     -> live-attendance.service.spec.ts
+  100% recording requirement            -> attendance.service.spec.ts,
+                                            watched-interval.service.spec.ts
+  skipped recording sections            -> watched-interval.service.spec.ts,
+                                            interval-merge.util.spec.ts
+  overlapping recording intervals       -> watched-interval.service.spec.ts
+  cutoff rejection                      -> attendance.service.spec.ts
+                                            (post-cutoff qualification tests)
+  attendance-window exceptions          -> attendance.service.spec.ts
+                                            (precedence block)
+  absence finalization                  -> attendance.service.spec.ts
+  cancellation entitlement              -> entitlement.service.spec.ts,
+                                            sessions.service.spec.ts
+  replacement entitlement               -> entitlement.service.spec.ts
+  repeated replacement chains           -> entitlement.service.spec.ts
+  duplicate/idempotent requests         -> entitlement.service.spec.ts,
+                                            attendance.service.spec.ts
+                                            (finalizer idempotency)
+  unauthorized access                   -> attendance-rbac.http.spec.ts
+  transaction/concurrency-sensitive     -> attendance.service.spec.ts
+  behaviour                                (status:PENDING-guarded
+                                            updateMany calls); entitlement.
+                                            service.spec.ts ($transaction
+                                            wrapping of snapshot+attendance
+                                            writes); [Correction 2]
+                                            live-attendance.service.spec.ts,
+                                            watched-interval.service.spec.ts,
+                                            and learner-session-lock.util.
+                                            spec.ts (advisory-locked
+                                            interval-ingestion transaction)
+
+================================================================================
+L. VERIFICATION RESULTS
+================================================================================
+
+pnpm run test (from apps/api) [CORRECTED — re-run after both post-review
+corrections]:
+  Test Suites: 21 passed, 21 total
+  Tests:       223 passed, 223 total
+  Snapshots:   0 total
+  Time:        ~15s
+
+pnpm run typecheck (tsc --noEmit) [re-run post-corrections]:
+  PASS — no output, no errors.
+
+pnpm exec eslint . (run directly; root `pnpm run lint` still hits the
+pre-existing Turbo `spawn UNKNOWN` environment issue, unrelated to this
+milestone and unchanged from every prior phase's report) [re-run
+post-corrections]:
+  0 problems, exit code 0. (One `@typescript-eslint/no-unsafe-assignment`
+  finding during the original development, in entitlement.service.spec.ts,
+  from @types/jest's `any`-typed `expect.objectContaining` — resolved with
+  a file-level, commented eslint-disable, the same justified pattern
+  already used elsewhere in this codebase's test suite. One additional
+  `@typescript-eslint/no-unsafe-member-access` finding surfaced while
+  applying Correction 1 — in sessions.service.spec.ts, from indexing an
+  untyped jest.Mock's `.mock.calls[0]` — resolved by casting the tuple
+  explicitly (`as unknown as [string, Date]`) instead of an inline
+  per-access assertion.)
+
+pnpm run build (nest build) [re-run post-corrections]:
+  PASS, exit code 0, no errors.
+
+pnpm exec prisma validate [re-run post-corrections]:
+  "The schema at prisma\schema.prisma is valid" — confirms zero drift; no
+  schema file was touched by this milestone or by either correction.
+
+pnpm exec prisma generate:
+  Not re-run as part of final verification (no schema change to
+  regenerate against); it was run earlier in the session purely to confirm
+  the existing generated client still matched the unchanged schema, with
+  no diff.
+
+Migration status:
+  Not applicable — no new migration was created. `apps/api/prisma/
+  migrations/` is unchanged from Phase 2E.
+
+pnpm run format:check (repository-wide, run specifically because a recent
+CI run had failed on Prettier formatting):
+  Initial run (original Phase 2F implementation): 24 files reported
+  formatting issues; `pnpm run format` applied (whitespace/line-wrap
+  only); re-run clean.
+  [CORRECTED — re-run after applying both post-review corrections]:
+  Initial re-run: 5 files (attendance.service.ts,
+  learner-session-lock.util.spec.ts, watched-interval.service.spec.ts,
+  watched-interval.service.ts, sessions.service.spec.ts) reported
+  formatting issues from the correction edits. Ran `pnpm run format`
+  again (whitespace/line-wrap only, no logic changed). Final re-run:
+  "All matched files use Prettier code style!" — clean.
+
+Other workspace packages, re-typechecked directly to confirm no
+regression from this milestone's changes:
+  packages/types  -> tsc --noEmit: PASS
+  packages/utils  -> tsc --noEmit: PASS
+  packages/ui     -> tsc --noEmit: PASS
+  apps/web        -> next typegen && tsc --noEmit: PASS
+
+================================================================================
+M. KNOWN LIMITATIONS / WARNINGS
+================================================================================
+
+1. LIVE interval ingestion is ADMIN-only, standing in for a future Zoom
+   adapter/webhook processor. There is no distinct "system"/"service"
+   role in the RBAC model yet; when real Zoom integration arrives it will
+   very likely need its own authentication mechanism (a service
+   credential or webhook signature) rather than a human ADMIN's JWT.
+
+2. No DeliveryMode-based (LIVE_AND_RECORDED vs RECORDED_ONLY) gating
+   exists on what a learner's session response exposes — a learner
+   entitled only to a RECORDED_ONLY offering currently still sees
+   `liveMeetingUrl` in `GET /learner/sessions`, identical to a
+   LIVE_AND_RECORDED subscriber. Deferred deliberately: correct behavior
+   depends on a product decision about gating per-Offering vs
+   per-SubscriptionAccess when a learner holds multiple concurrent
+   grants, which felt safer to defer than to guess.
+
+3. LIVE interval ingestion requires both `joinedAt` and `leftAt` in one
+   call (a completed interval) — there is no "open connection" streaming
+   ingestion path (join now, close later) in this milestone, even though
+   the schema's `leftAt` column is nullable specifically to support that.
+   `LiveAttendanceInterval.leftAt` being null is handled defensively in
+   coverage calculation (`leftAt ?? new Date()`) but no code path
+   currently writes a null `leftAt`. A future Zoom adapter integration
+   will need to decide whether to report intervals only after they close,
+   or to extend this ingestion to support open/streaming intervals.
+
+4. SubscriptionAccessService's overlap check (`assertNoOverlappingActiveGrant`)
+   is a pre-check, not enforced by a database constraint or a
+   transaction — a genuine concurrent race (two admins granting
+   overlapping ACTIVE access to the same learner+offering at the same
+   instant) is not fully closed the way the email-uniqueness race in
+   AuthService/TeachersService is (which additionally catches the
+   database's own P2002). This is a real, if narrow, gap: the frozen
+   schema has no unique constraint that could close it structurally
+   (SubscriptionAccess has no natural composite-uniqueness column set
+   given arbitrary date ranges), so closing it fully would require either
+   a serializable transaction/advisory lock or a generated exclusion
+   constraint — out of scope for this milestone, flagged for follow-up.
+
+5. `finalizeDueRecords()` has no production scheduler wired to it, per
+   the brief's explicit instruction not to build that integration now. It
+   is a plain, idempotent, ADMIN-callable HTTP endpoint
+   (`POST /admin/attendance/finalize`) — the intended seam for a future
+   cron job or scheduled Nest task.
+
+6. No pagination exists on any list/read endpoint in this milestone
+   (`GET /admin/attendance/sessions/:id`, `GET /admin/attendance/
+   learners/:id`, `GET /admin/learners`, `GET /admin/subscription-access`,
+   `GET /learner/sessions`), consistent with the same known gap already
+   flagged in the Phase 2D and Phase 2E reports.
+
+7. [RESOLVED — external review Correction 2] The interval-ingestion
+   concurrency gap originally disclosed here (two racing ingest() calls
+   for the same learner+session each reading the coverage set before the
+   other's insert committed, silently under-counting coverage) has been
+   closed. Both LiveAttendanceIntervalService.ingest and
+   WatchedIntervalService.ingest now run their entire
+   insert-reread-recompute-qualify sequence inside
+   `withLearnerSessionLock` — one `prisma.$transaction` guarded by a
+   Postgres transaction-scoped advisory lock keyed by (sessionId,
+   learnerId). Concurrent submissions for the same pair are now fully
+   serialized (the second call's transaction blocks until the first
+   commits and releases the lock); concurrent submissions for different
+   learners or sessions never contend. No schema change was needed. See
+   sections D/F/G/P for the corrected implementation and
+   learner-session-lock.util.spec.ts plus the added tests in
+   live-attendance.service.spec.ts and watched-interval.service.spec.ts
+   for coverage.
+
+8. Architectural note: AttendanceService itself performs no authorization
+   checks (it is a plain injectable) — all RBAC enforcement is at the
+   controller layer via `@Roles(...)` plus, for the TEACHER-scoped route,
+   an explicit `assertTeacherAssignedToSession` call the controller makes
+   before delegating to the service. This means any future new caller of
+   AttendanceService's methods must remember to add its own authorization
+   check; there is no structural guarantee at the service boundary. This
+   matches the pattern already established by every prior phase's
+   services in this codebase, so it is consistent, not a new risk, but
+   worth naming explicitly for review.
+
+9. The pre-existing Turbo `spawn UNKNOWN` issue (documented in every
+   prior phase's report) remains unchanged and unrelated to this
+   milestone.
+
+No TODO comments were left in any Phase 2F source file.
+
+================================================================================
+N. GIT STATE
+================================================================================
+
+Current branch: main
+
+HEAD commit before Phase 2F work began (i.e. the tip of `main` at the
+start of this milestone — the "chore: apply repository formatting" commit
+from the immediately preceding CI-repair task, which itself sat on top of
+the Phase 2E feature commit):
+  f4fadda75861bab36baf0748607a1c4dcdaaaba1  chore: apply repository formatting
+  cf06ab1c358542ff1d7c9014edddbef91ecabe32  feat: implement Phase 2E teacher and session operations
+
+Current HEAD is still f4fadda — no commit has been made during Phase 2F
+or during either post-review correction.
+
+$ git status [CORRECTED — re-run after applying both corrections]
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   apps/api/src/app.module.ts
+	modified:   apps/api/src/auth/auth.http.spec.ts
+	modified:   apps/api/src/auth/auth.service.spec.ts
+	modified:   apps/api/src/auth/auth.service.ts
+	modified:   apps/api/src/sessions/sessions.module.ts
+	modified:   apps/api/src/sessions/sessions.service.spec.ts
+	modified:   apps/api/src/sessions/sessions.service.ts
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	apps/api/src/attendance-rbac.http.spec.ts
+	apps/api/src/attendance/
+	apps/api/src/entitlements/
+	apps/api/src/learner-portal/
+	apps/api/src/learners/
+	apps/api/src/subscription-access/
+	docs/phase-2f-implementation-report.txt
+	docs/phase-2f-implementation-review.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+
+Staged files: none (nothing has been `git add`-ed) — unchanged by either
+correction.
+
+Unstaged (modified, tracked) files: the same 7 files as before both
+corrections — sessions.service.ts and sessions.service.spec.ts carry the
+Correction 1 edits; auth.service.ts/spec.ts, auth.http.spec.ts,
+app.module.ts, and sessions.module.ts are unchanged by either correction
+(they were already modified by the original Phase 2F implementation).
+
+Untracked files: the same 6 top-level directories/files as before, plus
+docs/phase-2f-implementation-review.txt (this file — now updated in place
+to reflect both corrections) and docs/phase-2f-implementation-report.txt.
+Two new files were added inside the untracked apps/api/src/attendance/
+directory by Correction 2: learner-session-lock.util.ts and
+learner-session-lock.util.spec.ts — since the whole apps/api/src/
+attendance/ directory was already untracked before either correction,
+`git status` continues to show it as a single untracked directory entry
+rather than listing the two new files individually; `git status
+--porcelain --untracked-files=all` or `git add -n` would enumerate them.
+
+No commit, tag, or push has been made at any point during Phase 2F, during
+the creation of the original review document, or while applying and
+verifying either post-review correction.
+
+================================================================================
+O. IMPLEMENTATION DIFF SUMMARY
+================================================================================
+
+Net change: 7 tracked files modified, 35 new files created in the original
+Phase 2F implementation, zero schema/migration files touched.
+
+[CORRECTED — updated after both post-review corrections] The corrections
+add 2 more new files (learner-session-lock.util.ts and its spec) and
+extend 5 existing files (sessions.service.ts, sessions.service.spec.ts,
+attendance.service.ts, live-attendance.service.ts,
+live-attendance.service.spec.ts, watched-interval.service.ts,
+watched-interval.service.spec.ts — attendance.service.ts and the interval
+services/specs were already new Phase 2F files, not tracked-file
+modifications; only sessions.service.ts and sessions.service.spec.ts were
+already-tracked files that grew further). Current `git diff --stat` for
+the tracked (pre-existing) files:
+
+ apps/api/src/app.module.ts                     |  10 +++
+ apps/api/src/auth/auth.http.spec.ts            |   8 +-
+ apps/api/src/auth/auth.service.spec.ts         |  47 +++++++++++
+ apps/api/src/auth/auth.service.ts              |  26 +++++--
+ apps/api/src/sessions/sessions.module.ts       |   2 +
+ apps/api/src/sessions/sessions.service.spec.ts | 104 ++++++++++++++++++++++++-
+ apps/api/src/sessions/sessions.service.ts      |  47 ++++++++++-
+ 7 files changed, 234 insertions(+), 10 deletions(-)
+
+(sessions.service.ts grew from +41/-1 to +47/-1 lines, and
+sessions.service.spec.ts from +35 to +104 lines, entirely from Correction
+1's entitlement-timing fix and its 4 new tests; the other 5 files are
+unchanged from the original implementation.)
+
+Technically, the diff has three layers:
+
+1. A structural extension of the existing Phase 2C/2D/2E patterns into
+   three new domains (learners, subscription-access, attendance) — each
+   following the exact same service/controller/module/DTO shape, the same
+   404/409/400/401/403 error-code convention, and the same
+   `@UseGuards(JwtAuthGuard, RolesGuard)` + `@Roles(...)` authorization
+   idiom already established. No new architectural pattern was introduced
+   for these three domains beyond what Phase 2D/2E already set.
+
+2. A new shared computational primitive (interval-merge.util.ts) used
+   identically by both the LIVE and RECORDED coverage engines — this is
+   the one genuinely new piece of general-purpose logic in the milestone,
+   and it is small (4 pure functions, no I/O, no framework dependency),
+   deliberately, so it is easy to review and test in isolation
+   (interval-merge.util.spec.ts covers it directly with no mocking at
+   all).
+
+3. Two targeted modifications to previously-frozen Phase 2C/2E code:
+   AuthService.register (User+LearnerProfile now atomic) and
+   SessionsService (markLive/cancel/create now call into
+   EntitlementService at exactly three points). Both changes are additive
+   wrapping of existing logic — no previously-existing behavior of either
+   method was removed or altered; the diffs are pure insertions plus the
+   one new constructor dependency each file gained. This is verifiable
+   directly from `git diff` (section N gives the exact stat; the review
+   process can re-run `git diff apps/api/src/auth/auth.service.ts
+   apps/api/src/sessions/sessions.service.ts` against f4fadda to see the
+   literal patch).
+
+================================================================================
+P. SOURCE EXCERPTS FOR EXTERNAL REVIEW
+================================================================================
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/attendance/interval-merge.util.ts (COMPLETE FILE)
+--------------------------------------------------------------------------------
+/**
+ * Generic numeric interval merge/coverage math, shared by the LIVE
+ * (LiveAttendanceInterval, millisecond epoch values) and RECORDED
+ * (WatchedInterval, integer second values) coverage engines. Neither
+ * engine trusts a client-supplied percentage — both derive coverage from
+ * the actual union of reported ranges, so overlapping or duplicate
+ * intervals can never inflate the total, and a skipped span always leaves
+ * a genuine gap.
+ */
+export interface NumericInterval {
+  start: number;
+  end: number;
+}
+
+/** Sorts and merges overlapping/adjacent intervals into the minimal
+ * non-overlapping set representing their union. */
+export function mergeIntervals(intervals: NumericInterval[]): NumericInterval[] {
+  if (intervals.length === 0) {
+    return [];
+  }
+
+  const sorted = [...intervals].sort((a, b) => a.start - b.start);
+  const merged: NumericInterval[] = [{ ...sorted[0]! }];
+
+  for (let i = 1; i < sorted.length; i += 1) {
+    const current = sorted[i]!;
+    const last = merged[merged.length - 1]!;
+
+    if (current.start <= last.end) {
+      last.end = Math.max(last.end, current.end);
+    } else {
+      merged.push({ ...current });
+    }
+  }
+
+  return merged;
+}
+
+/** Sum of durations across (already-merged, non-overlapping) intervals. */
+export function totalCoverage(intervals: NumericInterval[]): number {
+  return intervals.reduce((sum, interval) => sum + (interval.end - interval.start), 0);
+}
+
+/** Clips `interval` to `bounds`, returning null if there is no overlap at
+ * all (rather than a zero/negative-length interval). */
+export function clipInterval(
+  interval: NumericInterval,
+  bounds: NumericInterval,
+): NumericInterval | null {
+  const start = Math.max(interval.start, bounds.start);
+  const end = Math.min(interval.end, bounds.end);
+
+  return end > start ? { start, end } : null;
+}
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/entitlements/entitlement.service.ts (COMPLETE FILE)
+--------------------------------------------------------------------------------
+import { Injectable } from '@nestjs/common';
+
+import {
+  AttendanceStatus,
+  SubscriptionStatus,
+  type SubscriptionAccess,
+} from '../generated/prisma/client.js';
+import { PrismaService } from '../prisma/prisma.service.js';
+
+/**
+ * The frozen entitlement engine (docs/phase-2a-final-domain-design.txt,
+ * sections I and J).
+ *
+ * Every operation here is idempotent by construction — `upsert` on the
+ * unique (sessionId, learnerId) constraints already present on
+ * SessionEntitlementSnapshot and AttendanceRecord — so calling it more than
+ * once for the same session (a retry, a race between two admins, a future
+ * scheduler firing twice) never creates a duplicate row or changes an
+ * already-recorded entitlement decision. A snapshot is historical truth:
+ * once written, this service never overwrites `wasEntitled` or
+ * `subscriptionAccessId` on an existing row — `update: {}` in every upsert
+ * below is a deliberate no-op, not an oversight.
+ */
+@Injectable()
+export class EntitlementService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  /**
+   * Evaluates "normal" entitlement for a session at `entitlementPoint` —
+   * the moment the frozen design calls the session's entitlement point
+   * (MIN(session.startTime, session.canceledAt), approximated here by the
+   * real system event that triggers evaluation: the session going LIVE, or
+   * being canceled before it ever did — see SessionsService.markLive and
+   * SessionsService.cancel).
+   *
+   * For every learner holding an ACTIVE SubscriptionAccess, for an
+   * Offering that covers this session's Course, whose period covers
+   * `entitlementPoint`, this writes a SessionEntitlementSnapshot
+   * (wasEntitled: true) and idempotently ensures a PENDING AttendanceRecord
+   * exists — so a learner who never interacts with the session at all can
+   * still later be finalized ABSENT (Part J of the Phase 2F brief).
+   */
+  async evaluateForSession(sessionId: string, entitlementPoint: Date): Promise<void> {
+    const session = await this.prisma.session.findUniqueOrThrow({
+      where: { id: sessionId },
+      select: { courseId: true },
+    });
+
+    const offeringLinks = await this.prisma.offeringCourse.findMany({
+      where: { courseId: session.courseId },
+      select: { offeringId: true },
+    });
+    const offeringIds = offeringLinks.map((link) => link.offeringId);
+
+    if (offeringIds.length === 0) {
+      return;
+    }
+
+    const grants = await this.prisma.subscriptionAccess.findMany({
+      where: {
+        offeringId: { in: offeringIds },
+        status: SubscriptionStatus.ACTIVE,
+        currentPeriodStart: { lte: entitlementPoint },
+        currentPeriodEnd: { gte: entitlementPoint },
+      },
+    });
+
+    // A learner may hold more than one qualifying grant (e.g. two
+    // overlapping offerings covering the same course); one snapshot per
+    // learner is still correct — pick the first deterministically.
+    const grantByLearner = new Map<string, SubscriptionAccess>();
+    for (const grant of grants) {
+      if (!grantByLearner.has(grant.learnerId)) {
+        grantByLearner.set(grant.learnerId, grant);
+      }
+    }
+
+    for (const [learnerId, grant] of grantByLearner) {
+      await this.writeEntitlementAndPendingAttendance(sessionId, learnerId, {
+        subscriptionAccessId: grant.id,
+        snapshotAt: entitlementPoint,
+        inheritedFromSnapshotId: null,
+      });
+    }
+  }
+
+  /**
+   * Replacement-session entitlement inheritance (frozen design section J).
+   *
+   * For every learner entitled to the canceled `originalSessionId`, copies
+   * that entitlement onto `replacementSessionId` — never recalculated from
+   * today's subscription state — with `inheritedFromSnapshotId` pointing at
+   * the immediate predecessor's snapshot. This is what lets a multi-hop
+   * replacement chain (Original -> Replacement A -> Replacement B) stay
+   * traceable: each snapshot links only to its direct parent, and the full
+   * ancestry is recovered by walking the chain.
+   */
+  async inheritForReplacement(
+    originalSessionId: string,
+    replacementSessionId: string,
+  ): Promise<void> {
+    const originalSnapshots = await this.prisma.sessionEntitlementSnapshot.findMany({
+      where: { sessionId: originalSessionId, wasEntitled: true },
+    });
+
+    for (const snapshot of originalSnapshots) {
+      await this.writeEntitlementAndPendingAttendance(replacementSessionId, snapshot.learnerId, {
+        subscriptionAccessId: snapshot.subscriptionAccessId,
+        snapshotAt: new Date(),
+        inheritedFromSnapshotId: snapshot.id,
+      });
+    }
+  }
+
+  private async writeEntitlementAndPendingAttendance(
+    sessionId: string,
+    learnerId: string,
+    fields: {
+      subscriptionAccessId: string | null;
+      snapshotAt: Date;
+      inheritedFromSnapshotId: string | null;
+    },
+  ): Promise<void> {
+    await this.prisma.$transaction(async (tx) => {
+      await tx.sessionEntitlementSnapshot.upsert({
+        where: { sessionId_learnerId: { sessionId, learnerId } },
+        update: {},
+        create: {
+          sessionId,
+          learnerId,
+          wasEntitled: true,
+          subscriptionAccessId: fields.subscriptionAccessId,
+          snapshotAt: fields.snapshotAt,
+          inheritedFromSnapshotId: fields.inheritedFromSnapshotId,
+        },
+      });
+
+      await tx.attendanceRecord.upsert({
+        where: { sessionId_learnerId: { sessionId, learnerId } },
+        update: {},
+        create: { sessionId, learnerId, status: AttendanceStatus.PENDING },
+      });
+    });
+  }
+}
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/sessions/sessions.service.ts — entitlement wiring
+excerpts [CORRECTED per external review Correction 1 — exact source below
+is the CURRENT, post-correction implementation]
+--------------------------------------------------------------------------------
+  /**
+   * SCHEDULED -> LIVE is the normal entitlement trigger, but the frozen
+   * entitlement point itself is always `session.startTime` — never the
+   * timestamp an ADMIN happens to press the LIVE button at. Whether
+   * markLive fires early or late, entitlement is evaluated as of the
+   * session's own scheduled start.
+   */
+  async markLive(id: string): Promise<SessionWithRelations> {
+    const existing = await this.findOne(id);
+    this.assertTransition(existing.status, SessionStatus.SCHEDULED, SessionStatus.LIVE);
+
+    await this.entitlementService.evaluateForSession(id, existing.startTime);
+
+    return this.prisma.session.update({
+      where: { id },
+      data: { status: SessionStatus.LIVE },
+      include: sessionInclude,
+    });
+  }
+
+  /**
+   * Frozen rule: entitlementPoint = MIN(session.startTime,
+   * cancellationTime). A session canceled before its scheduled start
+   * relocates the entitlement point to the cancellation moment; a session
+   * canceled after its scheduled start (including one already LIVE) keeps
+   * the entitlement point at the scheduled start, exactly as markLive
+   * would have evaluated it. evaluateForSession is idempotent, so calling
+   * it again here for a session already evaluated by markLive is always
+   * safe and only ever does real work the first time.
+   */
+  async cancel(id: string): Promise<SessionWithRelations> {
+    const existing = await this.findOne(id);
+
+    if (existing.status !== SessionStatus.SCHEDULED && existing.status !== SessionStatus.LIVE) {
+      throw new ConflictException(
+        `Session ${id} is ${existing.status} and cannot be canceled (only SCHEDULED or LIVE sessions can be)`,
+      );
+    }
+
+    const cancellationTime = new Date();
+    const entitlementPoint =
+      cancellationTime.getTime() < existing.startTime.getTime()
+        ? cancellationTime
+        : existing.startTime;
+
+    await this.entitlementService.evaluateForSession(id, entitlementPoint);
+
+    return this.prisma.session.update({
+      where: { id },
+      data: { status: SessionStatus.CANCELED, canceledAt: new Date() },
+      include: sessionInclude,
+    });
+  }
+
+  // (in create(), immediately after the new Session row is created)
+      if (dto.replacementForSessionId !== undefined) {
+        // Replacement entitlement is inherited from the canceled original's
+        // snapshots, never recalculated from today's subscription state
+        // (frozen design section J). The original is guaranteed to already
+        // have entitlement snapshots — assertValidReplacementTarget above
+        // required it to be CANCELED, and every path that cancels a
+        // session (markLive's evaluation, or cancel's own evaluation for a
+        // session canceled before going live) evaluates entitlement first.
+        await this.entitlementService.inheritForReplacement(
+          dto.replacementForSessionId,
+          created.id,
+        );
+      }
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/attendance/attendance.service.ts — qualification, cutoff,
+finalization excerpts (see section D/F/G/H/I above for full narrative)
+[CORRECTED per external review Correction 2 — each method below gained an
+optional trailing `db` parameter, typed `Db = PrismaService |
+Prisma.TransactionClient`, defaulting to `this.prisma`, so interval
+ingestion can run qualification inside its own advisory-locked
+transaction]
+--------------------------------------------------------------------------------
+  /**
+   * Resolves the deadline that actually applies to one learner on one
+   * session: a learner-specific AttendanceWindowException, if one exists,
+   * always wins outright over a session-wide one — this is the explicit
+   * precedence the frozen design states (section G/K), not a "pick the
+   * latest of all applicable values" comparison. Falls back to the
+   * session's own normal cutoff when no exception exists. When more than
+   * one exception exists at the same scope (a corrected/superseding grant),
+   * the most recently created one is authoritative — exceptions are an
+   * append-only audit log, never edited in place.
+   */
+  async getEffectiveCutoff(
+    sessionId: string,
+    learnerId: string,
+    db: Db = this.prisma,
+  ): Promise<Date> {
+    const session = await db.session.findUniqueOrThrow({
+      where: { id: sessionId },
+      select: { attendanceCutoffAt: true },
+    });
+
+    const learnerException = await db.attendanceWindowException.findFirst({
+      where: { sessionId, learnerId },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (learnerException) {
+      return learnerException.extendedCutoffAt;
+    }
+
+    const sessionWideException = await db.attendanceWindowException.findFirst({
+      where: { sessionId, learnerId: null },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (sessionWideException) {
+      return sessionWideException.extendedCutoffAt;
+    }
+
+    return session.attendanceCutoffAt;
+  }
+
+  async qualifyLive(
+    sessionId: string,
+    learnerId: string,
+    coverageMs: number,
+    scheduledDurationMs: number,
+    qualifiedAt: Date,
+    db: Db = this.prisma,
+  ): Promise<void> {
+    if (coverageMs < scheduledDurationMs * 0.5) {
+      return;
+    }
+    await this.markPresentIfPending(sessionId, learnerId, CompletionMode.LIVE, qualifiedAt, db);
+  }
+
+  async qualifyRecorded(
+    sessionId: string,
+    learnerId: string,
+    coverageSeconds: number,
+    totalSeconds: number,
+    qualifiedAt: Date,
+    db: Db = this.prisma,
+  ): Promise<void> {
+    if (coverageSeconds < totalSeconds) {
+      return;
+    }
+    await this.markPresentIfPending(sessionId, learnerId, CompletionMode.RECORDED, qualifiedAt, db);
+  }
+
+  private async markPresentIfPending(
+    sessionId: string,
+    learnerId: string,
+    mode: CompletionMode,
+    qualifiedAt: Date,
+    db: Db = this.prisma,
+  ): Promise<void> {
+    const effectiveCutoff = await this.getEffectiveCutoff(sessionId, learnerId, db);
+
+    if (qualifiedAt.getTime() > effectiveCutoff.getTime()) {
+      // Genuine completion, but after the deadline: not ordinary
+      // attendance. The record is left PENDING; the finalizer (Part I)
+      // will move it to ABSENT once its cutoff has passed, exactly as if
+      // nothing had been watched at all.
+      return;
+    }
+
+    // `updateMany` with a `status: PENDING` guard, rather than a plain
+    // `update`, is what makes this safe under concurrent qualification
+    // attempts (e.g. two ingested intervals racing) and guarantees PRESENT
+    // is never downgraded or re-timestamped once set. `db` is the caller's
+    // active transaction when invoked from interval ingestion (see
+    // learner-session-lock.util.ts above), so this write participates in
+    // the same advisory-locked transaction as the interval insert/reread.
+    await db.attendanceRecord.updateMany({
+      where: { sessionId, learnerId, status: AttendanceStatus.PENDING },
+      data: { status: AttendanceStatus.PRESENT, completionMode: mode, completedAt: qualifiedAt },
+    });
+  }
+
+  /**
+   * Moves every still-PENDING AttendanceRecord whose effective cutoff has
+   * passed to ABSENT. Idempotent and safe to call repeatedly or
+   * concurrently: the `status: PENDING` guard on the update means a record
+   * already finalized (by this call or a concurrent one) or already
+   * PRESENT is never touched again.
+   */
+  async finalizeDueRecords(): Promise<{ finalizedCount: number }> {
+    const duePending = await this.prisma.attendanceRecord.findMany({
+      where: { status: AttendanceStatus.PENDING },
+      select: { sessionId: true, learnerId: true },
+    });
+
+    const now = new Date();
+    let finalizedCount = 0;
+
+    for (const { sessionId, learnerId } of duePending) {
+      const effectiveCutoff = await this.getEffectiveCutoff(sessionId, learnerId);
+
+      if (now.getTime() > effectiveCutoff.getTime()) {
+        const result = await this.prisma.attendanceRecord.updateMany({
+          where: { sessionId, learnerId, status: AttendanceStatus.PENDING },
+          data: { status: AttendanceStatus.ABSENT, completionMode: null, completedAt: null },
+        });
+        finalizedCount += result.count;
+      }
+    }
+
+    return { finalizedCount };
+  }
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/attendance/learner-session-lock.util.ts (COMPLETE FILE
+— NEW, Correction 2)
+--------------------------------------------------------------------------------
+import { Prisma } from '../generated/prisma/client.js';
+import { PrismaService } from '../prisma/prisma.service.js';
+
+/**
+ * Runs `fn` inside a Postgres transaction that first takes a
+ * transaction-scoped advisory lock keyed by (sessionId, learnerId).
+ *
+ * This is the smallest robust fix for the interval-ingestion concurrency
+ * gap identified in the Phase 2F external review: without it, two
+ * concurrent ingest() calls for the same learner+session could each read
+ * the prior interval set before the other's just-inserted row committed,
+ * silently under-counting coverage. `pg_advisory_xact_lock` serializes
+ * only requests that collide on the same (sessionId, learnerId) pair —
+ * unrelated learners and sessions never contend — and the lock is released
+ * automatically when the transaction commits or rolls back, so no manual
+ * unlock/cleanup path is needed. No schema change is required: advisory
+ * locks are a session-level Postgres primitive, not a table.
+ *
+ * `hashtext(...)::bigint` folds the composite key into the single bigint
+ * `pg_advisory_xact_lock` takes. A hash collision between two different
+ * (sessionId, learnerId) pairs would only ever cause extra, harmless
+ * serialization (never incorrect data), so no collision-avoidance beyond
+ * hashtext's own distribution is needed here.
+ */
+export async function withLearnerSessionLock<T>(
+  prisma: PrismaService,
+  sessionId: string,
+  learnerId: string,
+  fn: (tx: Prisma.TransactionClient) => Promise<T>,
+): Promise<T> {
+  const lockKey = `${sessionId}:${learnerId}`;
+
+  return prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey})::bigint)`;
+    return fn(tx);
+  });
+}
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/attendance/live-attendance.service.ts (COMPLETE FILE —
+CORRECTED per external review Correction 2)
+--------------------------------------------------------------------------------
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+
+import { PrismaService } from '../prisma/prisma.service.js';
+import { AttendanceService } from './attendance.service.js';
+import type { CreateLiveIntervalDto } from './dto/create-live-interval.dto.js';
+import {
+  clipInterval,
+  mergeIntervals,
+  totalCoverage,
+  type NumericInterval,
+} from './interval-merge.util.js';
+import { withLearnerSessionLock } from './learner-session-lock.util.js';
+
+/**
+ * Internal ingestion for LIVE participation — the seam a future Zoom
+ * adapter attaches to (Part E of the Phase 2F brief). Every ingested
+ * interval is clipped to the session's scheduled window before it is ever
+ * summed, so time outside [startTime, endTime] never counts, and
+ * overlapping/duplicate intervals never double-count because coverage is
+ * always recomputed from the full merged set, not accumulated
+ * incrementally.
+ */
+@Injectable()
+export class LiveAttendanceIntervalService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly attendanceService: AttendanceService,
+  ) {}
+
+  async ingest(sessionId: string, dto: CreateLiveIntervalDto): Promise<void> {
+    const session = await this.prisma.session.findUnique({ where: { id: sessionId } });
+
+    if (!session) {
+      throw new NotFoundException(`Session ${sessionId} not found`);
+    }
+
+    const joinedAt = new Date(dto.joinedAt);
+    const leftAt = new Date(dto.leftAt);
+
+    if (joinedAt.getTime() >= leftAt.getTime()) {
+      throw new BadRequestException('joinedAt must be strictly before leftAt');
+    }
+
+    await this.attendanceService.assertEntitled(sessionId, dto.learnerId);
+
+    // The insert-reread-recompute-qualify sequence below must behave as one
+    // consistent operation under concurrent submissions for the same
+    // (sessionId, learnerId) pair — otherwise two racing ingest() calls
+    // could each read the coverage set before the other's row is visible,
+    // silently losing one interval's contribution to the merged coverage
+    // total. A Postgres session-scoped advisory lock, held for the
+    // duration of one `$transaction`, serializes concurrent ingestion for
+    // the same learner+session without requiring any schema change:
+    // requests for different learners/sessions never contend, and a
+    // request for the same pair simply waits its turn. See
+    // learner-session-lock.util.ts for the exact mechanism.
+    await withLearnerSessionLock(this.prisma, sessionId, dto.learnerId, async (tx) => {
+      await tx.liveAttendanceInterval.create({
+        data: { sessionId, learnerId: dto.learnerId, joinedAt, leftAt },
+      });
+
+      const allIntervals = await tx.liveAttendanceInterval.findMany({
+        where: { sessionId, learnerId: dto.learnerId },
+      });
+
+      const bounds: NumericInterval = {
+        start: session.startTime.getTime(),
+        end: session.endTime.getTime(),
+      };
+      const clipped = allIntervals
+        .map((interval) =>
+          clipInterval(
+            { start: interval.joinedAt.getTime(), end: (interval.leftAt ?? new Date()).getTime() },
+            bounds,
+          ),
+        )
+        .filter((interval): interval is NumericInterval => interval !== null);
+
+      const coverageMs = totalCoverage(mergeIntervals(clipped));
+      const scheduledDurationMs = session.endTime.getTime() - session.startTime.getTime();
+
+      await this.attendanceService.qualifyLive(
+        sessionId,
+        dto.learnerId,
+        coverageMs,
+        scheduledDurationMs,
+        leftAt,
+        tx,
+      );
+    });
+  }
+}
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/attendance/watched-interval.service.ts (COMPLETE FILE —
+CORRECTED per external review Correction 2)
+--------------------------------------------------------------------------------
+import { BadRequestException, Injectable } from '@nestjs/common';
+
+import { PrismaService } from '../prisma/prisma.service.js';
+import { AttendanceService } from './attendance.service.js';
+import type { CreateWatchedIntervalDto } from './dto/create-watched-interval.dto.js';
+import { RecordingService } from './recording.service.js';
+import { mergeIntervals, totalCoverage } from './interval-merge.util.js';
+import { withLearnerSessionLock } from './learner-session-lock.util.js';
+
+/**
+ * Learner-facing RECORDED playback ingestion (Part G). Never accepts a
+ * client-reported percentage — only raw played ranges, which are merged
+ * against everything previously reported before coverage is recomputed
+ * from scratch, so skipping ahead always leaves the skipped span
+ * genuinely uncovered and re-watching a span never inflates the total.
+ */
+@Injectable()
+export class WatchedIntervalService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly attendanceService: AttendanceService,
+    private readonly recordingService: RecordingService,
+  ) {}
+
+  async ingest(sessionId: string, learnerId: string, dto: CreateWatchedIntervalDto): Promise<void> {
+    if (dto.startSecond >= dto.endSecond) {
+      throw new BadRequestException('startSecond must be strictly before endSecond');
+    }
+
+    await this.attendanceService.assertEntitled(sessionId, learnerId);
+
+    const recording = await this.recordingService.findForSession(sessionId);
+
+    if (dto.startSecond < 0 || dto.endSecond > recording.totalSeconds) {
+      throw new BadRequestException(
+        `Interval [${dto.startSecond}, ${dto.endSecond}] falls outside the recording's duration (0-${recording.totalSeconds})`,
+      );
+    }
+
+    // See learner-session-lock.util.ts: serializes the create-reread-
+    // recompute-qualify sequence for this (sessionId, learnerId) pair so
+    // concurrent submissions can never lose coverage.
+    await withLearnerSessionLock(this.prisma, sessionId, learnerId, async (tx) => {
+      await tx.watchedInterval.create({
+        data: {
+          sessionRecordingId: recording.id,
+          learnerId,
+          startSecond: dto.startSecond,
+          endSecond: dto.endSecond,
+        },
+      });
+
+      const allIntervals = await tx.watchedInterval.findMany({
+        where: { sessionRecordingId: recording.id, learnerId },
+      });
+
+      const coverageSeconds = totalCoverage(
+        mergeIntervals(
+          allIntervals.map((interval) => ({
+            start: interval.startSecond,
+            end: interval.endSecond,
+          })),
+        ),
+      );
+
+      await this.attendanceService.qualifyRecorded(
+        sessionId,
+        learnerId,
+        coverageSeconds,
+        recording.totalSeconds,
+        new Date(),
+        tx,
+      );
+    });
+  }
+}
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/attendance/window-exception.service.ts (COMPLETE FILE)
+--------------------------------------------------------------------------------
+import { Injectable, NotFoundException } from '@nestjs/common';
+
+import type { AttendanceWindowException } from '../generated/prisma/client.js';
+import { PrismaService } from '../prisma/prisma.service.js';
+import type { CreateWindowExceptionDto } from './dto/create-window-exception.dto.js';
+
+/** ADMIN-only, auditable extensions to a session's normal attendance
+ * cutoff — session-wide (learnerId omitted) or learner-specific. Every
+ * grant is append-only; see AttendanceService.getEffectiveCutoff for how
+ * precedence and "most recent wins within a scope" are resolved. */
+@Injectable()
+export class WindowExceptionService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async create(
+    sessionId: string,
+    dto: CreateWindowExceptionDto,
+    grantedByUserId: string,
+  ): Promise<AttendanceWindowException> {
+    const session = await this.prisma.session.findUnique({ where: { id: sessionId } });
+
+    if (!session) {
+      throw new NotFoundException(`Session ${sessionId} not found`);
+    }
+
+    if (dto.learnerId !== undefined) {
+      const learner = await this.prisma.learnerProfile.findUnique({ where: { id: dto.learnerId } });
+
+      if (!learner) {
+        throw new NotFoundException(`Learner ${dto.learnerId} not found`);
+      }
+    }
+
+    return this.prisma.attendanceWindowException.create({
+      data: {
+        sessionId,
+        learnerId: dto.learnerId ?? null,
+        reason: dto.reason,
+        extendedCutoffAt: new Date(dto.extendedCutoffAt),
+        grantedByUserId,
+        note: dto.note,
+      },
+    });
+  }
+
+  findForSession(sessionId: string): Promise<AttendanceWindowException[]> {
+    return this.prisma.attendanceWindowException.findMany({
+      where: { sessionId },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+}
+
+================================================================================
+Q. FINAL DECLARATION
+================================================================================
+
+COMPLETE AND READY FOR EXTERNAL REVIEW — both requested pre-commit
+corrections have been applied and verified.
+
+All required Phase 2F functionality (Parts A through L of the original
+brief) is implemented and wired into the running application. Both
+corrections from the external reviewer's "APPROVED SUBJECT TO TWO
+PRE-COMMIT CORRECTIONS" verdict have been applied exactly as specified:
+(1) the exact frozen entitlement point (MIN(session.startTime,
+cancellationTime), never a button-press timestamp) is now implemented
+literally in SessionsService.markLive/cancel, with 4 new tests proving
+the late-press, early-press, cancel-before-start, and cancel-after-start
+cases; (2) the interval-ingestion concurrency gap is closed for both LIVE
+and RECORDED ingestion via a Postgres advisory-lock-guarded transaction
+(withLearnerSessionLock), with 5 new tests (2 concurrency tests in the
+ingestion specs plus 3 in the new lock utility's own spec) proving the
+fix. The full suite now stands at 223/223 passing tests across 21 suites,
+verified clean against typecheck, ESLint, build, and Prisma validate, with
+repository-wide format:check clean after applying Prettier to the 5 files
+the corrections touched. No Prisma schema or migration change was
+required or made by either correction. No commit, tag, or push has
+occurred at any point. The limitations listed in section M are documented
+trade-offs and deferred integrations consistent with the brief's own
+explicit exclusions, minus the one item (concurrency) that this
+correction round resolved — none of the remainder represent an unresolved
+blocker to reviewing what was actually built.
+
+================================================================================
+END OF REVIEW HANDOFF
+================================================================================

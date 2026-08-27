@@ -27,6 +27,10 @@ describe('AuthService', () => {
       findUnique: jest.Mock;
       create: jest.Mock;
     };
+    learnerProfile: {
+      create: jest.Mock;
+    };
+    $transaction: jest.Mock;
   };
   let service: AuthService;
 
@@ -36,7 +40,17 @@ describe('AuthService', () => {
         findUnique: jest.fn(),
         create: jest.fn(),
       },
+      learnerProfile: {
+        create: jest.fn().mockResolvedValue({ id: 'learner-profile-1' }),
+      },
+      $transaction: jest.fn(),
     };
+    // By default, run the transaction callback against the same mocked
+    // client — individual tests only need to override this to simulate a
+    // mid-transaction failure.
+    prisma.$transaction.mockImplementation((fn: (tx: typeof prisma) => Promise<unknown>) =>
+      fn(prisma),
+    );
 
     const jwtService = new JwtService({ secret: 'test-secret' });
     service = new AuthService(prisma as unknown as PrismaService, jwtService);
@@ -70,6 +84,39 @@ describe('AuthService', () => {
         // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
         expect.objectContaining({ data: expect.objectContaining({ role: RoleName.LEARNER }) }),
       );
+    });
+
+    it('creates exactly one LearnerProfile for the new User, atomically', async () => {
+      prisma.user.findUnique.mockResolvedValue(null);
+      prisma.user.create.mockImplementation(({ data }: { data: Partial<User> }) =>
+        Promise.resolve(
+          buildUser({ id: 'new-user-id', email: data.email, fullName: data.fullName }),
+        ),
+      );
+
+      await service.register({
+        email: 'new@example.com',
+        password: 'correct-horse-battery-staple',
+        fullName: 'New Learner',
+      });
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(prisma.learnerProfile.create).toHaveBeenCalledWith({
+        data: { userId: 'new-user-id' },
+      });
+    });
+
+    it('does not create a LearnerProfile (or a User) when the email is already registered', async () => {
+      prisma.user.findUnique.mockResolvedValue(buildUser());
+
+      await expect(
+        service.register({
+          email: 'learner@example.com',
+          password: 'whatever123',
+          fullName: 'Dup',
+        }),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(prisma.learnerProfile.create).not.toHaveBeenCalled();
     });
 
     it('stores a bcrypt hash of the password, never the plaintext', async () => {

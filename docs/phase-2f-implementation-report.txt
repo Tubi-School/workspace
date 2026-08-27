@@ -1,0 +1,729 @@
+TUBI WORKSPACE — PHASE 2F IMPLEMENTATION REPORT
+Learner Access, Session Entitlement & Attendance Engine.
+Status: IMPLEMENTATION COMPLETE, UNCOMMITTED. Prepared for external
+architecture/security review. No commit, tag, or push has been made.
+
+================================================================================
+A. FILES CREATED / MODIFIED
+================================================================================
+
+Created (35 files):
+
+apps/api/src/learners/
+  dto/update-learner.dto.ts
+  learners.controller.ts
+  learners.service.ts
+  learners.module.ts
+
+apps/api/src/subscription-access/
+  dto/create-subscription-access.dto.ts
+  dto/update-subscription-access.dto.ts
+  subscription-access.controller.ts
+  subscription-access.service.ts
+  subscription-access.service.spec.ts
+  subscription-access.module.ts
+
+apps/api/src/entitlements/
+  entitlement.service.ts
+  entitlement.service.spec.ts
+  entitlement.module.ts
+
+apps/api/src/attendance/
+  attendance.service.ts
+  attendance.service.spec.ts
+  attendance.controller.ts
+  attendance-admin.controller.ts
+  attendance.module.ts
+  live-attendance.service.ts
+  live-attendance.service.spec.ts
+  watched-interval.service.ts
+  watched-interval.service.spec.ts
+  recording.service.ts
+  recording.service.spec.ts
+  window-exception.service.ts
+  interval-merge.util.ts
+  interval-merge.util.spec.ts
+  dto/create-live-interval.dto.ts
+  dto/create-watched-interval.dto.ts
+  dto/create-window-exception.dto.ts
+  dto/publish-recording.dto.ts
+  dto/override-attendance.dto.ts
+
+apps/api/src/learner-portal/
+  learner-portal.service.ts
+  learner-portal.controller.ts
+  learner-portal.module.ts
+
+apps/api/src/attendance-rbac.http.spec.ts (integration RBAC/privacy test)
+
+Modified (7 files):
+
+apps/api/src/app.module.ts
+  Registered LearnersModule, SubscriptionAccessModule, EntitlementModule,
+  AttendanceModule, LearnerPortalModule.
+
+apps/api/src/auth/auth.service.ts
+  register() now creates the User and its LearnerProfile atomically inside
+  prisma.$transaction (Part A) — see section B.
+
+apps/api/src/auth/auth.service.spec.ts
+  Added tests for the atomic LearnerProfile creation; updated the fake
+  Prisma to support $transaction/learnerProfile.
+
+apps/api/src/auth/auth.http.spec.ts
+  Updated the fake Prisma to support $transaction/learnerProfile so the
+  existing HTTP-level registration/login tests keep passing.
+
+apps/api/src/sessions/sessions.service.ts
+  markLive() now evaluates entitlement (normal entitlement point); cancel()
+  now evaluates entitlement when canceling a still-SCHEDULED session;
+  create() now triggers replacement-entitlement inheritance when
+  replacementForSessionId is supplied. Injects EntitlementService.
+
+apps/api/src/sessions/sessions.module.ts
+  Imports EntitlementModule.
+
+apps/api/src/sessions/sessions.service.spec.ts
+  Added EntitlementService mock wiring and assertions that markLive/cancel/
+  replacement-create call it correctly.
+
+No Prisma schema or migration file was touched. apps/api/prisma/schema.prisma
+and every migration are unchanged from the Phase 2E commit
+(cf06ab1c358542ff1d7c9014edddbef91ecabe32).
+
+================================================================================
+B. LEARNER-PROFILE CHANGES (PART A)
+================================================================================
+
+Evaluation: public registration (AuthService.register) created only a User
+with role LEARNER; no LearnerProfile existed anywhere in the codebase
+before this milestone, even though the frozen schema already models
+LearnerProfile as the entity every downstream Phase 2F table
+(SubscriptionAccess, SessionEntitlementSnapshot, AttendanceRecord,
+LiveAttendanceInterval, WatchedInterval, AttendanceWindowException) is
+actually keyed off, not User directly.
+
+Decision: modified Phase 2C's AuthService.register to create the User and
+its LearnerProfile atomically inside prisma.$transaction — the identical
+pattern Phase 2E's TeachersService already established for User +
+TeacherProfile. This was the cleanest deterministic mechanism available
+without changing frozen semantics: LearnerProfile.userId is already
+@unique in the schema, so "exactly one LearnerProfile per LEARNER User" is
+enforced at the database level regardless of how many times registration
+runs concurrently for the same email (the existing email uniqueness race
+handling — pre-check plus P2002 catch — already prevents two Users from
+being created for one email, and thus prevents two LearnerProfiles too).
+
+TEACHER/ADMIN cannot acquire a LearnerProfile through this path:
+AuthService.register is exclusively reachable through the public
+`POST /auth/register` route, which — unchanged from Phase 2C — hardcodes
+`role: RoleName.LEARNER` with no field in RegisterDto capable of
+overriding it. TEACHER provisioning (Phase 2E's TeachersService) creates a
+TeacherProfile, never a LearnerProfile, and there is no ADMIN endpoint in
+this milestone that creates a LearnerProfile directly — it is register()-
+only, as designed.
+
+passwordHash exposure: unchanged from Phase 2C — AuthService's
+sanitizeUser() is still the only function permitted to read passwordHash
+off a User row, and it is untouched by this change. LearnersService (the
+new ADMIN read/management surface) uses an explicit Prisma `select` on the
+`user` relation (id, email, fullName, role, isActive, createdAt,
+updatedAt) — passwordHash is never selected, so it structurally cannot
+leak through /admin/learners either.
+
+Learner deactivation: LearnersService.update supports `isActive` (and
+`fullName`), applied to the underlying User row — the same
+deactivate-don't-delete pattern as Phase 2E's TeachersService. There is
+deliberately no delete endpoint: a LearnerProfile is referenced by
+SubscriptionAccess, SessionEntitlementSnapshot, AttendanceRecord, and the
+interval tables, any of which could already exist by the time an admin
+wants to remove a learner.
+
+================================================================================
+C. SUBSCRIPTION ACCESS IMPLEMENTATION (PART B)
+================================================================================
+
+SubscriptionAccessService implements the operational surface around the
+existing, unmodified SubscriptionAccess model. It is explicitly an ACCESS
+GRANT: the DTOs (CreateSubscriptionAccessDto, UpdateSubscriptionAccessDto)
+carry only learnerId, offeringId, status, currentPeriodStart,
+currentPeriodEnd — no invoice/card/bank/payment field of any kind exists
+anywhere in this module.
+
+create(): validates the learner exists (404) and holds role LEARNER (409
+if not — cannot happen through normal registration, but checked as an
+explicit domain invariant rather than assumed); validates the offering
+exists (404); validates currentPeriodStart is strictly before
+currentPeriodEnd (400); and, for a grant being created with status ACTIVE
+(the default), rejects a grant that overlaps another already-ACTIVE grant
+for the same learner+offering (409) — a non-ACTIVE grant (e.g. importing
+historical CANCELED/EXPIRED records) skips the overlap check entirely,
+since two lapsed grants covering the same dates is not a conflict.
+
+update(): allows changing status and/or the period dates, re-running the
+same overlap check whenever the resulting state would be ACTIVE.
+
+revoke(): a dedicated `POST /:id/revoke` moves an ACTIVE or PAST_DUE grant
+to CANCELED (409 if it is already CANCELED/EXPIRED) — the model's own
+supported deactivation. There is no delete: a SessionEntitlementSnapshot
+may already reference this grant as historical truth (subscriptionAccessId
+is a real foreign key), so removing the row would corrupt that record.
+
+All mutations (create/update/revoke) are ADMIN-only; reads
+(list/get-one) are ADMIN-only too in this milestone — subscription access
+is administrative/financial-adjacent information, not something a TEACHER
+needs to operate a session.
+
+================================================================================
+D. SESSION ENTITLEMENT ENGINE (PART C)
+================================================================================
+
+EntitlementService.evaluateForSession(sessionId, entitlementPoint) is the
+frozen engine: it resolves every Offering covering the session's Course
+(via OfferingCourse), finds every learner with an ACTIVE SubscriptionAccess
+for one of those Offerings whose period covers `entitlementPoint`, and for
+each such learner writes a SessionEntitlementSnapshot (wasEntitled: true)
+plus a PENDING AttendanceRecord — both via `upsert` on the existing unique
+(sessionId, learnerId) constraints, with a deliberate no-op `update: {}`.
+This is what makes the operation both idempotent (calling it twice never
+duplicates a row or changes an already-recorded decision — verified by
+test) and safe under concurrent execution (Prisma's own unique constraint
+is the final guard, not just the upsert's own check).
+
+Entitlement point wiring — the real system events that stand in for "the
+session's entitlement point" (MIN(session.startTime, session.canceledAt) in
+the frozen design) in the absence of a cron/scheduler:
+
+- SessionsService.markLive() calls evaluateForSession(id, now) before
+  transitioning SCHEDULED -> LIVE. This is the operational analogue of
+  "session start" — there is no other signal in this system that a session
+  has actually begun.
+- SessionsService.cancel() calls evaluateForSession(id, now) before every
+  cancellation, unconditionally. For a session canceled from SCHEDULED
+  (never having gone LIVE), this is genuinely the first and only
+  evaluation, and it happens at the cancellation moment — exactly the
+  frozen rule ("cancellation before start" evaluates entitlement at the
+  cancellation time). For a session canceled from LIVE, entitlement was
+  already evaluated by markLive; calling evaluateForSession again here is
+  a harmless no-op (upsert), so no branch was needed to distinguish the
+  two paths — the idempotency of the underlying operation is what makes
+  this simple.
+
+An AttendanceRecord(PENDING) is created in the same upsert step as its
+SessionEntitlementSnapshot — see section on Part J below for why this
+lifecycle point was chosen.
+
+================================================================================
+E. REPLACEMENT ENTITLEMENT INHERITANCE (PART E OF THE ENGINE)
+================================================================================
+
+EntitlementService.inheritForReplacement(originalSessionId,
+replacementSessionId) copies every wasEntitled snapshot from the original
+onto the replacement, using the same upsert-based idempotent write, with
+`inheritedFromSnapshotId` set to the original snapshot's id — never
+recalculated from today's SubscriptionAccess state (verified by test: the
+method never queries subscriptionAccess at all).
+
+Wired into SessionsService.create(): when a CreateSessionDto supplies
+replacementForSessionId, after the existing Phase 2E validation (target
+exists, target is CANCELED, no cycle in the chain — all unchanged) and
+after the new Session row is created, inheritForReplacement is called with
+the target's id and the new session's id. The original session is
+guaranteed to already have entitlement snapshots by construction: every
+path that can produce a CANCELED session (markLive's own evaluation, or
+cancel's evaluation for a session canceled while still SCHEDULED) runs
+evaluateForSession first — see section D.
+
+Multi-generation chains: because inheritForReplacement always reads the
+immediate predecessor's own snapshots (not the ultimate original's), a
+chain Original -> Replacement A -> Replacement B produces
+inheritedFromSnapshotId links where B's snapshot points at A's snapshot,
+and A's snapshot points at the Original's — full ancestry is recoverable
+by walking the chain, exactly as the frozen design specifies. Verified by
+a dedicated test.
+
+A learner whose subscription has since expired still receives the
+inherited entitlement, because inheritForReplacement never re-checks
+SubscriptionAccess status/period — it only reads the frozen snapshot rows
+of the session being replaced (also verified by test).
+
+================================================================================
+F. LEARNER SESSION-ACCESS API (PART D)
+================================================================================
+
+LearnerPortalModule exposes `GET /learner/sessions`, `GET
+/learner/sessions/:id`, and `GET /learner/sessions/:id/attendance`, plus
+the watched-interval ingestion route (section H). Every route resolves the
+caller's LearnerProfile id from the authenticated JWT
+(LearnerPortalService.resolveLearnerProfileId(user.id)) — no route in this
+module accepts a learnerId from the client at all, so there is no
+parameter to trust or distrust.
+
+Visibility is filtered entirely through
+SessionEntitlementSnapshot.wasEntitled: `listEntitledSessions` only
+returns sessions with a wasEntitled snapshot for that learner;
+`getEntitledSession` checks the same snapshot for one session and throws
+NotFoundException (404) — not 403 — when it is missing, so a learner
+requesting a session they have no relationship to cannot distinguish "this
+session doesn't exist" from "you aren't entitled to it." The attendance
+route reuses the same 404-on-not-entitled check (see the correction
+recorded in section I of the git history of this file's earlier draft: it
+originally used a 403-throwing assertEntitled call and was fixed for
+consistency during this milestone's own test-writing).
+
+liveMeetingUrl and the recording relation are included in every session
+response the learner is entitled to see; no separate DeliveryMode-based
+gating (RECORDED_ONLY vs LIVE_AND_RECORDED) was implemented — see section
+Q for this deferred refinement.
+
+================================================================================
+G. LIVE INTERVAL / 50% ENGINE (PART E OF THE BRIEF)
+================================================================================
+
+LiveAttendanceIntervalService.ingest(sessionId, dto) is the internal
+seam a future Zoom adapter attaches to (`POST
+/admin/sessions/:id/live-intervals`, ADMIN-only in this phase — there is
+no separate "system" role yet, see section Q). It validates the session
+exists (404), the interval is well-formed (joinedAt strictly before
+leftAt, 400), and the learner is entitled (403 via
+AttendanceService.assertEntitled) before writing the row.
+
+Coverage is never accumulated incrementally — after every ingested
+interval, ALL of that learner's LiveAttendanceInterval rows for the
+session are re-read, each clipped to [session.startTime, session.endTime]
+via interval-merge.util's clipInterval, then merged via mergeIntervals and
+summed via totalCoverage. This is what guarantees: overlapping/duplicate
+intervals never double-count (merge collapses them); disconnected
+intervals accumulate correctly (each clipped, non-overlapping span
+contributes its own duration); and time outside the scheduled window never
+counts (clipping happens before anything is summed).
+
+The 50% threshold lives in AttendanceService.qualifyLive: `coverageMs <
+scheduledDurationMs * 0.5` is a strict less-than, so exactly 50% qualifies
+(verified by test with an exact-boundary case). A learner is never marked
+PRESENT from a single join event — qualification only ever happens through
+this coverage recomputation, and the AttendanceRecord.status = PRESENT /
+completionMode = LIVE / completedAt = (the timestamp of the interval that
+pushed coverage over the threshold) write happens exactly once, guarded by
+`status: PENDING` in the update's WHERE clause so it can never re-fire or
+downgrade an already-PRESENT record.
+
+================================================================================
+H. RECORDING + WATCHEDINTERVAL / 100% ENGINE (PARTS F AND G)
+================================================================================
+
+RecordingService.publish(sessionId, dto) (`POST
+/admin/sessions/:id/recording`, ADMIN-only) attaches a SessionRecording to
+an ENDED session (409 for any other status), and the schema's own
+`sessionId @unique` constraint is what enforces "one recording per
+session" — a second publish attempt is caught (P2002) and surfaced as 409
+rather than a raw database error. Publishing has no attendance side
+effect whatsoever: RecordingService has no dependency on AttendanceRecord
+at all (verified by test).
+
+WatchedIntervalService.ingest(sessionId, learnerId, dto) is learner-facing
+(`POST /learner/sessions/:id/recording/watched-intervals`) — the
+learner's own player reports the range it just played; learnerId is always
+the value LearnerPortalController resolved from the token, never accepted
+in the request body (CreateWatchedIntervalDto carries only
+startSecond/endSecond). It validates the interval is well-formed (400),
+the learner is entitled (403), the recording exists (404 via
+RecordingService.findForSession), and the interval falls within
+[0, totalSeconds] (400) before writing the row.
+
+Exactly like the LIVE engine, coverage is recomputed from the full merged
+set on every write — never a client-supplied percentage, and
+`CreateWatchedIntervalDto` has no percentage field to supply one in. The
+brief's own example is a direct test case: watching 0-15 and 30-60 of a
+60-minute (3600-second) recording computes to 2700 seconds (45 minutes),
+never 3600. AttendanceService.qualifyRecorded requires `coverageSeconds >=
+totalSeconds` — genuine 100%, no tolerance beyond the integer-second
+precision the schema itself already uses (WatchedInterval.startSecond/
+endSecond are `Int`, so there is no sub-second rounding question to
+tolerate in the first place).
+
+================================================================================
+I. ATTENDANCE CUTOFF + EXCEPTION HANDLING (PART H)
+================================================================================
+
+AttendanceService.getEffectiveCutoff(sessionId, learnerId) resolves, in
+order: a learner-specific AttendanceWindowException for this session (if
+one exists, its extendedCutoffAt is authoritative — full stop); else a
+session-wide exception (learnerId: null); else the session's own
+Session.attendanceCutoffAt (the existing Phase 2E-derived 23:59
+Africa/Johannesburg value). This is a deliberate divergence from the
+brief's fallback wording ("prefer the most permissive/latest valid
+explicitly granted cutoff unless the frozen design says otherwise") — the
+frozen design (docs/phase-2a-final-domain-design.txt, section G) DOES say
+otherwise: it states the explicit precedence order (learner-specific,
+then session-wide, then normal) rather than a chronological
+latest-value comparison, so that explicit order is what this
+implementation follows, tested directly with a case where the session-wide
+grant is chronologically later than the learner-specific one and the
+learner-specific one still wins.
+
+Multiple exceptions can exist at the same scope over time (they are
+append-only — WindowExceptionService.create never updates an existing
+row); when more than one applies at a given scope, the most recently
+created one is authoritative (`orderBy: { createdAt: 'desc' }`).
+
+WindowExceptionService (`POST`/`GET /admin/sessions/:id/window-exceptions`)
+is ADMIN-only for mutation; there is no learner-facing route anywhere that
+can create or read an exception, so an ordinary learner has no way to
+extend their own deadline. Every exception row carries reason,
+extendedCutoffAt, grantedByUserId (the authenticated admin's User id, not
+client-supplied), note, and createdAt — the full audit trail the existing
+schema already provides, with no new field added.
+
+================================================================================
+J. ABSENCE FINALIZATION (PART I) AND ATTENDANCE-RECORD CREATION (PART J)
+================================================================================
+
+AttendanceRecord creation point: chosen to be entitlement-snapshot
+creation, not first participation, per the brief's own stated preference
+("the school must ultimately know who was absent, not merely who
+interacted"). EntitlementService.writeEntitlementAndPendingAttendance
+idempotently upserts a PENDING AttendanceRecord in the same transaction as
+the SessionEntitlementSnapshot it accompanies — for both normal evaluation
+and replacement inheritance. A learner who is never entitled never gets an
+AttendanceRecord at all (there is no code path that creates one outside
+this method).
+
+AttendanceService.finalizeDueRecords() (`POST /admin/attendance/finalize`,
+ADMIN-only) is the deterministic, callable-now, idempotent finalizer: it
+reads every AttendanceRecord still PENDING, computes each one's effective
+cutoff (section I), and for any whose cutoff has passed, updates it to
+ABSENT with completionMode/completedAt explicitly nulled — via
+`updateMany` guarded by `status: PENDING` in the WHERE clause, so a record
+already finalized by a concurrent/prior run, or one that qualified PRESENT
+in the interim, is never touched again (verified by test: a record already
+moved off PENDING contributes 0 to finalizedCount on a second run). No
+scheduler/cron integration exists yet — this is deliberately just a
+callable service method plus an ADMIN HTTP endpoint, ready for a future
+scheduler to invoke on a timer, per the brief's explicit instruction not
+to build that integration now.
+
+PRESENT is never finalized to ABSENT: finalizeDueRecords only ever
+selects/updates rows with status: PENDING to begin with, so a PRESENT
+record is structurally unreachable by this method.
+
+================================================================================
+K. ADMIN/TEACHER ATTENDANCE READS (PART K)
+================================================================================
+
+AttendanceController exposes:
+  GET /admin/attendance/sessions/:sessionId              (ADMIN, school-wide)
+  GET /admin/attendance/learners/:learnerId               (ADMIN, school-wide)
+  GET /admin/attendance/sessions/:sessionId/learners/:learnerId/coverage (ADMIN)
+  GET /teacher/attendance/sessions/:sessionId              (TEACHER, scoped)
+
+The TEACHER route is the one carrying the scoping rule the brief calls
+out explicitly: before returning anything, it calls
+AttendanceService.assertTeacherAssignedToSession(user.id, sessionId),
+which resolves the caller's own TeacherProfile from their User id, then
+checks for a SessionTeacher row for that (session, teacher) pair — in ANY
+role (PRIMARY/ASSISTANT/SUBSTITUTE) — throwing ForbiddenException (403)
+if none exists. A TEACHER with no relationship to a given session gets 403
+on that session's attendance, verified directly by the RBAC integration
+test (a "teacher-unrelated" fixture distinct from the assigned one).
+
+getCoverageSummary computes both liveCoverageMs (LiveAttendanceInterval
+rows clipped to the session window, merged, summed) and
+recordedCoverageSeconds (WatchedInterval rows against the published
+recording, or null if none exists) for one learner — the "live/recorded
+accumulated coverage" figures the brief asks reads to expose, alongside
+whatever AttendanceRecord.status/completionMode/completedAt already
+provide.
+
+================================================================================
+L. ATTENDANCE OVERRIDE/AUDIT BEHAVIOR (PART L)
+================================================================================
+
+AttendanceService.override(attendanceRecordId, dto, performedByUserId)
+(`POST /admin/attendance/:id/override`, ADMIN-only) writes an
+AttendanceOverride row (previousStatus read from the record's current
+state, newStatus/reason/performedByUserId from the request/token) and
+applies the new state to AttendanceRecord in the same
+prisma.$transaction. OverrideAttendanceDto requires `reason` unconditionally
+(non-empty, enforced by class-validator) and requires completionMode +
+completedAt together only when newStatus is PRESENT (via `@ValidateIf`) —
+the same nullable-together invariant the frozen AttendanceRecord model
+itself enforces everywhere else, now enforced at the override boundary
+too.
+
+The override never touches LiveAttendanceInterval or WatchedInterval rows
+— AttendanceService has no write path to either table anywhere in the
+codebase, and this is asserted directly by test (the interval `findMany`
+mocks are asserted `not.toHaveBeenCalled()` during an override). The
+underlying participation evidence and the manual override remain two
+independently inspectable, distinguishable records: the evidence rows are
+exactly what LiveAttendanceIntervalService/WatchedIntervalService wrote
+during ingestion, and the override's own audit trail (AttendanceOverride)
+records what an admin changed and why, on top of — never in place of —
+that evidence.
+
+================================================================================
+M. ENDPOINTS IMPLEMENTED
+================================================================================
+
+Learners (ADMIN only unless noted):
+  GET    /admin/learners
+  GET    /admin/learners/:id
+  PATCH  /admin/learners/:id
+
+Subscription access (ADMIN only):
+  POST   /admin/subscription-access
+  GET    /admin/subscription-access
+  GET    /admin/subscription-access/:id
+  PATCH  /admin/subscription-access/:id
+  POST   /admin/subscription-access/:id/revoke
+
+Attendance admin/operational (ADMIN only):
+  POST   /admin/sessions/:sessionId/live-intervals
+  POST   /admin/sessions/:sessionId/recording
+  GET    /admin/sessions/:sessionId/window-exceptions
+  POST   /admin/sessions/:sessionId/window-exceptions
+  GET    /admin/attendance/sessions/:sessionId
+  GET    /admin/attendance/learners/:learnerId
+  GET    /admin/attendance/sessions/:sessionId/learners/:learnerId/coverage
+  POST   /admin/attendance/:attendanceRecordId/override
+  POST   /admin/attendance/finalize
+
+Teacher (scoped to assigned sessions):
+  GET    /teacher/attendance/sessions/:sessionId
+
+Learner (identity always derived from the JWT):
+  GET    /learner/sessions
+  GET    /learner/sessions/:id
+  GET    /learner/sessions/:id/attendance
+  POST   /learner/sessions/:id/recording/watched-intervals
+
+================================================================================
+N. TESTS AND EXACT TOTALS
+================================================================================
+
+Test Suites: 20 passed, 20 total
+Tests:       214 passed, 214 total
+
+(143 from the Phase 2E baseline + 71 new in this milestone, across 9 new
+spec files: auth.service.spec.ts gained 2 tests for atomic LearnerProfile
+creation; sessions.service.spec.ts gained 3 tests for entitlement wiring;
+and the following are entirely new —
+  entitlement.service.spec.ts           (10 tests)
+  attendance.service.spec.ts            (24 tests)
+  interval-merge.util.spec.ts           (7 tests)
+  live-attendance.service.spec.ts       (6 tests)
+  watched-interval.service.spec.ts      (7 tests)
+  recording.service.spec.ts             (5 tests)
+  subscription-access.service.spec.ts   (8 tests)
+  attendance-rbac.http.spec.ts          (10 tests, integration/RBAC) )
+
+Coverage against the brief's required test list (representative mapping;
+most bullets map to a named test above rather than being repeated here
+verbatim):
+
+Learner/access: LearnerProfile-atomic-creation and role tests live in
+auth.service.spec.ts; subscription grant success/missing-learner/
+missing-course/invalid-window/overlap/unauthorized-role tests live in
+subscription-access.service.spec.ts (role/HTTP-level 401/403 covered by
+the existing Phase 2C/2D RBAC pattern applied to the new
+@Roles('ADMIN') guard on SubscriptionAccessController).
+
+Entitlement: all bullets (valid grant produces snapshot; no snapshot
+without a qualifying grant; idempotent; PENDING attendance created;
+canceled-before-start still evaluates; replacement inherits; expired
+subscription doesn't block inherited replacement; multi-generation chain)
+are direct tests in entitlement.service.spec.ts and
+sessions.service.spec.ts.
+
+Live attendance: <50% pending, exactly 50% present, >50% present,
+disconnected-intervals-accumulate, overlap-doesn't-double-count, and
+outside-window-doesn't-count are all direct tests in
+attendance.service.spec.ts (threshold math) and
+live-attendance.service.spec.ts (clipping/merging).
+
+Recording: publication works, publication alone doesn't mark PRESENT,
+partial/skipped/overlapping coverage, genuine 100% -> PRESENT RECORDED,
+and post-cutoff completion not counting are all direct tests across
+recording.service.spec.ts, watched-interval.service.spec.ts, and
+attendance.service.spec.ts.
+
+Cutoff exceptions: normal/session-wide/learner-specific/precedence are
+four direct tests in attendance.service.spec.ts's "getEffectiveCutoff
+precedence" block.
+
+Absence: PENDING->ABSENT-after-cutoff, ABSENT-fields-null,
+PRESENT-never-finalized-to-ABSENT (structurally, by the PENDING-only
+selection), and finalizer-idempotent are all direct tests in
+attendance.service.spec.ts's "finalizeDueRecords" block.
+
+RBAC/privacy: learner-sees-own-data-only, learner-cannot-read-another's,
+teacher-scoped, teacher-cannot-read-unrelated, admin-permitted,
+override-admin-only, and override-requires-reason are all direct tests in
+attendance-rbac.http.spec.ts.
+
+Override: reason-required, audit-attribution-stored, and
+evidence-remains-untouched are direct tests in attendance.service.spec.ts's
+"override" block.
+
+================================================================================
+O. VERIFICATION RESULTS
+================================================================================
+
+  pnpm run test
+    -> Test Suites: 20 passed, 20 total
+       Tests:       214 passed, 214 total
+
+  pnpm run typecheck   (tsc --noEmit)
+    -> PASS, no errors.
+
+  pnpm exec eslint .   (run directly; root `pnpm run lint` still hits the
+  pre-existing Turbo `spawn UNKNOWN` issue, unrelated to this milestone)
+    -> 0 problems (one `no-unsafe-assignment` finding in
+       entitlement.service.spec.ts, from @types/jest's `any`-typed
+       `expect.objectContaining`, silenced with a file-level, commented
+       eslint-disable — the same justified pattern already used elsewhere
+       in this codebase's tests).
+
+  pnpm run build   (nest build)
+    -> PASS, exit code 0, no errors.
+
+  pnpm exec prisma validate
+    -> "The schema at prisma\schema.prisma is valid" — confirms no drift;
+       no schema file was touched by this milestone at all.
+
+  pnpm run format:check   (repository-wide, run specifically because the
+  brief flagged the recent CI Prettier failure)
+    -> Initial run: 24 files (23 new/modified this milestone, one
+       overlapping with the CI-flagged set) failed formatting.
+    -> Ran `pnpm run format` (Prettier --write, whitespace/line-wrap only —
+       no logic touched) across the repository.
+    -> Re-run: "All matched files use Prettier code style!" — clean.
+
+  Other workspace packages, re-typechecked directly to confirm no
+  regression:
+    packages/types  -> tsc --noEmit: PASS
+    packages/utils  -> tsc --noEmit: PASS
+    packages/ui     -> tsc --noEmit: PASS
+    apps/web        -> next typegen && tsc --noEmit: PASS
+
+================================================================================
+P. SCHEMA CHANGES / DEVIATIONS
+================================================================================
+
+No Phase 2F database schema changes were required, and none were made.
+
+apps/api/prisma/schema.prisma and every migration file are unchanged from
+the Phase 2E commit. Every model this milestone needed —
+LearnerProfile, SubscriptionAccess, SessionEntitlementSnapshot,
+AttendanceRecord, AttendanceOverride, AttendanceWindowException,
+SessionRecording, WatchedInterval, LiveAttendanceInterval, Offering,
+OfferingCourse — already existed in the frozen schema with every field
+this implementation needed. `prisma validate` confirms no drift. No
+mechanical Prisma adaptation was necessary either (unlike Phase 2A->2B,
+which needed one for a missing relation object) — the frozen schema was
+already complete for this milestone's purposes.
+
+No semantic blocker was encountered. Nothing required stopping under the
+brief's "STOP only for a genuine semantic blocker" rule.
+
+================================================================================
+Q. WARNINGS / DEFERRED INTEGRATIONS
+================================================================================
+
+1. LIVE interval ingestion is ADMIN-only in this phase, standing in for a
+   future Zoom adapter or webhook processor. There is no distinct "system"
+   or "service" role in the RBAC model yet, so ADMIN was used as the
+   interim caller identity for `POST /admin/sessions/:id/live-intervals`.
+   When real Zoom integration arrives, this almost certainly needs its own
+   authentication mechanism (a service credential / webhook signature)
+   rather than a human ADMIN's JWT — flagged for that future milestone,
+   not implemented here per the brief's explicit "do not integrate Zoom
+   yet" instruction.
+
+2. No DeliveryMode-based (LIVE_AND_RECORDED vs RECORDED_ONLY) gating exists
+   on what a learner's session response exposes — a learner entitled to a
+   RECORDED_ONLY offering currently still sees `liveMeetingUrl` in the
+   session payload from `GET /learner/sessions`, the same as a
+   LIVE_AND_RECORDED subscriber would. This is a real simplification, not
+   an oversight: implementing it properly requires deciding whether
+   gating happens per-Offering or per-SubscriptionAccess when a learner
+   holds multiple grants, which felt like a product decision better made
+   deliberately in a future milestone than guessed at here. Flagged, not
+   blocking.
+
+3. The window-exception precedence rule (learner-specific always beats
+   session-wide, regardless of which is chronologically later) is a
+   deliberate reading of the frozen design's explicit ordering over the
+   brief's more general "prefer the latest" fallback language — see
+   section I for the reasoning. This is a judgment call, documented and
+   tested, not silently assumed.
+
+4. finalizeDueRecords() has no production scheduler wired to it yet, per
+   the brief's explicit instruction not to build that integration now. It
+   is exposed as a plain, idempotent, callable ADMIN endpoint
+   (`POST /admin/attendance/finalize`) — the exact seam a future cron job
+   or scheduled Nest task would call.
+
+5. Attendance reads (`GET /admin/attendance/sessions/:id`,
+   `GET /admin/attendance/learners/:id`) have no pagination, consistent
+   with the same known gap already flagged in the Phase 2D and Phase 2E
+   reports.
+
+6. Payment processor integration, invoices/card/bank/payment-transaction
+   ledgers, Zoom API integration, automatic webhook processing, video
+   hosting integration, frontend/UI, HAPS, homework, and
+   notifications/email/SMS were all explicitly out of scope for this
+   milestone and none were implemented, per the brief's "NOT IN PHASE 2F"
+   list.
+
+7. The pre-existing Turbo `spawn UNKNOWN` issue (documented in every prior
+   phase's report) remains unchanged and unrelated to this milestone;
+   package-level commands were used throughout, as in every prior phase.
+
+================================================================================
+R. EXACT GIT STATUS
+================================================================================
+
+$ git status
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   apps/api/src/app.module.ts
+	modified:   apps/api/src/auth/auth.http.spec.ts
+	modified:   apps/api/src/auth/auth.service.spec.ts
+	modified:   apps/api/src/auth/auth.service.ts
+	modified:   apps/api/src/sessions/sessions.module.ts
+	modified:   apps/api/src/sessions/sessions.service.spec.ts
+	modified:   apps/api/src/sessions/sessions.service.ts
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	apps/api/src/attendance-rbac.http.spec.ts
+	apps/api/src/attendance/
+	apps/api/src/entitlements/
+	apps/api/src/learner-portal/
+	apps/api/src/learners/
+	apps/api/src/subscription-access/
+
+no changes added to commit (use "git add" and/or "git commit -a")
+
+$ git diff --stat
+ apps/api/src/app.module.ts                     | 10 ++++++
+ apps/api/src/auth/auth.http.spec.ts            |  8 ++++-
+ apps/api/src/auth/auth.service.spec.ts         | 47 ++++++++++++++++++++++++++
+ apps/api/src/auth/auth.service.ts              | 26 ++++++++++----
+ apps/api/src/sessions/sessions.module.ts       |  2 ++
+ apps/api/src/sessions/sessions.service.spec.ts | 35 ++++++++++++++++++-
+ apps/api/src/sessions/sessions.service.ts      | 41 +++++++++++++++++++++-
+ 7 files changed, 159 insertions(+), 10 deletions(-)
+
+No commit, tag, or push has been made. Phase 2F remains fully local,
+uncommitted, and ready for external review.
+
+================================================================================
+END OF REPORT
+================================================================================

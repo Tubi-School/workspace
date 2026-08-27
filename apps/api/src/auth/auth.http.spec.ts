@@ -79,7 +79,13 @@ describe('Auth HTTP surface', () => {
           return Promise.resolve(user);
         }),
       },
+      learnerProfile: {
+        create: jest.fn(() => Promise.resolve({ id: 'learner-profile-1' })),
+      },
     };
+    const fakePrismaWithTransaction = Object.assign(fakePrisma, {
+      $transaction: jest.fn((fn: (tx: typeof fakePrisma) => Promise<unknown>) => fn(fakePrisma)),
+    });
 
     const fakeConfigService = {
       getOrThrow: (key: string) => (key === 'JWT_SECRET' ? TEST_JWT_SECRET : '1h'),
@@ -96,7 +102,7 @@ describe('Auth HTTP surface', () => {
       providers: [
         AuthService,
         JwtStrategy,
-        { provide: PrismaService, useValue: fakePrisma },
+        { provide: PrismaService, useValue: fakePrismaWithTransaction },
         { provide: ConfigService, useValue: fakeConfigService },
       ],
     }).compile();

@@ -2,14 +2,19 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 
 import { AcademicTermsModule } from './academic-terms/academic-terms.module.js';
+import { AttendanceModule } from './attendance/attendance.module.js';
 import { AuthModule } from './auth/auth.module.js';
 import { validateEnvironment } from './config/environment.js';
 import { CoursesModule } from './courses/courses.module.js';
+import { EntitlementModule } from './entitlements/entitlement.module.js';
 import { GradeLevelsModule } from './grade-levels/grade-levels.module.js';
 import { HealthModule } from './health/health.module.js';
+import { LearnerPortalModule } from './learner-portal/learner-portal.module.js';
+import { LearnersModule } from './learners/learners.module.js';
 import { PrismaModule } from './prisma/prisma.module.js';
 import { SessionsModule } from './sessions/sessions.module.js';
 import { SubjectsModule } from './subjects/subjects.module.js';
+import { SubscriptionAccessModule } from './subscription-access/subscription-access.module.js';
 import { TeachersModule } from './teachers/teachers.module.js';
 
 /**
@@ -39,6 +44,11 @@ import { TeachersModule } from './teachers/teachers.module.js';
     CoursesModule,
     TeachersModule,
     SessionsModule,
+    LearnersModule,
+    SubscriptionAccessModule,
+    EntitlementModule,
+    AttendanceModule,
+    LearnerPortalModule,
   ],
 })
 export class AppModule {}

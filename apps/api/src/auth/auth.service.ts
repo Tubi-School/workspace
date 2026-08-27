@@ -63,13 +63,25 @@ export class AuthService {
 
     let user: User;
     try {
-      user = await this.prisma.user.create({
-        data: {
-          email,
-          passwordHash,
-          fullName: dto.fullName,
-          role: RoleName.LEARNER,
-        },
+      // The User and its LearnerProfile are created together, atomically —
+      // exactly the same pattern Phase 2E's TeachersService uses for
+      // User+TeacherProfile. A LEARNER User with no LearnerProfile would be
+      // a state the rest of the domain (SubscriptionAccess,
+      // SessionEntitlementSnapshot, AttendanceRecord — all keyed off
+      // LearnerProfile, not User) cannot represent.
+      user = await this.prisma.$transaction(async (tx) => {
+        const createdUser = await tx.user.create({
+          data: {
+            email,
+            passwordHash,
+            fullName: dto.fullName,
+            role: RoleName.LEARNER,
+          },
+        });
+
+        await tx.learnerProfile.create({ data: { userId: createdUser.id } });
+
+        return createdUser;
       });
     } catch (error) {
       // The findUnique check above narrows the window but does not close
