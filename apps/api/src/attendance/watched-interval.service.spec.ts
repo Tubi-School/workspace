@@ -1,4 +1,4 @@
-import { BadRequestException, ForbiddenException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException } from '@nestjs/common';
 
 import type { PrismaService } from '../prisma/prisma.service.js';
 import { AttendanceService } from './attendance.service.js';
@@ -14,6 +14,7 @@ describe('WatchedIntervalService', () => {
     watchedInterval: { create: jest.Mock; findMany: jest.Mock };
     sessionEntitlementSnapshot: { findUnique: jest.Mock };
     sessionRecording: { findUnique: jest.Mock };
+    session: { findUnique: jest.Mock };
     $transaction: jest.Mock;
     $queryRaw: jest.Mock;
   };
@@ -28,6 +29,9 @@ describe('WatchedIntervalService', () => {
         findUnique: jest.fn().mockResolvedValue({ wasEntitled: true }),
       },
       sessionRecording: { findUnique: jest.fn().mockResolvedValue(RECORDING) },
+      session: {
+        findUnique: jest.fn().mockResolvedValue({ id: SESSION_ID, status: 'LIVE' }),
+      },
       $queryRaw: jest.fn().mockResolvedValue(undefined),
       $transaction: jest.fn(),
     };
@@ -71,6 +75,15 @@ describe('WatchedIntervalService', () => {
     await expect(
       service.ingest(SESSION_ID, LEARNER_ID, { startSecond: 0, endSecond: 10 }),
     ).rejects.toBeInstanceOf(ForbiddenException);
+  });
+
+  it('rejects ingestion for a CANCELED session', async () => {
+    prisma.session.findUnique.mockResolvedValue({ id: SESSION_ID, status: 'CANCELED' });
+
+    await expect(
+      service.ingest(SESSION_ID, LEARNER_ID, { startSecond: 0, endSecond: 10 }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(prisma.watchedInterval.create).not.toHaveBeenCalled();
   });
 
   it('rejects an interval extending past the recording duration', async () => {

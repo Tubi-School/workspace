@@ -5,7 +5,9 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 
+import { withAdvisoryLock } from '../common/pg-advisory-lock.util.js';
 import {
+  Prisma,
   RoleName,
   SubscriptionStatus,
   type SubscriptionAccess,
@@ -13,6 +15,12 @@ import {
 import { PrismaService } from '../prisma/prisma.service.js';
 import type { CreateSubscriptionAccessDto } from './dto/create-subscription-access.dto.js';
 import type { UpdateSubscriptionAccessDto } from './dto/update-subscription-access.dto.js';
+
+/** Db is either PrismaService or an in-flight transaction client — the
+ * overlap check and the write must run against the same connection inside
+ * the advisory-locked transaction, or the lock does not actually cover
+ * them. */
+type Db = PrismaService | Prisma.TransactionClient;
 
 @Injectable()
 export class SubscriptionAccessService {
@@ -47,24 +55,41 @@ export class SubscriptionAccessService {
 
     const status = dto.status ?? SubscriptionStatus.ACTIVE;
 
-    if (status === SubscriptionStatus.ACTIVE) {
-      await this.assertNoOverlappingActiveGrant(
-        dto.learnerId,
-        dto.offeringId,
-        currentPeriodStart,
-        currentPeriodEnd,
-      );
-    }
+    // The overlap pre-check and the create must be indivisible from the
+    // perspective of any other concurrent grant request for the same
+    // (learnerId, offeringId) pair — otherwise two simultaneous requests
+    // can each pass the pre-check before either commits, producing two
+    // conflicting ACTIVE grants (the concurrency gap flagged in the
+    // Phase 2F review, closed here per Phase 2G Correction A). A
+    // Postgres advisory lock, held for one transaction, serializes only
+    // requests that collide on this exact learner+offering pair —
+    // unrelated grants never contend.
+    return withAdvisoryLock(
+      this.prisma,
+      `subscription-access:${dto.learnerId}:${dto.offeringId}`,
+      async (tx) => {
+        if (status === SubscriptionStatus.ACTIVE) {
+          await this.assertNoOverlappingActiveGrant(
+            dto.learnerId,
+            dto.offeringId,
+            currentPeriodStart,
+            currentPeriodEnd,
+            undefined,
+            tx,
+          );
+        }
 
-    return this.prisma.subscriptionAccess.create({
-      data: {
-        learnerId: dto.learnerId,
-        offeringId: dto.offeringId,
-        status,
-        currentPeriodStart,
-        currentPeriodEnd,
+        return tx.subscriptionAccess.create({
+          data: {
+            learnerId: dto.learnerId,
+            offeringId: dto.offeringId,
+            status,
+            currentPeriodStart,
+            currentPeriodEnd,
+          },
+        });
       },
-    });
+    );
   }
 
   findAll(): Promise<SubscriptionAccess[]> {
@@ -96,24 +121,34 @@ export class SubscriptionAccessService {
 
     const status = dto.status ?? existing.status;
 
-    if (status === SubscriptionStatus.ACTIVE) {
-      await this.assertNoOverlappingActiveGrant(
-        existing.learnerId,
-        existing.offeringId,
-        currentPeriodStart,
-        currentPeriodEnd,
-        id,
-      );
-    }
+    // Same concurrency reasoning as create(): the overlap check and the
+    // write must be indivisible under the same per-(learner, offering)
+    // advisory lock.
+    return withAdvisoryLock(
+      this.prisma,
+      `subscription-access:${existing.learnerId}:${existing.offeringId}`,
+      async (tx) => {
+        if (status === SubscriptionStatus.ACTIVE) {
+          await this.assertNoOverlappingActiveGrant(
+            existing.learnerId,
+            existing.offeringId,
+            currentPeriodStart,
+            currentPeriodEnd,
+            id,
+            tx,
+          );
+        }
 
-    return this.prisma.subscriptionAccess.update({
-      where: { id },
-      data: {
-        ...(dto.status !== undefined ? { status: dto.status } : {}),
-        ...(dto.currentPeriodStart !== undefined ? { currentPeriodStart } : {}),
-        ...(dto.currentPeriodEnd !== undefined ? { currentPeriodEnd } : {}),
+        return tx.subscriptionAccess.update({
+          where: { id },
+          data: {
+            ...(dto.status !== undefined ? { status: dto.status } : {}),
+            ...(dto.currentPeriodStart !== undefined ? { currentPeriodStart } : {}),
+            ...(dto.currentPeriodEnd !== undefined ? { currentPeriodEnd } : {}),
+          },
+        });
       },
-    });
+    );
   }
 
   /** Revokes a grant by moving it to CANCELED — the model's own supported
@@ -146,9 +181,10 @@ export class SubscriptionAccessService {
     offeringId: string,
     start: Date,
     end: Date,
-    excludeId?: string,
+    excludeId: string | undefined,
+    db: Db,
   ): Promise<void> {
-    const overlapping = await this.prisma.subscriptionAccess.findFirst({
+    const overlapping = await db.subscriptionAccess.findFirst({
       where: {
         learnerId,
         offeringId,

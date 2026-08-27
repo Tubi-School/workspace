@@ -1,12 +1,18 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { AppEnvironment, DependencyHealth, HealthReport, HealthStatus } from '@tubi/types';
 import { assertNever } from '@tubi/utils';
 
 import { PrismaService } from '../prisma/prisma.service.js';
 
+/** The only string a failed database probe may return to an HTTP caller.
+ * Deliberately generic — see probeDatabase for why. */
+const GENERIC_DATABASE_ERROR = 'Database unavailable';
+
 @Injectable()
 export class HealthService {
+  private readonly logger = new Logger(HealthService.name);
+
   constructor(
     private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
@@ -65,11 +71,21 @@ export class HealthService {
         latencyMs: Math.round(performance.now() - startedAt),
       };
     } catch (error) {
+      // The underlying pg/Prisma driver's error message can embed
+      // hostnames, usernames, or connection-string fragments — a public
+      // readiness endpoint must never return that. The real error is
+      // logged server-side (operators can read it there); the HTTP
+      // response gets only the fixed, non-sensitive GENERIC_DATABASE_ERROR
+      // string, regardless of what the driver actually said.
+      this.logger.error(
+        `Database readiness probe failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+
       return {
         name: 'postgresql',
         status: 'down',
         latencyMs: Math.round(performance.now() - startedAt),
-        error: error instanceof Error ? error.message : 'Unknown database error',
+        error: GENERIC_DATABASE_ERROR,
       };
     }
   }

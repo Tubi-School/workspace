@@ -1,4 +1,5 @@
 import { Body, Controller, Get, HttpCode, HttpStatus, Post, UseGuards } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 
 import { AuthService } from './auth.service.js';
 import { CurrentUser } from './decorators/current-user.decorator.js';
@@ -17,6 +18,11 @@ export class AuthController {
     return this.authService.register(dto);
   }
 
+  // Meaningfully tighter than the global default: brute-forcing a
+  // password is the one abuse pattern worth specifically limiting.
+  // 5 attempts/minute per client is enough headroom for a genuine typo or
+  // two, without giving a credential-stuffing script a useful budget.
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @Post('login')
   @HttpCode(HttpStatus.OK)
   login(@Body() dto: LoginDto): Promise<{ accessToken: string; user: SanitizedUser }> {

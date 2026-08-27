@@ -45,6 +45,15 @@ jobs:
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
 
+      - name: Validate Prisma schema
+        # Schema-only validation (parses prisma/schema.prisma and every
+        # migration file); never opens a database connection, so no real
+        # DATABASE_URL is required here beyond satisfying the datasource
+        # block's own validation.
+        run: pnpm --filter @tubi/api exec prisma validate
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+
       - name: Check formatting
         run: pnpm run format:check
 
@@ -53,6 +62,15 @@ jobs:
 
       - name: Typecheck
         run: pnpm run typecheck
+
+      - name: Test
+        # Every existing test mocks Prisma directly — none open a real
+        # database connection — so no Postgres service container is needed
+        # here, only a syntactically valid DATABASE_URL for env validation.
+        run: pnpm --filter @tubi/api run test
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+          JWT_SECRET: ci-test-secret-at-least-32-characters-long
 
       - name: Build
         run: pnpm run build

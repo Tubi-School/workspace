@@ -1,5 +1,11 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 
+import { SessionStatus } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { AttendanceService } from './attendance.service.js';
 import type { CreateLiveIntervalDto } from './dto/create-live-interval.dto.js';
@@ -34,6 +40,15 @@ export class LiveAttendanceIntervalService {
       throw new NotFoundException(`Session ${sessionId} not found`);
     }
 
+    // A canceled session produces no AttendanceRecord rows (frozen design
+    // section F) and must never have its historical entitlement/attendance
+    // state mutated by late-arriving participation evidence.
+    if (session.status === SessionStatus.CANCELED) {
+      throw new ConflictException(
+        `Session ${sessionId} is CANCELED; attendance cannot be recorded`,
+      );
+    }
+
     const joinedAt = new Date(dto.joinedAt);
     const leftAt = new Date(dto.leftAt);
 
@@ -42,6 +57,7 @@ export class LiveAttendanceIntervalService {
     }
 
     await this.attendanceService.assertEntitled(sessionId, dto.learnerId);
+    await this.attendanceService.assertLiveDeliveryModeAllowed(sessionId, dto.learnerId);
 
     // The insert-reread-recompute-qualify sequence below must behave as one
     // consistent operation under concurrent submissions for the same

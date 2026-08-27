@@ -1,4 +1,9 @@
-import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 
 import type { PrismaService } from '../prisma/prisma.service.js';
 import { AttendanceService } from './attendance.service.js';
@@ -20,6 +25,7 @@ describe('LiveAttendanceIntervalService', () => {
 
   const session = {
     id: SESSION_ID,
+    status: 'LIVE',
     startTime: new Date('2026-07-01T11:00:00Z'),
     endTime: new Date('2026-07-01T12:00:00Z'),
   };
@@ -29,7 +35,15 @@ describe('LiveAttendanceIntervalService', () => {
       session: { findUnique: jest.fn().mockResolvedValue(session) },
       liveAttendanceInterval: { create: jest.fn(), findMany: jest.fn().mockResolvedValue([]) },
       sessionEntitlementSnapshot: {
-        findUnique: jest.fn().mockResolvedValue({ wasEntitled: true }),
+        // Affirmative LIVE_AND_RECORDED by default — assertEntitled and
+        // assertLiveDeliveryModeAllowed share this same lookup, and
+        // DeliveryMode now fails closed (Phase 2G Correction 3), so a
+        // mock with no resolvable offering would incorrectly deny every
+        // test below that isn't specifically exercising that denial.
+        findUnique: jest.fn().mockResolvedValue({
+          wasEntitled: true,
+          subscriptionAccess: { offering: { deliveryMode: 'LIVE_AND_RECORDED' } },
+        }),
       },
       $queryRaw: jest.fn().mockResolvedValue(undefined),
       $transaction: jest.fn(),
@@ -70,6 +84,66 @@ describe('LiveAttendanceIntervalService', () => {
       }),
     ).rejects.toBeInstanceOf(BadRequestException);
     expect(prisma.liveAttendanceInterval.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects ingestion for a CANCELED session', async () => {
+    prisma.session.findUnique.mockResolvedValue({ ...session, status: 'CANCELED' });
+
+    await expect(
+      service.ingest(SESSION_ID, {
+        learnerId: LEARNER_ID,
+        joinedAt: '2026-07-01T11:00:00Z',
+        leftAt: '2026-07-01T11:30:00Z',
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(prisma.liveAttendanceInterval.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects LIVE ingestion for a learner entitled only through a RECORDED_ONLY offering (DeliveryMode enforcement)', async () => {
+    prisma.sessionEntitlementSnapshot.findUnique.mockResolvedValue({
+      wasEntitled: true,
+      subscriptionAccess: { offering: { deliveryMode: 'RECORDED_ONLY' } },
+    });
+
+    await expect(
+      service.ingest(SESSION_ID, {
+        learnerId: LEARNER_ID,
+        joinedAt: '2026-07-01T11:00:00Z',
+        leftAt: '2026-07-01T11:30:00Z',
+      }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(prisma.liveAttendanceInterval.create).not.toHaveBeenCalled();
+  });
+
+  it('FAILS CLOSED: denies LIVE ingestion when the entitlement snapshot has no resolvable subscriptionAccess/offering (Phase 2G Correction 3)', async () => {
+    prisma.sessionEntitlementSnapshot.findUnique.mockResolvedValue({
+      wasEntitled: true,
+      subscriptionAccess: null,
+    });
+
+    await expect(
+      service.ingest(SESSION_ID, {
+        learnerId: LEARNER_ID,
+        joinedAt: '2026-07-01T11:00:00Z',
+        leftAt: '2026-07-01T11:30:00Z',
+      }),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    expect(prisma.liveAttendanceInterval.create).not.toHaveBeenCalled();
+  });
+
+  it('allows LIVE ingestion for a learner entitled through a LIVE_AND_RECORDED offering', async () => {
+    prisma.sessionEntitlementSnapshot.findUnique.mockResolvedValue({
+      wasEntitled: true,
+      subscriptionAccess: { offering: { deliveryMode: 'LIVE_AND_RECORDED' } },
+    });
+
+    await service.ingest(SESSION_ID, {
+      learnerId: LEARNER_ID,
+      joinedAt: '2026-07-01T11:00:00Z',
+      leftAt: '2026-07-01T11:30:00Z',
+    });
+
+    expect(prisma.liveAttendanceInterval.create).toHaveBeenCalled();
   });
 
   it('rejects ingestion for a learner who was never entitled to the session', async () => {

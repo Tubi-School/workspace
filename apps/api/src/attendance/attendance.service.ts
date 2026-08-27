@@ -3,6 +3,7 @@ import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/commo
 import {
   AttendanceStatus,
   CompletionMode,
+  DeliveryMode,
   Prisma,
   type AttendanceRecord,
 } from '../generated/prisma/client.js';
@@ -55,6 +56,63 @@ export class AttendanceService {
 
     if (!snapshot || !snapshot.wasEntitled) {
       throw new ForbiddenException(`Learner ${learnerId} is not entitled to session ${sessionId}`);
+    }
+  }
+
+  /**
+   * Resolves the DeliveryMode the learner's own historical entitlement
+   * grants for this session — read from the SessionEntitlementSnapshot's
+   * own `subscriptionAccess.offering`, never from the learner's current
+   * live subscription, so a later plan change cannot retroactively change
+   * what a session already entitled a learner to. Assumes the caller has
+   * already confirmed entitlement (assertEntitled).
+   *
+   * FAILS CLOSED (Phase 2G Correction 3): returns `null` — never a
+   * default DeliveryMode — when the snapshot has no linked
+   * SubscriptionAccess/Offering to read a mode from. This should not
+   * occur for any snapshot the current entitlement engine writes, but a
+   * missing or inconsistent entitlement-origin link is exactly the kind
+   * of authorization-relevant data that must never be silently upgraded
+   * to a permissive default. Every caller of this method is required to
+   * treat `null` as "no LIVE privilege" — see assertLiveDeliveryModeAllowed
+   * and LearnerPortalService's redaction logic.
+   */
+  private async resolvePermittedDeliveryMode(
+    sessionId: string,
+    learnerId: string,
+    db: Db = this.prisma,
+  ): Promise<DeliveryMode | null> {
+    const snapshot = await db.sessionEntitlementSnapshot.findUnique({
+      where: { sessionId_learnerId: { sessionId, learnerId } },
+      include: { subscriptionAccess: { include: { offering: true } } },
+    });
+
+    return snapshot?.subscriptionAccess?.offering.deliveryMode ?? null;
+  }
+
+  /**
+   * Enforces DeliveryMode at the point of LIVE participation: a learner
+   * entitled only through a RECORDED_ONLY offering — or whose
+   * entitlement-origin data cannot be resolved at all — must not gain
+   * learner-facing LIVE access merely because the session also has a
+   * meeting URL. LIVE access requires AFFIRMATIVE evidence of
+   * LIVE_AND_RECORDED; anything else (RECORDED_ONLY, or null/unresolved)
+   * denies it. RECORDED access is never gated the same way — both
+   * DeliveryMode values include recorded access, so there is no
+   * "LIVE_ONLY" case in the frozen enum that would need a symmetric
+   * check on the recorded path.
+   */
+  async assertLiveDeliveryModeAllowed(
+    sessionId: string,
+    learnerId: string,
+    db: Db = this.prisma,
+  ): Promise<void> {
+    const deliveryMode = await this.resolvePermittedDeliveryMode(sessionId, learnerId, db);
+
+    if (deliveryMode !== DeliveryMode.LIVE_AND_RECORDED) {
+      throw new ForbiddenException(
+        `Learner ${learnerId} is not entitled to LIVE attendance on session ${sessionId}`,
+      );
     }
   }
 

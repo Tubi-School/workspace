@@ -17,6 +17,8 @@ describe('SubscriptionAccessService', () => {
       findUnique: jest.Mock;
       update: jest.Mock;
     };
+    $transaction: jest.Mock;
+    $queryRaw: jest.Mock;
   };
   let service: SubscriptionAccessService;
 
@@ -41,7 +43,15 @@ describe('SubscriptionAccessService', () => {
         findUnique: jest.fn(),
         update: jest.fn(),
       },
+      $queryRaw: jest.fn().mockResolvedValue(undefined),
+      $transaction: jest.fn(),
     };
+    // Runs the transaction callback against the same fake client, so the
+    // service's own advisory-lock + overlap-check + write logic actually
+    // executes rather than being bypassed by the mock.
+    prisma.$transaction.mockImplementation((fn: (tx: typeof prisma) => Promise<unknown>) =>
+      fn(prisma),
+    );
     service = new SubscriptionAccessService(prisma as unknown as PrismaService);
   });
 
@@ -88,6 +98,36 @@ describe('SubscriptionAccessService', () => {
 
       expect(prisma.subscriptionAccess.findFirst).not.toHaveBeenCalled();
       expect(prisma.subscriptionAccess.create).toHaveBeenCalled();
+    });
+
+    it('runs the overlap check and the create inside one advisory-locked transaction, keyed by (learnerId, offeringId)', async () => {
+      prisma.subscriptionAccess.findFirst.mockResolvedValue(null);
+      prisma.subscriptionAccess.create.mockResolvedValue({ id: 'grant-1', ...validDto });
+
+      await service.create(validDto);
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
+      // The overlap check ran before the create, both against the same
+      // (locked) transactional client.
+      const findFirstOrder = prisma.subscriptionAccess.findFirst.mock.invocationCallOrder[0]!;
+      const createOrder = prisma.subscriptionAccess.create.mock.invocationCallOrder[0]!;
+      expect(findFirstOrder).toBeLessThan(createOrder);
+    });
+
+    it('a legitimate non-overlapping grant for a different offering is unaffected by another learner+offering pair holding the lock', async () => {
+      // Different (learnerId, offeringId) pairs use different lock keys —
+      // simulated here simply by two independent create() calls both
+      // succeeding, since the fake $transaction never actually contends.
+      prisma.subscriptionAccess.findFirst.mockResolvedValue(null);
+      prisma.subscriptionAccess.create
+        .mockResolvedValueOnce({ id: 'grant-1', ...validDto })
+        .mockResolvedValueOnce({ id: 'grant-2', ...validDto, offeringId: 'offering-2' });
+
+      await service.create(validDto);
+      await service.create({ ...validDto, offeringId: 'offering-2' });
+
+      expect(prisma.subscriptionAccess.create).toHaveBeenCalledTimes(2);
     });
   });
 

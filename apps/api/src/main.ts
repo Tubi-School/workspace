@@ -3,14 +3,22 @@ import 'reflect-metadata';
 import { Logger, ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import helmet from 'helmet';
 
 import { AppModule } from './app.module.js';
 
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create(AppModule, { bufferLogs: true });
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, { bufferLogs: true });
   const config = app.get(ConfigService);
   const logger = new Logger('Bootstrap');
+
+  // Railway (and any conventional PaaS reverse proxy) terminates TLS and
+  // forwards the real client IP via X-Forwarded-For. Without this, every
+  // request appears to originate from the proxy's own address, which
+  // would make the login rate limiter (see auth.controller.ts) count all
+  // callers as one client instead of limiting each caller individually.
+  app.set('trust proxy', 1);
 
   // Sensible security headers by default; relaxing them later is a deliberate
   // act, whereas remembering to add them is easy to forget.

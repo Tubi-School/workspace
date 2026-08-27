@@ -1,5 +1,8 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { APP_GUARD } from '@nestjs/core';
+import { ScheduleModule } from '@nestjs/schedule';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 
 import { AcademicTermsModule } from './academic-terms/academic-terms.module.js';
 import { AttendanceModule } from './attendance/attendance.module.js';
@@ -35,6 +38,13 @@ import { TeachersModule } from './teachers/teachers.module.js';
       // directly and have no .env file at all.
       envFilePath: ['.env.local', '.env'],
     }),
+    // Generous global default (every route not otherwise annotated) —
+    // this is baseline abuse protection, not a per-endpoint policy.
+    // AuthController.login carries its own stricter @Throttle override
+    // (see auth.controller.ts) since credential-guessing is the one
+    // endpoint worth a materially tighter limit.
+    ThrottlerModule.forRoot([{ name: 'default', ttl: 60_000, limit: 100 }]),
+    ScheduleModule.forRoot(),
     PrismaModule,
     HealthModule,
     AuthModule,
@@ -50,5 +60,6 @@ import { TeachersModule } from './teachers/teachers.module.js';
     AttendanceModule,
     LearnerPortalModule,
   ],
+  providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })
 export class AppModule {}

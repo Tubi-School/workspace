@@ -1,0 +1,1635 @@
+TUBI WORKSPACE — PHASE 2G EXTERNAL ARCHITECTURE REVIEW HANDOFF
+Operational Backend Completion & Production API.
+Status: CORRECTED per external review verdict "APPROVED SUBJECT TO THREE
+SMALL PRE-COMMIT CORRECTIONS." All three are applied and verified. Still
+local, uncommitted — not committed, tagged, or pushed. This document
+remains the single review gate before that happens.
+
+================================================================================
+POST-REVIEW CORRECTIONS (applied after the external reviewer's verdict)
+================================================================================
+
+CORRECTION 1 — Railway builder matches the current Railway service:
+  `railway.json`'s `build.builder` changed from `"NIXPACKS"` to
+  `"RAILPACK"` — the builder the founder's actual Railway service uses.
+  The monorepo-root build command, the `start:prod` start command, the
+  `/health` healthcheck path, and the restart policy are all byte-for-byte
+  unchanged. See section N.
+
+CORRECTION 2 — Readiness endpoint no longer exposes raw database errors:
+  `HealthService.probeDatabase` now logs the real driver error
+  server-side (`Logger.error`, Nest's own logger — never returned to a
+  caller) and returns a fixed, non-sensitive string,
+  `"Database unavailable"`, as the HTTP-visible `error` field, regardless
+  of what the underlying pg/Prisma error actually said. A new test proves
+  a thrown error containing an obvious fake connection string/credentials
+  cannot appear anywhere in the serialized readiness response. See
+  section J.
+
+CORRECTION 3 — DeliveryMode resolution now fails closed:
+  `AttendanceService.resolvePermittedDeliveryMode` returns
+  `DeliveryMode | null` — `null`, never a default `LIVE_AND_RECORDED`,
+  when a snapshot has no resolvable `subscriptionAccess.offering`.
+  `assertLiveDeliveryModeAllowed` now requires AFFIRMATIVE evidence of
+  `LIVE_AND_RECORDED` (`deliveryMode !== LIVE_AND_RECORDED` denies,
+  covering both `RECORDED_ONLY` and `null` in one branch) instead of
+  only rejecting the single `RECORDED_ONLY` case.
+  `LearnerPortalService`'s `redactLiveAccess` was changed the same way:
+  it now exposes `liveMeetingUrl` only when `deliveryMode ===
+  LIVE_AND_RECORDED`, so a `null` (unresolvable) mode redacts the URL
+  exactly like `RECORDED_ONLY` does, rather than being silently promoted
+  to the permissive default. The frozen two-value `DeliveryMode` enum
+  itself was not touched. See sections D and W.
+
+Everything below this point describes the CORRECTED implementation —
+sections D, J, N, R, S, V, and W have been updated in place to match,
+rather than left as stale pre-correction snapshots.
+
+================================================================================
+A. SCOPE COMPLETED
+================================================================================
+
+Phase 2G combined, in one milestone, the remaining operational-backend
+work needed to make the existing TUBI API production-deployable:
+
+  1. Closed the two Phase 2F review limitations explicitly named in the
+     brief: SubscriptionAccess overlapping-grant concurrency, and
+     DeliveryMode enforcement.
+  2. Made attendance finalization automatic (a scheduled Cron job),
+     rather than admin-triggered only.
+  3. Hardened the Session/attendance lifecycle against mutation of
+     CANCELED sessions by late-arriving participation evidence.
+  4. Added login rate limiting (a real, tested throttle, not a stub).
+  5. Confirmed and documented health/readiness, environment validation,
+     CORS, and Prisma production-migration strategy — all of which
+     turned out to already be implemented to a production standard by
+     prior phases (see section C for what was pre-existing vs. new).
+  6. Added Railway deployment configuration (`railway.json`) and a safe
+     `start:prod` script running `prisma migrate deploy` before start.
+  7. Added a minimal, environment-driven API base URL foundation on the
+     `apps/web` side (`NEXT_PUBLIC_API_URL`), with no frontend UI built.
+  8. Added a CI test step and a Prisma schema-validation step; reviewed
+     (and found already current) the GitHub Actions runner versions.
+  9. Did NOT deploy — this environment has no Railway CLI, no Railway
+     authentication, and no linked project (verified directly; see
+     section T). All non-blocked repository work was completed anyway,
+     per the brief's explicit instruction for this exact situation.
+
+Deliberately excluded (per the brief's own scope exclusions, section 17,
+and reconfirmed still true after implementation): full learner/teacher/
+admin frontend, Zoom API/webhooks, video hosting integration, payment
+gateway, invoices/ledger, homework LMS entity, HAPS, notifications,
+mobile app. None of these were touched.
+
+Assumptions:
+  - "COMPLETED" in the brief's section 4 heading is the existing frozen
+    `SessionStatus.ENDED` value — the frozen schema has no separate
+    `COMPLETED` enum member, and none was added (see section G — no
+    schema change was needed or made).
+  - The brief's DELIVERY MODE test list asks for "LIVE-only cannot use
+    recorded path." The frozen `DeliveryMode` enum has exactly two
+    values, `LIVE_AND_RECORDED` and `RECORDED_ONLY` — there is no
+    `LIVE_ONLY` value, so this specific case is a schema impossibility,
+    not an untested gap. The two real cases — `RECORDED_ONLY` blocking
+    LIVE access, and `LIVE_AND_RECORDED` permitting both — are fully
+    implemented and tested (section D).
+  - Rate limiting uses `@nestjs/throttler`'s default in-memory storage.
+    This is correct and sufficient for a single-instance deployment; for
+    a future multi-replica Railway deployment, per-instance counting
+    means the effective global limit scales with replica count rather
+    than staying fixed. This is flagged in section U as a known,
+    deliberately out-of-scope limitation ("do not build a distributed
+    anti-fraud platform").
+
+================================================================================
+B. FILES CREATED / MODIFIED
+================================================================================
+
+--- Created ---
+
+apps/api/src/common/pg-advisory-lock.util.ts
+  Generic `withAdvisoryLock(prisma, lockKey, fn)` — the shared Postgres
+  advisory-lock-guarded-transaction primitive behind both the Phase 2F
+  interval-ingestion fix and the new SubscriptionAccess concurrency fix.
+
+apps/api/src/attendance/attendance-finalizer.scheduler.ts
+  `AttendanceFinalizerScheduler` — `@Cron(EVERY_5_MINUTES)` calling
+  `AttendanceService.finalizeDueRecords()` automatically.
+
+apps/api/src/attendance/attendance-finalizer.scheduler.spec.ts
+  3 unit tests.
+
+apps/api/src/auth/auth-rate-limit.http.spec.ts
+  3 integration tests (real ThrottlerGuard, real `@Throttle` override)
+  for the login rate limiter.
+
+apps/api/src/config/environment.spec.ts
+  8 unit tests for `validateEnvironment` (previously untested, though the
+  function itself is not new to Phase 2G).
+
+apps/api/src/health/health.service.spec.ts
+  4 unit tests for `HealthService` (previously untested).
+
+apps/api/src/learner-portal/learner-portal.service.spec.ts
+  8 unit tests, primarily covering the new DeliveryMode redaction
+  behavior in `LearnerPortalService`.
+
+apps/web/src/config/api.ts
+  `API_BASE_URL`, read from `NEXT_PUBLIC_API_URL` — the frontend's
+  production-connectivity foundation (section O).
+
+railway.json (repository root)
+  Railway build/deploy configuration (section N).
+
+--- Modified ---
+
+apps/api/src/subscription-access/subscription-access.service.ts
+  `create()`/`update()` now run their overlap pre-check and write inside
+  one `withAdvisoryLock`-guarded transaction, closing the Phase 2F review's
+  concurrency gap (section E).
+
+apps/api/src/subscription-access/subscription-access.service.spec.ts
+  +2 tests: advisory-locked transaction ordering, and that a different
+  (learner, offering) pair is unaffected.
+
+apps/api/src/attendance/attendance.service.ts
+  Added `resolvePermittedDeliveryMode` (private) and
+  `assertLiveDeliveryModeAllowed` (public) — DeliveryMode enforcement at
+  the point of LIVE participation (section D).
+
+apps/api/src/attendance/live-attendance.service.ts
+  `ingest()` now rejects a CANCELED session (409) and calls
+  `assertLiveDeliveryModeAllowed` after `assertEntitled`.
+
+apps/api/src/attendance/live-attendance.service.spec.ts
+  +3 tests: CANCELED-session rejection, RECORDED_ONLY rejection,
+  LIVE_AND_RECORDED success.
+
+apps/api/src/attendance/watched-interval.service.ts
+  `ingest()` now rejects a CANCELED session (409). RECORDED access is not
+  additionally gated by DeliveryMode — both enum values permit recorded
+  access, so there is no case to reject (see Assumptions above).
+
+apps/api/src/attendance/watched-interval.service.spec.ts
+  +1 test: CANCELED-session rejection.
+
+apps/api/src/attendance/learner-session-lock.util.ts
+  Refactored to delegate to the new shared `withAdvisoryLock` (same
+  external signature/behavior; lock key now prefixed
+  `learner-session:` instead of bare `sessionId:learnerId` — cosmetic
+  only, since the key is only ever compared to itself).
+
+apps/api/src/attendance/attendance.module.ts
+  Registers `AttendanceFinalizerScheduler` as a provider.
+
+apps/api/src/learner-portal/learner-portal.service.ts
+  `listEntitledSessions`/`getEntitledSession` now redact `liveMeetingUrl`
+  to `''` for a learner whose entitlement snapshot resolves to a
+  RECORDED_ONLY offering (section D).
+
+apps/api/src/auth/auth.controller.ts
+  `login()` now carries `@Throttle({ default: { limit: 5, ttl: 60_000 } })`.
+
+apps/api/src/app.module.ts
+  Registers `ThrottlerModule.forRoot(...)`, `ScheduleModule.forRoot()`,
+  and `APP_GUARD: ThrottlerGuard`.
+
+apps/api/src/main.ts
+  `app.set('trust proxy', 1)` so the throttler and any future
+  IP-sensitive logic see the real client IP behind Railway's proxy.
+
+apps/api/package.json
+  Added `@nestjs/schedule` (6.1.3) and `@nestjs/throttler` (6.5.0)
+  dependencies; added `start:prod` script
+  (`prisma migrate deploy && node dist/main.js`).
+
+apps/api/.env.example
+  Documents `CORS_ORIGINS` including a Vercel-style origin; documents the
+  hardcoded (non-environment-configurable) scheduler interval, rate
+  limit, and academic timezone choices, and Railway's automatic
+  PORT/DATABASE_URL injection.
+
+.github/workflows/ci.yml
+  Added a "Validate Prisma schema" step (`prisma validate`) and a "Test"
+  step (`pnpm --filter @tubi/api run test`) — CI previously validated
+  format/lint/typecheck/build only, never actually ran the test suite.
+
+pnpm-lock.yaml
+  Updated by `pnpm install` for the two new dependencies.
+
+================================================================================
+C. PHASE 2F LIMITATIONS CLOSED
+================================================================================
+
+Phase 2F's review (docs/phase-2f-implementation-review.txt, section M)
+listed limitations. Phase 2G's brief named two of them explicitly as
+Corrections A and B — both closed:
+
+1. SubscriptionAccess overlapping-grant concurrency race — CLOSED.
+   See section E.
+
+2. DeliveryMode enforcement (was never implemented pre-Phase-2G) — CLOSED.
+   See section D.
+
+Other Phase 2F limitations, reconfirmed:
+
+3. LIVE ingestion is ADMIN-only, standing in for a future Zoom
+   adapter — UNCHANGED, correctly out of Phase 2G's scope (no Zoom
+   integration in this milestone).
+4. No "open interval" streaming ingestion path — UNCHANGED, same reason.
+5. No pagination on list endpoints — UNCHANGED; not named in the Phase
+   2G brief and not a production-blocking concern for the current data
+   volumes.
+6. The interval-ingestion concurrency gap itself — was already CLOSED in
+   the Phase 2F correction round (the advisory-lock mechanism this
+   milestone's Correction A reuses via the new shared
+   `pg-advisory-lock.util.ts`).
+
+New limitation closed by this milestone that Phase 2F's review had NOT
+flagged: attendance finalization had no automatic trigger at all
+(admin-endpoint-only) — CLOSED, see section F. Session lifecycle also had
+no explicit guard preventing attendance ingestion against a CANCELED
+session — CLOSED, see section G.
+
+================================================================================
+D. DELIVERYMODE ENFORCEMENT
+================================================================================
+
+The frozen `Offering.deliveryMode` enum has exactly two values:
+`LIVE_AND_RECORDED` and `RECORDED_ONLY` (docs/phase-2a-final-domain-design.txt,
+section D). Prior to Phase 2G, nothing in the codebase read this field at
+attendance-ingestion time — a learner entitled only through a
+RECORDED_ONLY offering could still submit LIVE participation and a
+learner-portal read always exposed `liveMeetingUrl` regardless of
+entitlement.
+
+Mechanism (see section W for full source) [CORRECTED per external review
+Correction 3 — fails closed]:
+  - `AttendanceService.resolvePermittedDeliveryMode(sessionId, learnerId,
+    db)` reads the learner's own SessionEntitlementSnapshot for this
+    session, joined to `subscriptionAccess.offering`, and returns that
+    offering's `deliveryMode` — never the learner's current live
+    subscription, so a later plan change cannot retroactively alter what
+    a session already entitled a learner to (the same "historical truth"
+    principle SessionEntitlementSnapshot already embodies for
+    entitlement itself). Return type is `DeliveryMode | null`: a snapshot
+    with no linked subscriptionAccess/offering now resolves to `null`,
+    never a default `LIVE_AND_RECORDED` — entitlement-origin data that is
+    missing or inconsistent must never be silently upgraded to a
+    permissive authorization outcome.
+  - `AttendanceService.assertLiveDeliveryModeAllowed(sessionId,
+    learnerId, db)` now requires AFFIRMATIVE evidence: it throws
+    `ForbiddenException` (403) whenever the resolved mode is anything
+    OTHER than `LIVE_AND_RECORDED` — one condition,
+    `deliveryMode !== DeliveryMode.LIVE_AND_RECORDED`, covering both
+    `RECORDED_ONLY` and `null` identically. Previously this only checked
+    for `RECORDED_ONLY` specifically, which is what let a `null`
+    (unresolvable) case fall through unguarded before Correction 3.
+  - `LiveAttendanceIntervalService.ingest()` calls this immediately after
+    `assertEntitled`, before any interval is written — unchanged call
+    site, corrected callee behavior.
+  - `WatchedIntervalService.ingest()` does NOT need a symmetric check:
+    both enum values include recorded access, so there is no DeliveryMode
+    value that could make a RECORDED submission invalid — see
+    Assumptions in section A.
+  - `LearnerPortalService`'s `redactLiveAccess` helper now takes
+    `deliveryMode: DeliveryMode | null` and exposes `liveMeetingUrl` only
+    when `deliveryMode === DeliveryMode.LIVE_AND_RECORDED` — redacting it
+    to `''` for both `RECORDED_ONLY` and `null` alike. This is the same
+    Session row for every caller — no second Session is ever created for
+    a redacted learner, exactly as instructed.
+
+Tests (15 total across 3 files, +3 from the pre-correction 12):
+live-attendance.service.spec.ts (reject RECORDED_ONLY, allow
+LIVE_AND_RECORDED, the CANCELED-session guard, and — new —
+FAILS CLOSED: reject when subscriptionAccess is null);
+learner-portal.service.spec.ts (redact for RECORDED_ONLY, pass through
+for LIVE_AND_RECORDED, — corrected — FAILS CLOSED: redact for a null
+subscriptionAccess on both the single-session and list read paths, "same
+row not a second Session" assertion via `expect(session.findMany).not
+.toHaveBeenCalled()` in the single-session case).
+
+================================================================================
+E. SUBSCRIPTION CONCURRENCY SOLUTION
+================================================================================
+
+Problem (Phase 2F review, section M, item 4): `assertNoOverlappingActiveGrant`
+was a plain pre-check before `create`/`update` — two simultaneous requests
+for the same (learnerId, offeringId) pair could each pass the check before
+either transaction committed, producing two conflicting ACTIVE grants.
+
+Fix: the smallest robust PostgreSQL-compatible mechanism, matching the
+pattern already established for interval ingestion in Phase 2F —
+`pg_advisory_xact_lock`, generalized into a new shared helper
+(`common/pg-advisory-lock.util.ts`) so both use sites share one
+implementation rather than duplicating the transaction-plus-raw-SQL
+pattern. `SubscriptionAccessService.create()`/`update()` now run the
+overlap check and the write inside
+`withAdvisoryLock(prisma, `subscription-access:${learnerId}:${offeringId}`,
+...)` — a single Postgres transaction that first takes a lock keyed by
+exactly the (learnerId, offeringId) pair being written. Two concurrent
+requests for the SAME pair are fully serialized (the second's transaction
+blocks until the first commits and releases the lock, so it always
+re-checks against the first's already-committed row); requests for
+different learners or different offerings never contend with each other,
+so legitimate unrelated grants remain fully concurrent. No schema change
+was made or needed — `assertNoOverlappingActiveGrant`'s query and the
+409 it raises are byte-for-byte unchanged; only the transaction/locking
+wrapper around it changed.
+
+Tests added (2): one asserting the overlap check and the create are both
+inside exactly one `$transaction`/`$queryRaw` pair, in the correct order;
+one demonstrating a different (learnerId, offeringId) pair succeeds
+independently. Combined with the 6 pre-existing `create`/`revoke` tests,
+the full concurrency-and-correctness picture (overlap detection, non-
+overlap success, invalid window, missing learner/offering, non-ACTIVE
+grants skip the check, revoke semantics) remains covered.
+
+================================================================================
+F. ATTENDANCE SCHEDULER/FINALIZER
+================================================================================
+
+`AttendanceService.finalizeDueRecords()` (built in Phase 2F) is unchanged
+— still idempotent via `updateMany` guarded by `status: PENDING` in the
+WHERE clause, still respects session-wide and learner-specific
+AttendanceWindowException precedence via `getEffectiveCutoff`, still sets
+`completionMode: null, completedAt: null` on every ABSENT it writes, and
+still never touches an already-PRESENT record (the WHERE clause excludes
+it). None of this logic was modified.
+
+What Phase 2G adds is the trigger: `AttendanceFinalizerScheduler`
+(`@nestjs/schedule`), registered via `ScheduleModule.forRoot()` in
+AppModule, calling `finalizeDueRecords()` on a fixed
+`@Cron(CronExpression.EVERY_5_MINUTES)` schedule — no administrator
+action required for normal operation. The existing
+`POST /admin/attendance/finalize` endpoint is unchanged and kept
+specifically for operational recovery (e.g. after an extended outage),
+per the brief's explicit instruction.
+
+Interval choice: every 5 minutes. Documented directly in the scheduler's
+own source comment (section W) — the frozen cutoff granularity is a fixed
+clock instant (23:59 Africa/Johannesburg, or an explicit
+AttendanceWindowException timestamp) with no sub-minute precision
+requirement anywhere in the frozen domain design, so finalizing up to ~5
+minutes after the exact cutoff changes no founder-defined semantics.
+
+Multi-replica safety: not a new concern this scheduler introduces —
+`finalizeDueRecords`'s idempotency (pre-existing) is exactly what makes
+concurrent execution from multiple replicas' schedulers harmless: a
+second replica's `updateMany` calls simply match zero rows for anything
+a first replica already finalized in the same window. No distributed
+lock was added, per the brief's explicit instruction not to build
+anti-fraud/distributed-coordination infrastructure beyond what
+correctness requires.
+
+Tests added (3, attendance-finalizer.scheduler.spec.ts): calls
+`finalizeDueRecords` once per run; repeated invocation is safe (delegates
+to the already-idempotent finalizer, asserted across two calls with
+different return values); a failure from `finalizeDueRecords` propagates
+rather than being silently swallowed (so a real failure is visible in
+logs/monitoring rather than disappearing).
+
+================================================================================
+G. SESSION LIFECYCLE HARDENING
+================================================================================
+
+Reviewed the complete lifecycle (SessionsService: `create`, `update`,
+`markLive`, `markEnded`, `cancel`, staffing operations) against the
+brief's checklist:
+
+  - SCHEDULED -> LIVE -> ENDED, and SCHEDULED/LIVE -> CANCELED: unchanged
+    from Phase 2F/2E — `assertTransition` and explicit status checks
+    already reject every impossible transition (LIVE from non-SCHEDULED,
+    ENDED from non-LIVE, CANCELED from ENDED/CANCELED). No frozen-enum
+    "COMPLETED" state exists to add — ENDED already fills that role (see
+    Assumptions, section A).
+  - `entitlementPoint = MIN(scheduled start, cancellation time)` —
+    unchanged from the Phase 2F correction round; still implemented
+    exactly in `SessionsService.markLive`/`cancel` (see the Phase 2F
+    review's own section P for the source, byte-for-byte unchanged by
+    Phase 2G).
+  - Entitlement creation idempotency: unchanged — `EntitlementService`'s
+    upsert-based writes are untouched by this milestone.
+  - Cancellation cannot destroy historical entitlement: unchanged —
+    `SessionEntitlementSnapshot` rows are never deleted or overwritten by
+    any code path touched in Phase 2G.
+  - Replacement inheritance / repeated replacement chains: unchanged —
+    `EntitlementService.inheritForReplacement` and
+    `SessionsService.create`'s replacement wiring are untouched.
+  - Recording publication lifecycle rule (`RecordingService.publish`
+    requires `status === ENDED`, and the schema's own `sessionId @unique`
+    on SessionRecording prevents a second publish): unchanged, already
+    correct.
+  - Attendance processing cannot mutate CANCELED sessions — THIS WAS THE
+    ONE GENUINE GAP, now closed: `LiveAttendanceIntervalService.ingest`
+    and `WatchedIntervalService.ingest` both now reject (409
+    ConflictException) any ingestion attempt against a session whose
+    `status === CANCELED`, before any interval row is written or any
+    qualification is attempted. A CANCELED session produces no
+    AttendanceRecord rows in the first place (frozen design section F),
+    so this closes the one path by which a late-arriving interval could
+    otherwise still write raw LiveAttendanceInterval/WatchedInterval
+    evidence rows against a session the domain considers to have no
+    attendance at all.
+
+No new workflow complexity was introduced — both new guards are a single
+status check each, matching the existing style of every other lifecycle
+guard in this codebase.
+
+================================================================================
+H. SECURITY HARDENING
+================================================================================
+
+Adversarial review against the brief's checklist, Phase 2C through 2F:
+
+  - Authentication guards / JWT validation: `JwtStrategy` re-checks
+    `user.isActive` against the database on every request (never trusts
+    the token's claims for its whole lifetime) and pins the signing
+    algorithm explicitly (`JWT_ALGORITHM`), rejecting a token signed with
+    any other algorithm — both already correct, unchanged, and covered by
+    existing tests (`auth.http.spec.ts`'s algorithm-substitution test).
+  - Role guards / ADMIN endpoints / TEACHER scoping / LEARNER ownership:
+    already correctly enforced by `RolesGuard` + `@Roles(...)` at every
+    controller, `assertTeacherAssignedToSession` for TEACHER-scoped reads,
+    and `resolveLearnerProfileId(user.id)` (never a client-supplied
+    learnerId) for every learner-facing route — unchanged, reconfirmed by
+    reading every controller in `attendance`, `learner-portal`,
+    `sessions`, `subscription-access`, `learners`.
+  - IDOR: every learner-facing read is entitlement-filtered (404, not
+    403, for a session/record the caller has no relationship to — this
+    was itself a Phase 2F correction, unchanged here). Every admin/teacher
+    identifier param uses `ParseUUIDPipe` (verified present on every
+    controller method taking an `:id` param across the codebase via a
+    direct grep — none missing).
+  - Inactive-user handling: `AuthService.login`/`findSanitizedById` and
+    `JwtStrategy.validate` all reject an inactive user with the same
+    generic message a nonexistent account gets — unchanged, correct.
+  - passwordHash serialization: `sanitizeUser` remains the only function
+    in `auth.service.ts` permitted to read `passwordHash` off a `User`
+    row; every response passes through it. `LearnersService` similarly
+    never selects `passwordHash`. Unchanged, correct.
+  - DTO validation / overposting: global `ValidationPipe({ whitelist:
+    true, forbidNonWhitelisted: true, transform: true })` in `main.ts` —
+    unchanged, already correct; an unexpected body field is rejected
+    (400), not silently dropped or accepted.
+  - Exception information leakage: Nest's built-in exception handling
+    already returns a generic body for unhandled exceptions and never
+    includes a stack trace in the HTTP response (stack traces are only
+    ever logged server-side) — verified by inspection; no custom filter
+    was needed or added.
+  - CORS: already environment-driven (`corsOrigins` from `CORS_ORIGINS`),
+    never `"*"` — unchanged, see section L.
+  - Environment-secret handling: `JWT_SECRET` has no default and a
+    minimum-length validator; `DATABASE_URL` is validated as a Postgres
+    connection string; both fail startup with a readable message if
+    missing/invalid — unchanged (already implemented before Phase 2G),
+    see section K.
+  - Logging of sensitive data: no interceptor or logger call in this
+    codebase logs a request body, a JWT, or a password anywhere; the
+    only production log call this milestone added
+    (`AttendanceFinalizerScheduler`) logs only a count. Reviewed and
+    confirmed clean.
+
+Genuinely new hardening added this milestone: Helmet was already wired
+(pre-existing, `app.use(helmet())` in `main.ts`); what was missing and is
+now added is (1) `trust proxy` so the app and its rate limiter see real
+client IPs behind Railway's reverse proxy (`main.ts`), and (2) the login
+rate limiter itself (section I). Request-size limits were reviewed:
+Express's default body-parser limit (100kb) already applies to every
+route via Nest's platform-express adapter and is more than adequate for
+this API's JSON-only payloads (the largest body any endpoint accepts is a
+short DTO) — no change was made, since tightening or loosening an
+already-reasonable default with no observed problem would be
+speculative, not hardening.
+
+CAPTCHA, external identity providers, MFA, and enterprise IAM were not
+introduced, per the brief's explicit exclusion.
+
+================================================================================
+I. RATE LIMITING
+================================================================================
+
+Mechanism: `@nestjs/throttler` (v6.5.0), the conventional NestJS-native
+rate-limiting library. `ThrottlerModule.forRoot([{ name: 'default', ttl:
+60_000, limit: 100 }])` registers a generous global default (100
+requests/minute per client) applied via a global `APP_GUARD`
+(`ThrottlerGuard`) in `app.module.ts` — every route not otherwise
+annotated gets this baseline. `AuthController.login` carries its own
+stricter override, `@Throttle({ default: { limit: 5, ttl: 60_000 } })` —
+5 attempts per minute per client, specifically because credential-
+guessing is the one endpoint worth a materially tighter limit than
+everything else.
+
+Correct throttled response: Nest's `ThrottlerGuard` returns HTTP 429 (Too
+Many Requests) automatically when a client exceeds its limit — verified
+directly by the new integration test hitting `/auth/login` 6 times.
+
+No enumeration introduced: the throttled (429) response carries no
+`accessToken` and is identical in shape regardless of which email was
+submitted or whether that account exists — verified by a test that
+throttles using a different, nonexistent email on every attempt and still
+gets 429 on the 6th, proving the counter tracks the client (IP), not the
+submitted account.
+
+Deployment behind Railway/proxy: `main.ts`'s `app.set('trust proxy', 1)`
+(added this milestone) is what makes per-client counting correct once
+deployed behind Railway's reverse proxy — without it, every request would
+appear to originate from the proxy's own address and the limiter would
+throttle all callers as a single client.
+
+Tests (3, `auth-rate-limit.http.spec.ts`, using a real `ThrottlerGuard`
+and the real `@Throttle` decorator, not a stand-in): normal login within
+the limit succeeds; the 6th attempt in a minute is throttled with 429 and
+carries no credential-shaped body; throttling is client-scoped, not
+account-scoped (proven with varying nonexistent emails).
+
+================================================================================
+J. HEALTH/READINESS IMPLEMENTATION
+================================================================================
+
+Both endpoints already existed, implemented to a production standard,
+before Phase 2G:
+
+  `GET /health` (liveness): `HealthService.getLiveness()` checks nothing
+  external — deliberately, so a transient database blip does not cause
+  Railway to restart a perfectly healthy container. Always 200. Unchanged.
+
+  `GET /health/ready` (readiness): `HealthService.getReadiness()` probes
+  PostgreSQL via `PrismaService.ping()`, and the controller returns 503
+  (`ServiceUnavailableException`) whenever `HealthService.isServable`
+  says the reported status should not receive traffic — a readiness
+  probe communicates through the status code, not just the body.
+  Unchanged.
+
+  [CORRECTED per external review Correction 2] `probeDatabase()`'s catch
+  block previously surfaced the underlying driver error's own `.message`
+  directly in the HTTP response — a realistic Postgres connection
+  failure can embed a hostname, username, or connection-string fragment
+  in that message, which a public readiness endpoint must never return.
+  It now does two separate things: it logs the real error server-side via
+  Nest's own `Logger.error` (so operators retain full diagnostic detail
+  in the platform's log stream), and it returns a fixed, non-sensitive
+  string — `"Database unavailable"` (the `GENERIC_DATABASE_ERROR`
+  constant) — as the HTTP-visible `error` field, regardless of what the
+  underlying driver actually said. Neither endpoint's body includes
+  `DATABASE_URL`, `JWT_SECRET`, a hostname, a username, a password, a
+  connection-string fragment, raw driver/Prisma error text, or a stack
+  trace. Both endpoints remain excluded from the global `api/v1` prefix
+  (`app.setGlobalPrefix('api/v1', { exclude: ['health', 'health/ready'] })`)
+  so a deployment platform's health-check configuration never needs to
+  know about API versioning.
+
+`health.service.spec.ts` (5 tests, +1 from the pre-correction 4,
+previously untested before Phase 2G): liveness succeeds without touching
+the database; readiness succeeds when the ping succeeds; readiness
+reports `degraded` (and `isServable` returns `false`) when the ping
+fails, with an assertion that the service never calls
+`configService.getOrThrow('DATABASE_URL')` or `'JWT_SECRET')` while
+building that report; `isServable`'s exhaustive-switch behavior across
+all three `HealthStatus` values; and — new, Correction 2 — a test that
+throws an error containing an obvious fake secret/connection string
+(`postgresql://tubi_admin:sup3r-s3cr3t-p4ssw0rd@prod-db.internal:5432/tubi`)
+and asserts, via `JSON.stringify(report)`, that neither the full string
+nor any of its individual sensitive fragments (password, username,
+hostname) appears anywhere in the serialized response, and that the
+response's `error` field is exactly `"Database unavailable"`.
+
+================================================================================
+K. ENVIRONMENT/CONFIGURATION CHANGES
+================================================================================
+
+`apps/api/src/config/environment.ts` (Zod-based `validateEnvironment`,
+wired into `ConfigModule.forRoot({ validate: validateEnvironment })` so
+Nest refuses to boot on an invalid environment) already existed and
+already validated every variable the brief's checklist names:
+`DATABASE_URL` (required, must be a `postgres(ql)://` URL), `JWT_SECRET`
+(required, minimum 32 characters, no default), `PORT` (defaults 3001,
+range-checked), `NODE_ENV` (enum, defaults `development`), `CORS_ORIGINS`
+(defaults to localhost, normalized into an array). This was not modified
+— it was reviewed and found already correct — except for adding its
+first test coverage (`environment.spec.ts`, 8 tests, new this milestone):
+accepts a full valid production environment; fails clearly on missing
+`DATABASE_URL`; fails clearly on a non-Postgres `DATABASE_URL`; fails
+clearly on missing `JWT_SECRET`; fails clearly on a too-short
+`JWT_SECRET`; fails on an unrecognised `NODE_ENV`; defaults are applied
+correctly when optional variables are omitted; `CORS_ORIGINS` whitespace/
+empty-entry normalization is correct.
+
+Academic timezone and scheduler configuration were evaluated per the
+brief's checklist and deliberately left non-configurable: the academic
+timezone (Africa/Johannesburg) is a frozen founder ruling with no
+per-environment variation, already hardcoded in
+`sessions/academic-timezone.util.ts`; the finalizer's 5-minute interval
+and the login rate limit are ordinary engineering defaults with no
+product reason to vary by environment (see sections F and I for the
+reasoning) — introducing environment variables for either would be
+speculative configurability, not hardening.
+
+`apps/api/.env.example` updated (not `apps/api/.env`, which was never
+read, written, or overwritten): `CORS_ORIGINS` now shows a
+comma-separated example including a Vercel-style production origin
+alongside localhost; a new comment block documents the three hardcoded-
+by-design choices above and clarifies that Railway injects `PORT` (and
+`DATABASE_URL`, if using Railway Postgres) automatically in production.
+
+Proxy trust: `apps/api/src/main.ts`'s new `app.set('trust proxy', 1)` is
+the one "trust settings required by Railway" item the brief's checklist
+names — added this milestone (section H/I).
+
+================================================================================
+L. CORS CONFIGURATION
+================================================================================
+
+Unchanged mechanism, confirmed already correct: `main.ts` calls
+`app.enableCors({ origin: config.getOrThrow<string[]>('corsOrigins'),
+credentials: true })`, where `corsOrigins` is the parsed, trimmed array
+`environment.ts` derives from the `CORS_ORIGINS` environment variable.
+This is never `"*"` — a request from an origin not in the list is
+rejected by the CORS layer regardless of environment.
+
+How production origins are configured (documented directly in
+`.env.example`, updated this milestone): set `CORS_ORIGINS` on the
+Railway service to a comma-separated list including the deployed Vercel
+frontend's URL (and any future custom domain), e.g.
+`CORS_ORIGINS=https://tubi-workspace.vercel.app,https://app.tubi.school`.
+Local development's default (`http://localhost:3000`) requires no code
+change to coexist — it is simply one more entry in the same
+comma-separated variable during local work. Adding a future production
+custom domain is exactly the same: append it to the environment
+variable, redeploy, no code change.
+
+================================================================================
+M. PRISMA/MIGRATION PRODUCTION STRATEGY
+================================================================================
+
+`apps/api/package.json` already distinguished `db:migrate` (`prisma
+migrate dev` — local/development only) from `db:deploy` (`prisma migrate
+deploy` — the non-interactive, production-safe migration command) before
+Phase 2G. This milestone adds a new `start:prod` script:
+`prisma migrate deploy && node dist/main.js` — so a Railway deployment's
+start command applies any pending migration exactly once, safely,
+immediately before the server process starts, with no manual step. This
+is the command `railway.json`'s `deploy.startCommand` invokes (section N).
+
+`prisma migrate deploy` never resets a database and never seeds data —
+it only applies migration files already committed to
+`apps/api/prisma/migrations/` in order, exactly the non-destructive
+behavior production requires. No production database has been reset,
+seeded, or otherwise touched by this milestone (there is no production
+database connection available in this environment at all — see section T).
+
+No new migration was created and no schema file was touched — `prisma
+validate` (section S) confirms zero drift, matching Phase 2F and every
+prior phase.
+
+================================================================================
+N. RAILWAY DEPLOYMENT CONFIGURATION
+================================================================================
+
+File: `railway.json` (repository root — see the file itself in section
+W). [CORRECTED per external review Correction 1]
+
+  build.builder: `"RAILPACK"` — changed from the original `"NIXPACKS"`
+  to match the builder the founder's actual, currently-running Railway
+  service uses. This is the only field Correction 1 changed.
+
+  build.buildCommand (UNCHANGED by Correction 1):
+    `pnpm install --frozen-lockfile && pnpm turbo run build --filter=@tubi/api...`
+    Runs from the repository root deliberately — `apps/api` depends on
+    `@tubi/types`/`@tubi/utils`/`@tubi/config` via `workspace:*`, which
+    only resolve correctly when pnpm installs from the workspace root.
+    Turborepo's own task graph (`turbo.json`) already declares
+    `@tubi/api#build`'s dependency on `db:generate`, so Prisma Client
+    generation happens automatically as part of this one command; no
+    separate generate step was added to `railway.json`.
+
+  deploy.startCommand (UNCHANGED): `pnpm --filter @tubi/api run
+  start:prod` — applies pending migrations via `prisma migrate deploy`,
+  then starts the built server (section M).
+
+  deploy.healthcheckPath (UNCHANGED): `/health` — Railway's own liveness
+  probe target (excluded from the `api/v1` prefix, per section J).
+
+  deploy.restartPolicyType/MaxRetries (UNCHANGED): `ON_FAILURE` / 5 — a
+  conventional, bounded restart policy; not an invented one.
+
+================================================================================
+RAILWAY SERVICE ROOT DIRECTORY — OPERATOR REQUIREMENT (no code change)
+================================================================================
+
+CRITICAL, unmistakable, repeated here exactly as the reviewer requested:
+
+  Railway Service Root Directory MUST be:   /   (the repository root)
+  Railway Service Root Directory MUST NOT be:   /apps/api
+
+TUBI is a shared pnpm/Turborepo monorepo. `apps/api` depends on
+`@tubi/types`/`@tubi/utils`/`@tubi/config` via `workspace:*`, which only
+resolve correctly when pnpm installs from the workspace root, and
+`railway.json` itself lives at the repository root — Railway only reads
+it there. Setting Root Directory to `apps/api` would break both the
+`workspace:*` dependency resolution and Railway's ability to find
+`railway.json` at all.
+
+This is a Railway project-configuration setting inside the Railway
+dashboard, not a repository file — no code change can enforce it, which
+is exactly why it is called out this explicitly in prose. Per the
+reviewer's own note, the founder/operator will correct this setting in
+the Railway dashboard before the first deployment; no further action is
+needed from this repository to support that.
+
+Required environment variables on the Railway service (all already
+validated at startup by `environment.ts`, section K): `DATABASE_URL`,
+`JWT_SECRET`, `CORS_ORIGINS`, `NODE_ENV=production`. `PORT` is injected by
+Railway automatically and does not need to be set manually.
+
+================================================================================
+O. FRONTEND API URL CONFIGURATION
+================================================================================
+
+`apps/web/.env.example` already documented `NEXT_PUBLIC_API_URL` before
+Phase 2G (pre-existing convention, confirmed correct — no hardcoded
+`localhost` reference exists anywhere in `apps/web/src`, which currently
+contains no more than the default Next.js scaffold page).
+
+New this milestone: `apps/web/src/config/api.ts` —
+`export const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL ??
+'http://localhost:3001'`. This is the entire addition: a single,
+environment-driven constant, ready for the next milestone's frontend code
+to import, with a local-development fallback and zero hardcoded
+production value. No frontend UI, API client, fetch wrapper, or route was
+built — per the brief's explicit instruction to establish only the
+connectivity foundation.
+
+Production wiring (for the next milestone, not built here): set
+`NEXT_PUBLIC_API_URL` in the Vercel project's environment variables to
+the deployed Railway API's public URL (e.g.
+`https://tubi-api-production.up.railway.app`) for the Production
+environment, and to the local API's URL for local development — both
+without any code change, since the value is read from the environment at
+build time, never hardcoded.
+
+================================================================================
+P. CI CHANGES
+================================================================================
+
+`.github/workflows/ci.yml` previously ran: checkout, pnpm/Node setup,
+install, Prisma generate, format:check, lint, typecheck, build — but
+never actually ran the test suite. Added:
+
+  - A "Test" step (`pnpm --filter @tubi/api run test`), with a
+    syntactically valid `DATABASE_URL` and a 32+ character `JWT_SECRET`
+    supplied via env — required only to satisfy `environmentSchema`
+    validation and Nest's module bootstrap in the handful of HTTP-level
+    specs that build a real `NestApplication`; every test in this
+    repository mocks Prisma directly and none opens a real database
+    connection, so no Postgres service container was added.
+  - A "Validate Prisma schema" step (`prisma validate`), run
+    immediately after Prisma Client generation — schema-only validation
+    (parses `schema.prisma` and every migration file), never opens a
+    connection.
+
+GitHub Actions runner/version review (per the brief's item about a
+previously observed Node runtime deprecation warning): `actions/checkout@v5`,
+`pnpm/action-setup@v4`, and `actions/setup-node@v5` are all already the
+current major versions as of this review, and `actions/setup-node@v5`
+already runs on the Node 20 runtime internally — there is no deprecated-
+runtime warning left to fix with a version bump. No workflow file changes
+were made for this item, since none were needed; this was investigated
+and confirmed, not skipped.
+
+No unrelated CI redesign was performed — format/lint/typecheck/build
+remain exactly as they were, with test and Prisma-validate added
+alongside them.
+
+================================================================================
+Q. ENDPOINTS ADDED/CHANGED
+================================================================================
+
+No new HTTP route was added in Phase 2G. Existing routes with changed
+underlying behavior:
+
+  POST /admin/sessions/:sessionId/live-intervals (LiveAttendanceIntervalService.ingest)
+    NEW: 409 Conflict if the session is CANCELED.
+    NEW: 403 Forbidden if the learner's entitlement resolves to a
+         RECORDED_ONLY offering (DeliveryMode enforcement).
+
+  POST /learner/sessions/:id/recording/watched-intervals (WatchedIntervalService.ingest)
+    NEW: 409 Conflict if the session is CANCELED.
+
+  GET /learner/sessions, GET /learner/sessions/:id (LearnerPortalService)
+    NEW: `liveMeetingUrl` is now `''` instead of the real meeting URL for
+         a learner whose entitlement resolves to a RECORDED_ONLY offering.
+
+  POST /auth/login
+    NEW: throttled — 429 Too Many Requests after 5 attempts/minute from
+         the same client (previously unlimited).
+
+  GET /health, GET /health/ready
+    UNCHANGED — reviewed, already correct, now covered by tests.
+
+All other endpoints (admin/subscription-access, admin/attendance,
+admin/sessions lifecycle transitions, teacher-scoped reads, etc.) are
+unchanged in request/response shape; SubscriptionAccess's `create`/
+`update` responses are identical, only their internal concurrency
+handling changed.
+
+================================================================================
+R. TESTS ADDED AND EXACT TOTALS
+================================================================================
+
+Before Phase 2G (end of Phase 2F, corrected): 223 tests, 21 suites.
+After Phase 2G's original implementation: 255 tests, 26 suites.
+After Phase 2G's post-review corrections [CORRECTED]: 258 tests, 26
+suites — +35 tests, +5 suites overall relative to Phase 2F.
+
+New suite files (5, unchanged by the correction round):
+  attendance/attendance-finalizer.scheduler.spec.ts     3 tests
+  auth/auth-rate-limit.http.spec.ts                     3 tests
+  config/environment.spec.ts                            8 tests
+  health/health.service.spec.ts                          5 tests (+1 in
+    the correction round — see below)
+  learner-portal/learner-portal.service.spec.ts          9 tests (+1 in
+    the correction round — see below)
+
+Extended existing suite files:
+  attendance/live-attendance.service.spec.ts       6 -> 10 tests (+4
+    total: CANCELED rejection, RECORDED_ONLY rejection, LIVE_AND_RECORDED
+    success, and — added in the correction round, Correction 3 — FAILS
+    CLOSED: reject when subscriptionAccess is null)
+  attendance/watched-interval.service.spec.ts      8 -> 9 tests (+1:
+    CANCELED rejection)
+  subscription-access/subscription-access.service.spec.ts  8 -> 10 tests
+    (+2: advisory-lock ordering, independent non-overlapping pair)
+
+Correction-round-specific additions (+3 tests, 255 -> 258):
+  health/health.service.spec.ts: +1 — Correction 2's secret-leak-proof
+    test (a thrown error containing an obvious fake connection string
+    cannot appear anywhere in the serialized readiness response).
+  attendance/live-attendance.service.spec.ts: +1 — Correction 3's
+    fail-closed LIVE-ingestion-denial test (null subscriptionAccess).
+  learner-portal/learner-portal.service.spec.ts: +1 net — the
+    pre-correction "defaults to permissive" test for
+    `getEntitledSession` was repurposed in place to assert the corrected
+    fail-closed behavior instead (same test slot, opposite assertion,
+    not counted as a new test), and one new test was added for the
+    equivalent fail-closed case in `listEntitledSessions` (the batch/list
+    read path), which the pre-correction suite had not covered at all.
+
+Every other existing suite (attendance.service.spec.ts,
+entitlement.service.spec.ts, sessions.service.spec.ts,
+interval-merge.util.spec.ts, learner-session-lock.util.spec.ts,
+recording.service.spec.ts, auth.service.spec.ts, auth.http.spec.ts,
+teachers-sessions-rbac.http.spec.ts, admin-rbac.http.spec.ts,
+attendance-rbac.http.spec.ts, roles.guard.spec.ts, and every
+academic-terms/courses/grade-levels/subjects/teachers service spec) is
+unchanged and still fully passing — confirmed by the full run in
+section S, not merely assumed.
+
+Explicit cross-reference against the brief's section 15 requested test
+coverage:
+
+  LIVE-only cannot use recorded path        -> schema impossibility, see
+                                                Assumptions (section A) —
+                                                no LIVE_ONLY DeliveryMode
+                                                value exists to test
+  RECORDED-only cannot use live path        -> live-attendance.service.spec.ts
+  BOTH can use both                         -> live-attendance.service.spec.ts
+  attendance qualification respects mode    -> live-attendance.service.spec.ts
+                                                (rejection happens before
+                                                qualification is ever
+                                                reached)
+  simultaneous conflicting grants blocked    -> subscription-access.service.spec.ts
+  legitimate non-overlapping grants work     -> subscription-access.service.spec.ts
+                                                (pre-existing + new
+                                                independent-pair test)
+  due PENDING -> ABSENT                      -> attendance.service.spec.ts
+                                                (pre-existing,
+                                                finalizeDueRecords itself
+                                                unchanged)
+  PRESENT remains PRESENT                    -> attendance.service.spec.ts
+                                                (pre-existing)
+  exceptions respected                       -> attendance.service.spec.ts
+                                                (pre-existing)
+  repeated execution idempotent              -> attendance.service.spec.ts
+                                                (pre-existing) +
+                                                attendance-finalizer.
+                                                scheduler.spec.ts (new,
+                                                scheduler-level)
+  invalid transitions rejected               -> sessions.service.spec.ts
+                                                (pre-existing, unchanged)
+  cancellation entitlement preserved         -> sessions.service.spec.ts,
+                                                entitlement.service.spec.ts
+                                                (pre-existing, unchanged)
+  replacement entitlement preserved          -> entitlement.service.spec.ts
+                                                (pre-existing, unchanged)
+  unauthenticated protected requests rejected -> auth.http.spec.ts,
+                                                attendance-rbac.http.spec.ts
+                                                (pre-existing, unchanged)
+  learner cross-account access rejected      -> attendance-rbac.http.spec.ts,
+                                                learner-portal.service.spec.ts
+  teacher unrelated-course access rejected    -> attendance-rbac.http.spec.ts,
+                                                teachers-sessions-rbac.http.spec.ts
+                                                (pre-existing, unchanged)
+  admin access works where appropriate       -> admin-rbac.http.spec.ts
+                                                (pre-existing, unchanged)
+  malformed identifiers handled safely       -> ParseUUIDPipe on every
+                                                controller (verified by
+                                                inspection; behavior is
+                                                framework-level, not
+                                                separately unit-tested
+                                                per endpoint)
+  sensitive fields never serialized          -> auth.http.spec.ts
+                                                (pre-existing, unchanged)
+  repeated login abuse throttled             -> auth-rate-limit.http.spec.ts
+                                                (new)
+  normal authentication still works          -> auth-rate-limit.http.spec.ts
+                                                (new), auth.http.spec.ts
+                                                (pre-existing)
+  liveness success                           -> health.service.spec.ts (new)
+  readiness DB success                       -> health.service.spec.ts (new)
+  readiness failure without leaking creds    -> health.service.spec.ts (new)
+  production configuration validation        -> config/environment.spec.ts
+                                                (new)
+
+================================================================================
+S. VERIFICATION RESULTS
+================================================================================
+
+pnpm run test (from apps/api), full suite [CORRECTED — re-run after
+applying all three corrections], final run before updating this
+document:
+  Test Suites: 26 passed, 26 total
+  Tests:       258 passed, 258 total
+  Snapshots:   0 total
+  Time:        ~17-40s (varies by run; all runs green)
+
+(255 passed after the original Phase 2G implementation, before this
+correction round; 258 after applying Corrections 2 and 3's new tests —
+Correction 1, the `railway.json` builder change, has no test surface of
+its own.)
+
+pnpm run typecheck (tsc --noEmit) [re-run post-corrections]:
+  PASS — no output, no errors.
+
+pnpm exec eslint . (apps/api) [re-run post-corrections]:
+  0 problems, exit code 0. (One transient finding while writing the
+  original milestone's `main.ts` `trust proxy` line —
+  `@typescript-eslint/no-unsafe-call`/`no-unsafe-member-access` from
+  calling `.set(...)` on the loosely-typed default HTTP adapter instance —
+  resolved before the review gate by typing
+  `NestFactory.create<NestExpressApplication>(...)` and calling
+  `app.set(...)` directly; unaffected by this correction round, and still
+  clean on re-run.)
+
+pnpm run build (nest build) [re-run post-corrections]:
+  PASS, exit code 0, no errors.
+
+pnpm exec prisma validate [re-run post-corrections]:
+  "The schema at prisma\schema.prisma is valid" — confirms zero schema
+  drift; none of the three corrections touched the schema or any
+  migration file.
+
+apps/web: pnpm run typecheck (next typegen && tsc --noEmit) [re-run
+post-corrections; apps/web was untouched by any of the three
+corrections]:
+  PASS — "Types generated successfully", no tsc errors.
+
+pnpm run format:check (repository-wide) [CORRECTED — re-run after
+applying all three corrections]:
+  Original milestone's initial run had reported 4 files with formatting
+  issues (attendance-finalizer.scheduler.spec.ts, live-attendance.
+  service.ts, watched-interval.service.ts, config/environment.spec.ts);
+  `pnpm run format` was applied and re-verified clean before the first
+  review gate. This correction round's own re-run: "All matched files use
+  Prettier code style!" — clean, no further formatting issues introduced
+  by any of the three corrections.
+
+Migration status: no new migration exists to apply; `prisma migrate
+deploy` against the current migration set is a no-op on any database
+already at the Phase 2B/2C schema (unchanged since).
+
+================================================================================
+T. DEPLOYMENT RESULT AND PRODUCTION API URL
+================================================================================
+
+NOT DEPLOYED. This was verified directly, not assumed:
+
+  $ which railway            -> not found
+  $ railway --version        -> "command not found"
+  $ railway whoami            -> "command not found"
+  $ env | grep -i railway    -> no output (no Railway environment
+                                 variables of any kind present)
+
+This environment has no Railway CLI installed, no Railway authentication,
+and no linked Railway project. Per the brief's explicit instruction for
+exactly this situation ("do not block the rest of Phase 2G... complete
+all repository work first, then report the exact minimal founder action
+required"), every other Phase 2G item was completed and verified locally
+(section S), and no deployment — real or substitute/mock — was attempted.
+
+EXACT MINIMAL FOUNDER ACTION REQUIRED TO DEPLOY:
+
+  1. Create (or identify) a Railway project and a PostgreSQL database
+     within it (Railway's own managed Postgres, or an external one such
+     as Neon — either way, its connection string becomes `DATABASE_URL`).
+  2. Create a Railway service for this repository, with:
+       - Root Directory: the repository root (NOT `apps/api` — see
+         section N's critical note).
+       - Railway auto-detects `railway.json` for build/start commands
+         once the service is linked; no further configuration needed
+         there.
+  3. Set these environment variables on the Railway service:
+       DATABASE_URL   (from step 1)
+       JWT_SECRET     (a real, random, at least 32-character secret —
+                       generate with e.g. `openssl rand -base64 48`;
+                       never reuse the `.env.example` placeholder)
+       CORS_ORIGINS   (the deployed Vercel frontend's URL, comma-
+                       separated with any other real origins)
+       NODE_ENV       production
+     (`PORT` is injected by Railway automatically — do not set it.)
+  4. Trigger the first deploy (via `railway up`, a GitHub-connected
+     auto-deploy, or the Railway dashboard's deploy button — any of
+     these is a founder/operator action requiring Railway account
+     access this environment does not have).
+  5. After the first successful deploy, verify:
+       curl https://<the-railway-url>/health
+       curl https://<the-railway-url>/health/ready
+     both respond, and that `POST /api/v1/auth/register` +
+     `POST /api/v1/auth/login` behave correctly against the real
+     database.
+
+No production API URL exists yet — there is nothing to report here
+beyond the steps above.
+
+================================================================================
+U. KNOWN LIMITATIONS / DEFERRED INTEGRATIONS
+================================================================================
+
+1. Rate limiting uses `@nestjs/throttler`'s default in-memory store. This
+   is correct for a single Railway instance; if the service is later
+   scaled to multiple replicas, each replica counts independently, so the
+   effective global rate limit scales up with replica count rather than
+   staying fixed at 5/minute. Closing this fully would need a shared
+   store (e.g. Redis-backed throttler storage) — explicitly out of scope
+   per the brief ("do not build a distributed anti-fraud platform").
+
+2. [RESOLVED — external review Correction 2] `HealthService.probeDatabase`
+   previously passed the underlying Postgres driver's own `.message`
+   through to the HTTP readiness response unmodified — a realistic
+   failure mode that could expose a hostname, username, or
+   connection-string fragment publicly. It now logs the real error
+   server-side (`Logger.error`) and returns a fixed, non-sensitive string
+   (`"Database unavailable"`) to the HTTP caller in every failure case,
+   with a test (`health.service.spec.ts`) proving a thrown error
+   containing an obvious fake secret/connection string cannot appear
+   anywhere in the serialized response. No remaining limitation here.
+
+3. LIVE ingestion remains ADMIN-only (Phase 2F limitation, unchanged;
+   the future Zoom adapter is out of scope for both 2F and 2G).
+
+4. No pagination on list endpoints (unchanged from Phase 2F; not named in
+   the Phase 2G brief).
+
+5. The `apps/web` foundation added this milestone
+   (`NEXT_PUBLIC_API_URL`/`API_BASE_URL`) is intentionally inert — no
+   fetch call, API client, or route references it yet. This is by design
+   (section 12 of the brief: "do NOT build the full frontend in this
+   phase"), not an oversight; the next milestone is expected to consume
+   it directly.
+
+6. No production deployment exists (section T) — this is not a code
+   limitation but the expected, reported outcome of this environment
+   having no Railway access.
+
+7. Malformed-identifier handling for URL path parameters is enforced
+   uniformly by `ParseUUIDPipe` at the framework level across every
+   controller; this was verified by direct inspection (a repository-wide
+   grep confirming every `:id`-shaped route parameter across every
+   controller uses it) rather than by one dedicated unit test per
+   endpoint, since the guarantee is structural (the pipe itself is
+   NestJS's own, already extensively tested code) rather than
+   business-logic that could regress silently per-endpoint.
+
+No other known limitations, TODOs, or untested edge cases were
+identified in this milestone's own code during review.
+
+================================================================================
+V. EXACT GIT STATUS
+================================================================================
+
+Branch: main (up to date with origin/main). No commit, tag, or push has
+been made for Phase 2G, at any point across the original implementation
+or this correction round, per explicit instruction.
+
+$ git status [CORRECTED — re-run after applying all three corrections]
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+	modified:   .github/workflows/ci.yml
+	modified:   apps/api/.env.example
+	modified:   apps/api/package.json
+	modified:   apps/api/src/app.module.ts
+	modified:   apps/api/src/attendance/attendance.module.ts
+	modified:   apps/api/src/attendance/attendance.service.ts
+	modified:   apps/api/src/attendance/learner-session-lock.util.ts
+	modified:   apps/api/src/attendance/live-attendance.service.spec.ts
+	modified:   apps/api/src/attendance/live-attendance.service.ts
+	modified:   apps/api/src/attendance/watched-interval.service.spec.ts
+	modified:   apps/api/src/attendance/watched-interval.service.ts
+	modified:   apps/api/src/auth/auth.controller.ts
+	modified:   apps/api/src/health/health.service.ts
+	modified:   apps/api/src/learner-portal/learner-portal.service.ts
+	modified:   apps/api/src/main.ts
+	modified:   apps/api/src/subscription-access/subscription-access.service.spec.ts
+	modified:   apps/api/src/subscription-access/subscription-access.service.ts
+	modified:   pnpm-lock.yaml
+
+Untracked files:
+	apps/api/src/attendance/attendance-finalizer.scheduler.spec.ts
+	apps/api/src/attendance/attendance-finalizer.scheduler.ts
+	apps/api/src/auth/auth-rate-limit.http.spec.ts
+	apps/api/src/common/pg-advisory-lock.util.ts
+	apps/api/src/config/environment.spec.ts
+	apps/api/src/health/health.service.spec.ts
+	apps/api/src/learner-portal/learner-portal.service.spec.ts
+	apps/web/src/config/api.ts
+	docs/phase-2g-implementation-review.txt
+	railway.json
+
+no changes added to commit (use "git add" and/or "git commit -a")
+
+`apps/api/src/health/health.service.ts` is the one file this correction
+round added to the modified list that was not already modified before
+the first review gate (Correction 2). `railway.json` remains untracked
+(Correction 1 changed one field inside an already-new, not-yet-committed
+file, so it does not appear as a separate diff). `docs/phase-2g-
+implementation-review.txt` itself is now listed as untracked in this
+snapshot, having been created before this correction round and updated
+in place by it.
+
+$ git diff --stat (tracked files only) [CORRECTED]
+ .github/workflows/ci.yml                           |  18 ++++
+ apps/api/.env.example                              |  19 +++-
+ apps/api/package.json                              |   3 +
+ apps/api/src/app.module.ts                         |  11 +++
+ apps/api/src/attendance/attendance.module.ts       |   2 +
+ apps/api/src/attendance/attendance.service.ts      |  58 +++++++++++
+ .../src/attendance/learner-session-lock.util.ts    |  33 ++-----
+ .../src/attendance/live-attendance.service.spec.ts |  78 ++++++++++++++-
+ apps/api/src/attendance/live-attendance.service.ts |  18 +++-
+ .../attendance/watched-interval.service.spec.ts    |  15 ++-
+ .../api/src/attendance/watched-interval.service.ts |  17 +++-
+ apps/api/src/auth/auth.controller.ts               |   6 ++
+ apps/api/src/health/health.service.ts              |  20 +++-
+ .../src/learner-portal/learner-portal.service.ts   |  50 ++++++++--
+ apps/api/src/main.ts                               |  10 +-
+ .../subscription-access.service.spec.ts            |  40 ++++++++
+ .../subscription-access.service.ts                 | 108 ++++++++++++++-------
+ pnpm-lock.yaml                                     |  51 ++++++++++
+ 18 files changed, 481 insertions(+), 76 deletions(-)
+
+This document (docs/phase-2g-implementation-review.txt) and its own
+update in place are the only additional change beyond what is listed
+above.
+
+================================================================================
+W. CRITICAL SOURCE EXCERPTS FOR EXTERNAL REVIEW
+================================================================================
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/common/pg-advisory-lock.util.ts (COMPLETE FILE — the
+shared mechanism behind both subscription concurrency and interval
+ingestion locking)
+--------------------------------------------------------------------------------
+import { Prisma } from '../generated/prisma/client.js';
+import { PrismaService } from '../prisma/prisma.service.js';
+
+export async function withAdvisoryLock<T>(
+  prisma: PrismaService,
+  lockKey: string,
+  fn: (tx: Prisma.TransactionClient) => Promise<T>,
+): Promise<T> {
+  return prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${lockKey})::bigint)`;
+    return fn(tx);
+  });
+}
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/subscription-access/subscription-access.service.ts —
+concurrency-relevant excerpts (CORRECTED per Phase 2G Correction A)
+--------------------------------------------------------------------------------
+type Db = PrismaService | Prisma.TransactionClient;
+
+  async create(dto: CreateSubscriptionAccessDto): Promise<SubscriptionAccess> {
+    // ... learner/offering existence checks and window validation unchanged ...
+
+    const status = dto.status ?? SubscriptionStatus.ACTIVE;
+
+    return withAdvisoryLock(
+      this.prisma,
+      `subscription-access:${dto.learnerId}:${dto.offeringId}`,
+      async (tx) => {
+        if (status === SubscriptionStatus.ACTIVE) {
+          await this.assertNoOverlappingActiveGrant(
+            dto.learnerId,
+            dto.offeringId,
+            currentPeriodStart,
+            currentPeriodEnd,
+            undefined,
+            tx,
+          );
+        }
+
+        return tx.subscriptionAccess.create({
+          data: {
+            learnerId: dto.learnerId,
+            offeringId: dto.offeringId,
+            status,
+            currentPeriodStart,
+            currentPeriodEnd,
+          },
+        });
+      },
+    );
+  }
+
+  async update(id: string, dto: UpdateSubscriptionAccessDto): Promise<SubscriptionAccess> {
+    // ... existing/window resolution unchanged ...
+
+    return withAdvisoryLock(
+      this.prisma,
+      `subscription-access:${existing.learnerId}:${existing.offeringId}`,
+      async (tx) => {
+        if (status === SubscriptionStatus.ACTIVE) {
+          await this.assertNoOverlappingActiveGrant(
+            existing.learnerId,
+            existing.offeringId,
+            currentPeriodStart,
+            currentPeriodEnd,
+            id,
+            tx,
+          );
+        }
+
+        return tx.subscriptionAccess.update({
+          where: { id },
+          data: {
+            ...(dto.status !== undefined ? { status: dto.status } : {}),
+            ...(dto.currentPeriodStart !== undefined ? { currentPeriodStart } : {}),
+            ...(dto.currentPeriodEnd !== undefined ? { currentPeriodEnd } : {}),
+          },
+        });
+      },
+    );
+  }
+
+  private async assertNoOverlappingActiveGrant(
+    learnerId: string,
+    offeringId: string,
+    start: Date,
+    end: Date,
+    excludeId: string | undefined,
+    db: Db,
+  ): Promise<void> {
+    const overlapping = await db.subscriptionAccess.findFirst({
+      where: {
+        learnerId,
+        offeringId,
+        status: SubscriptionStatus.ACTIVE,
+        ...(excludeId !== undefined ? { id: { not: excludeId } } : {}),
+        currentPeriodStart: { lte: end },
+        currentPeriodEnd: { gte: start },
+      },
+    });
+
+    if (overlapping) {
+      throw new ConflictException(
+        `Learner ${learnerId} already has an overlapping ACTIVE subscription access grant (${overlapping.id}) for offering ${offeringId}`,
+      );
+    }
+  }
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/attendance/attendance.service.ts — DeliveryMode
+enforcement excerpt — CORRECTED per external review Correction 3 (fails
+closed: returns `DeliveryMode | null`, requires affirmative
+LIVE_AND_RECORDED rather than only rejecting RECORDED_ONLY)
+--------------------------------------------------------------------------------
+  private async resolvePermittedDeliveryMode(
+    sessionId: string,
+    learnerId: string,
+    db: Db = this.prisma,
+  ): Promise<DeliveryMode | null> {
+    const snapshot = await db.sessionEntitlementSnapshot.findUnique({
+      where: { sessionId_learnerId: { sessionId, learnerId } },
+      include: { subscriptionAccess: { include: { offering: true } } },
+    });
+
+    return snapshot?.subscriptionAccess?.offering.deliveryMode ?? null;
+  }
+
+  async assertLiveDeliveryModeAllowed(
+    sessionId: string,
+    learnerId: string,
+    db: Db = this.prisma,
+  ): Promise<void> {
+    const deliveryMode = await this.resolvePermittedDeliveryMode(sessionId, learnerId, db);
+
+    if (deliveryMode !== DeliveryMode.LIVE_AND_RECORDED) {
+      throw new ForbiddenException(
+        `Learner ${learnerId} is not entitled to LIVE attendance on session ${sessionId}`,
+      );
+    }
+  }
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/attendance/live-attendance.service.ts — CANCELED guard
++ DeliveryMode call site excerpt
+--------------------------------------------------------------------------------
+    if (!session) {
+      throw new NotFoundException(`Session ${sessionId} not found`);
+    }
+
+    if (session.status === SessionStatus.CANCELED) {
+      throw new ConflictException(`Session ${sessionId} is CANCELED; attendance cannot be recorded`);
+    }
+
+    const joinedAt = new Date(dto.joinedAt);
+    const leftAt = new Date(dto.leftAt);
+
+    if (joinedAt.getTime() >= leftAt.getTime()) {
+      throw new BadRequestException('joinedAt must be strictly before leftAt');
+    }
+
+    await this.attendanceService.assertEntitled(sessionId, dto.learnerId);
+    await this.attendanceService.assertLiveDeliveryModeAllowed(sessionId, dto.learnerId);
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/attendance/watched-interval.service.ts — CANCELED
+guard excerpt
+--------------------------------------------------------------------------------
+    const session = await this.prisma.session.findUnique({ where: { id: sessionId } });
+
+    if (session?.status === SessionStatus.CANCELED) {
+      throw new ConflictException(`Session ${sessionId} is CANCELED; attendance cannot be recorded`);
+    }
+
+    await this.attendanceService.assertEntitled(sessionId, learnerId);
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/learner-portal/learner-portal.service.ts —
+DeliveryMode redaction excerpt — CORRECTED per external review
+Correction 3 (fails closed: redacts unless the mode is affirmatively
+LIVE_AND_RECORDED, instead of defaulting a missing mode to permissive)
+--------------------------------------------------------------------------------
+  async getEntitledSession(learnerId: string, sessionId: string): Promise<LearnerVisibleSession> {
+    const snapshot = await this.prisma.sessionEntitlementSnapshot.findUnique({
+      where: { sessionId_learnerId: { sessionId, learnerId } },
+      include: { subscriptionAccess: { select: { offering: true } } },
+    });
+
+    if (!snapshot || !snapshot.wasEntitled) {
+      throw new NotFoundException(`Session ${sessionId} not found`);
+    }
+
+    const session = await this.prisma.session.findUniqueOrThrow({
+      where: { id: sessionId },
+      include: sessionInclude,
+    });
+
+    return redactLiveAccess(session, snapshot.subscriptionAccess?.offering.deliveryMode ?? null);
+  }
+}
+
+function redactLiveAccess(
+  session: LearnerVisibleSession,
+  deliveryMode: DeliveryMode | null,
+): LearnerVisibleSession {
+  if (deliveryMode === DeliveryMode.LIVE_AND_RECORDED) {
+    return session;
+  }
+
+  return { ...session, liveMeetingUrl: '' };
+}
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/attendance/attendance-finalizer.scheduler.ts (COMPLETE
+FILE — the scheduler/finalizer)
+--------------------------------------------------------------------------------
+import { Injectable, Logger } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
+
+import { AttendanceService } from './attendance.service.js';
+
+@Injectable()
+export class AttendanceFinalizerScheduler {
+  private readonly logger = new Logger(AttendanceFinalizerScheduler.name);
+
+  constructor(private readonly attendanceService: AttendanceService) {}
+
+  @Cron(CronExpression.EVERY_5_MINUTES, { name: 'attendance-finalizer' })
+  async run(): Promise<void> {
+    const { finalizedCount } = await this.attendanceService.finalizeDueRecords();
+
+    if (finalizedCount > 0) {
+      this.logger.log(`Finalized ${finalizedCount} PENDING attendance record(s) to ABSENT`);
+    }
+  }
+}
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/sessions/sessions.service.ts — lifecycle transition
+guards (UNCHANGED by Phase 2G; reproduced here because section G's review
+depends on this exact source)
+--------------------------------------------------------------------------------
+  async markLive(id: string): Promise<SessionWithRelations> {
+    const existing = await this.findOne(id);
+    this.assertTransition(existing.status, SessionStatus.SCHEDULED, SessionStatus.LIVE);
+    await this.entitlementService.evaluateForSession(id, existing.startTime);
+    return this.prisma.session.update({
+      where: { id },
+      data: { status: SessionStatus.LIVE },
+      include: sessionInclude,
+    });
+  }
+
+  async markEnded(id: string): Promise<SessionWithRelations> {
+    const existing = await this.findOne(id);
+    this.assertTransition(existing.status, SessionStatus.LIVE, SessionStatus.ENDED);
+    return this.prisma.session.update({
+      where: { id },
+      data: { status: SessionStatus.ENDED },
+      include: sessionInclude,
+    });
+  }
+
+  async cancel(id: string): Promise<SessionWithRelations> {
+    const existing = await this.findOne(id);
+    if (existing.status !== SessionStatus.SCHEDULED && existing.status !== SessionStatus.LIVE) {
+      throw new ConflictException(
+        `Session ${id} is ${existing.status} and cannot be canceled (only SCHEDULED or LIVE sessions can be)`,
+      );
+    }
+    const cancellationTime = new Date();
+    const entitlementPoint =
+      cancellationTime.getTime() < existing.startTime.getTime()
+        ? cancellationTime
+        : existing.startTime;
+    await this.entitlementService.evaluateForSession(id, entitlementPoint);
+    return this.prisma.session.update({
+      where: { id },
+      data: { status: SessionStatus.CANCELED, canceledAt: new Date() },
+      include: sessionInclude,
+    });
+  }
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/auth/auth.controller.ts — rate-limit override excerpt
+--------------------------------------------------------------------------------
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @Post('login')
+  @HttpCode(HttpStatus.OK)
+  login(@Body() dto: LoginDto): Promise<{ accessToken: string; user: SanitizedUser }> {
+    return this.authService.login(dto);
+  }
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/app.module.ts — throttler/scheduler registration excerpt
+--------------------------------------------------------------------------------
+    ThrottlerModule.forRoot([{ name: 'default', ttl: 60_000, limit: 100 }]),
+    ScheduleModule.forRoot(),
+    PrismaModule,
+    // ... existing feature modules unchanged ...
+  ],
+  providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
+})
+export class AppModule {}
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/main.ts (COMPLETE FILE — proxy trust, CORS, versioning,
+validation, shutdown hooks; only the `trust proxy` line is new this
+milestone)
+--------------------------------------------------------------------------------
+import 'reflect-metadata';
+
+import { Logger, ValidationPipe } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { NestFactory } from '@nestjs/core';
+import type { NestExpressApplication } from '@nestjs/platform-express';
+import helmet from 'helmet';
+
+import { AppModule } from './app.module.js';
+
+async function bootstrap(): Promise<void> {
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, { bufferLogs: true });
+  const config = app.get(ConfigService);
+  const logger = new Logger('Bootstrap');
+
+  app.set('trust proxy', 1);
+
+  app.use(helmet());
+
+  app.enableCors({
+    origin: config.getOrThrow<string[]>('corsOrigins'),
+    credentials: true,
+  });
+
+  app.setGlobalPrefix('api/v1', { exclude: ['health', 'health/ready'] });
+
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,
+      forbidNonWhitelisted: true,
+      transform: true,
+    }),
+  );
+
+  app.enableShutdownHooks();
+
+  const port = config.getOrThrow<number>('PORT');
+  await app.listen(port, '0.0.0.0');
+
+  logger.log(`API listening on http://0.0.0.0:${port}`);
+}
+
+void bootstrap();
+
+--------------------------------------------------------------------------------
+FILE: apps/api/src/health/health.service.ts — readiness/DB-check excerpt
+— CORRECTED per external review Correction 2 (probeDatabase's catch
+block no longer returns the driver's raw error text)
+--------------------------------------------------------------------------------
+const GENERIC_DATABASE_ERROR = 'Database unavailable';
+
+@Injectable()
+export class HealthService {
+  private readonly logger = new Logger(HealthService.name);
+
+  // ... constructor unchanged ...
+
+  async getReadiness(): Promise<HealthReport> {
+    const database = await this.probeDatabase();
+    const status: HealthStatus = database.status === 'ok' ? 'ok' : 'degraded';
+    return this.buildReport(status, [database]);
+  }
+
+  private async probeDatabase(): Promise<DependencyHealth> {
+    const startedAt = performance.now();
+    try {
+      await this.prisma.ping();
+      return {
+        name: 'postgresql',
+        status: 'ok',
+        latencyMs: Math.round(performance.now() - startedAt),
+      };
+    } catch (error) {
+      // The underlying pg/Prisma driver's error message can embed
+      // hostnames, usernames, or connection-string fragments — a public
+      // readiness endpoint must never return that. The real error is
+      // logged server-side (operators can read it there); the HTTP
+      // response gets only the fixed, non-sensitive
+      // GENERIC_DATABASE_ERROR string, regardless of what the driver
+      // actually said.
+      this.logger.error(
+        `Database readiness probe failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+
+      return {
+        name: 'postgresql',
+        status: 'down',
+        latencyMs: Math.round(performance.now() - startedAt),
+        error: GENERIC_DATABASE_ERROR,
+      };
+    }
+  }
+
+--------------------------------------------------------------------------------
+FILE: railway.json (COMPLETE FILE, repository root) — CORRECTED per
+external review Correction 1 (builder only; every other field unchanged)
+--------------------------------------------------------------------------------
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "RAILPACK",
+    "buildCommand": "pnpm install --frozen-lockfile && pnpm turbo run build --filter=@tubi/api..."
+  },
+  "deploy": {
+    "startCommand": "pnpm --filter @tubi/api run start:prod",
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 30,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 5
+  }
+}
+
+--------------------------------------------------------------------------------
+FILE: apps/web/src/config/api.ts (COMPLETE FILE — frontend connectivity
+foundation)
+--------------------------------------------------------------------------------
+export const API_BASE_URL: string = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
+
+================================================================================
+END OF PHASE 2G REVIEW HANDOFF
+================================================================================
