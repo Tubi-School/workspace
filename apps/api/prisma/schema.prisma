@@ -1,7 +1,10 @@
 // TUBI Workspace — database schema.
 //
-// M1 establishes the Prisma toolchain only; no domain models are defined yet.
-// Models arrive with the milestones that need them.
+// Phase 2A domain design frozen for external architecture review at
+// docs/phase-2a-final-domain-design.txt. Phase 2B implements that design at
+// the database level. Do not redesign, simplify, or reinterpret any model,
+// relation, enum, constraint or nullability below without reopening that
+// document through architecture review.
 
 generator client {
   provider = "prisma-client"
@@ -18,4 +21,374 @@ datasource db {
   provider = "postgresql"
   // Prisma 7 no longer accepts `url` here. The connection string is supplied
   // by `prisma.config.ts` for the CLI, and by a driver adapter at runtime.
+}
+
+// ---------------------------------------------------------------------------
+// Enums (docs/phase-2a-final-domain-design.txt, section D)
+// ---------------------------------------------------------------------------
+
+enum RoleName {
+  ADMIN
+  TEACHER
+  LEARNER
+}
+
+enum DeliveryMode {
+  LIVE_AND_RECORDED
+  RECORDED_ONLY
+}
+
+enum SessionStatus {
+  SCHEDULED
+  LIVE
+  ENDED
+  CANCELED
+}
+
+enum TeacherRole {
+  PRIMARY
+  ASSISTANT
+  SUBSTITUTE
+}
+
+enum CompletionMode {
+  LIVE
+  RECORDED
+}
+
+enum AttendanceStatus {
+  PENDING
+  PRESENT
+  ABSENT
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  EXPIRED
+}
+
+enum ExceptionReason {
+  RECORDING_PROCESSING_DELAY
+  PLATFORM_OUTAGE
+  LEARNER_CIRCUMSTANCE
+  OTHER
+}
+
+// ---------------------------------------------------------------------------
+// Identity (section B)
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  role         RoleName
+  fullName     String
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  learnerProfile LearnerProfile?
+  teacherProfile TeacherProfile?
+}
+
+model LearnerProfile {
+  id              String    @id @default(uuid())
+  userId          String    @unique
+  user            User      @relation(fields: [userId], references: [id])
+  dateOfBirth     DateTime?
+  guardianContact String?
+  createdAt       DateTime  @default(now())
+
+  attendanceRecords       AttendanceRecord[]
+  watchedIntervals        WatchedInterval[]
+  liveAttendanceIntervals LiveAttendanceInterval[]
+  subscriptionAccess      SubscriptionAccess[]
+  entitlementSnapshots    SessionEntitlementSnapshot[]
+  windowExceptions        AttendanceWindowException[]
+}
+
+model TeacherProfile {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id])
+  bio       String?
+  createdAt DateTime @default(now())
+
+  primaryCourses  Course[]         @relation("CoursePrimaryTeacher")
+  sessionTeaching SessionTeacher[]
+}
+
+// ---------------------------------------------------------------------------
+// Curriculum taxonomy (section B — GradeLevel/AcademicTerm are first-class
+// per founder rulings 1 and 2)
+// ---------------------------------------------------------------------------
+
+model GradeLevel {
+  id      String   @id @default(uuid())
+  name    String   @unique
+  courses Course[]
+}
+
+model Subject {
+  id      String   @id @default(uuid())
+  name    String   @unique
+  courses Course[]
+}
+
+model AcademicTerm {
+  id        String   @id @default(uuid())
+  name      String
+  startDate DateTime @db.Date
+  endDate   DateTime @db.Date
+  timezone  String   @default("Africa/Johannesburg")
+  courses   Course[]
+}
+
+model Course {
+  id               String         @id @default(uuid())
+  subjectId        String
+  subject          Subject        @relation(fields: [subjectId], references: [id])
+  gradeLevelId     String
+  gradeLevel       GradeLevel     @relation(fields: [gradeLevelId], references: [id])
+  academicTermId   String
+  academicTerm     AcademicTerm   @relation(fields: [academicTermId], references: [id])
+  primaryTeacherId String
+  primaryTeacher   TeacherProfile @relation("CoursePrimaryTeacher", fields: [primaryTeacherId], references: [id])
+  title            String
+
+  sessions  Session[]
+  offerings OfferingCourse[]
+}
+
+// ---------------------------------------------------------------------------
+// Commercial layer (section B — Offering is the sellable unit; subscriptions
+// are never per-lesson, per founder ruling 10)
+// ---------------------------------------------------------------------------
+
+model Offering {
+  id           String       @id @default(uuid())
+  name         String
+  deliveryMode DeliveryMode
+  monthlyPrice Decimal
+
+  courses       OfferingCourse[]
+  subscriptions SubscriptionAccess[]
+}
+
+model OfferingCourse {
+  offeringId String
+  courseId   String
+  offering   Offering @relation(fields: [offeringId], references: [id])
+  course     Course   @relation(fields: [courseId], references: [id])
+
+  @@id([offeringId, courseId])
+}
+
+// ---------------------------------------------------------------------------
+// Session — the atomic teaching event (sections B, F, J)
+// ---------------------------------------------------------------------------
+
+model Session {
+  id                 String        @id @default(uuid())
+  courseId           String
+  course             Course        @relation(fields: [courseId], references: [id])
+  sessionDate        DateTime      @db.Date
+  startTime          DateTime
+  endTime            DateTime
+  attendanceCutoffAt DateTime
+  liveMeetingUrl     String
+  status             SessionStatus @default(SCHEDULED)
+  // Set the moment a session enters CANCELED, regardless of how far from its
+  // scheduled start that occurs. Together with startTime this defines the
+  // session's entitlement point as MIN(startTime, canceledAt) — founder
+  // ruling / correction 2, section I.
+  canceledAt         DateTime?
+
+  // A canceled session has at most one replacement (founder ruling 4,
+  // section J). The replacement chain is unbounded via repeated
+  // cancel-and-replace, but each individual session has exactly one
+  // predecessor and at most one successor.
+  replacementForSessionId String?  @unique
+  replacementForSession   Session? @relation("SessionReplacement", fields: [replacementForSessionId], references: [id])
+  replacementSession      Session? @relation("SessionReplacement")
+
+  teachers                SessionTeacher[]
+  recording               SessionRecording?
+  attendanceRecords       AttendanceRecord[]
+  windowExceptions        AttendanceWindowException[]
+  entitlementSnapshots    SessionEntitlementSnapshot[]
+  liveAttendanceIntervals LiveAttendanceInterval[]
+
+  @@index([courseId, sessionDate])
+}
+
+model SessionTeacher {
+  sessionId   String
+  teacherId   String
+  teacherRole TeacherRole
+  session     Session        @relation(fields: [sessionId], references: [id])
+  teacher     TeacherProfile @relation(fields: [teacherId], references: [id])
+
+  // Exactly-one-PRIMARY-per-session is an application-layer invariant only
+  // (founder ruling 15) — no partial unique index is introduced here.
+  @@id([sessionId, teacherId])
+}
+
+// ---------------------------------------------------------------------------
+// Recorded pathway (sections B, H1 — genuine 100% timeline coverage)
+// ---------------------------------------------------------------------------
+
+model SessionRecording {
+  id            String   @id @default(uuid())
+  sessionId     String   @unique
+  session       Session  @relation(fields: [sessionId], references: [id])
+  recordingUrl  String
+  availableFrom DateTime
+  totalSeconds  Int
+
+  watchedIntervals WatchedInterval[]
+}
+
+model WatchedInterval {
+  id                 String           @id @default(uuid())
+  sessionRecordingId String
+  recording          SessionRecording @relation(fields: [sessionRecordingId], references: [id])
+  learnerId          String
+  learner            LearnerProfile   @relation(fields: [learnerId], references: [id])
+  startSecond        Int
+  endSecond          Int
+
+  // Rows are merged/coalesced on write by the service layer; coverage is
+  // sum(endSecond - startSecond) across rows, compared against
+  // SessionRecording.totalSeconds. Never a row per second.
+  @@index([sessionRecordingId, learnerId])
+}
+
+// ---------------------------------------------------------------------------
+// Live pathway (sections B, H2 — cumulative 50%-of-scheduled-duration
+// coverage, founder ruling / correction 4)
+// ---------------------------------------------------------------------------
+
+model LiveAttendanceInterval {
+  id        String         @id @default(uuid())
+  sessionId String
+  session   Session        @relation(fields: [sessionId], references: [id])
+  learnerId String
+  learner   LearnerProfile @relation(fields: [learnerId], references: [id])
+  joinedAt  DateTime
+  // Null while the connection is currently open.
+  leftAt    DateTime?
+
+  // Rows are merged/coalesced on write by the service layer; coverage is the
+  // sum of clipped, merged durations within [session.startTime,
+  // session.endTime], compared against 50% of scheduled duration. Never a
+  // single "joined" boolean and never a row per heartbeat.
+  @@index([sessionId, learnerId])
+}
+
+// ---------------------------------------------------------------------------
+// Attendance (sections B, G — nullable completionMode/completedAt per
+// founder ruling / correction 1)
+// ---------------------------------------------------------------------------
+
+model AttendanceRecord {
+  id        String         @id @default(uuid())
+  sessionId String
+  session   Session        @relation(fields: [sessionId], references: [id])
+  learnerId String
+  learner   LearnerProfile @relation(fields: [learnerId], references: [id])
+
+  // Nullable: populated together only when status transitions to PRESENT.
+  // Both remain null for PENDING and ABSENT — no invented completion mode
+  // or timestamp is ever assigned to a learner who did not complete the
+  // session (founder ruling / correction 1).
+  completionMode CompletionMode?
+  completedAt    DateTime?
+  status         AttendanceStatus @default(PENDING)
+  createdAt      DateTime         @default(now())
+
+  overrides AttendanceOverride[]
+
+  @@unique([sessionId, learnerId])
+  @@index([status])
+}
+
+model AttendanceOverride {
+  id                 String           @id @default(uuid())
+  attendanceRecordId String
+  attendanceRecord   AttendanceRecord @relation(fields: [attendanceRecordId], references: [id])
+  previousStatus     AttendanceStatus
+  newStatus          AttendanceStatus
+  performedByUserId  String
+  reason             String
+  createdAt          DateTime         @default(now())
+}
+
+model AttendanceWindowException {
+  id        String          @id @default(uuid())
+  sessionId String
+  session   Session         @relation(fields: [sessionId], references: [id])
+  // Null = session-wide exception; set = learner-specific exception. A
+  // learner-specific exception takes precedence over a session-wide one for
+  // that learner when both exist (founder ruling / correction 4/18).
+  learnerId String?
+  learner   LearnerProfile? @relation(fields: [learnerId], references: [id])
+
+  reason           ExceptionReason
+  extendedCutoffAt DateTime
+  grantedByUserId  String
+  note             String?
+  createdAt        DateTime        @default(now())
+
+  @@index([sessionId, learnerId])
+}
+
+// ---------------------------------------------------------------------------
+// Entitlement (sections B, I, J — entitlement point is
+// MIN(session.startTime, session.canceledAt); inheritance chains are
+// unbounded and non-unique per founder rulings / corrections 2 and 3)
+// ---------------------------------------------------------------------------
+
+model SessionEntitlementSnapshot {
+  id        String         @id @default(uuid())
+  sessionId String
+  session   Session        @relation(fields: [sessionId], references: [id])
+  learnerId String
+  learner   LearnerProfile @relation(fields: [learnerId], references: [id])
+
+  subscriptionAccessId String?
+  subscriptionAccess   SubscriptionAccess? @relation(fields: [subscriptionAccessId], references: [id])
+  wasEntitled          Boolean
+  // Equal to the session's entitlement point:
+  // MIN(session.startTime, session.canceledAt).
+  snapshotAt           DateTime            @default(now())
+
+  // Ordinary indexed self-reference — deliberately NOT unique, so that
+  // replacement chains of arbitrary length (Original -> Replacement A ->
+  // Replacement B -> ...) remain fully traceable (founder ruling /
+  // correction 3).
+  inheritedFromSnapshotId String?
+  inheritedFromSnapshot   SessionEntitlementSnapshot?  @relation("EntitlementInheritance", fields: [inheritedFromSnapshotId], references: [id])
+  inheritedBySnapshots    SessionEntitlementSnapshot[] @relation("EntitlementInheritance")
+
+  @@unique([sessionId, learnerId])
+  @@index([inheritedFromSnapshotId])
+}
+
+model SubscriptionAccess {
+  id                 String             @id @default(uuid())
+  learnerId          String
+  learner            LearnerProfile     @relation(fields: [learnerId], references: [id])
+  offeringId         String
+  offering           Offering           @relation(fields: [offeringId], references: [id])
+  status             SubscriptionStatus
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+
+  entitlementSnapshots SessionEntitlementSnapshot[]
+
+  @@index([learnerId, offeringId])
 }

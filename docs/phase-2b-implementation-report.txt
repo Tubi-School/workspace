@@ -1,0 +1,329 @@
+TUBI WORKSPACE — PHASE 2B IMPLEMENTATION REPORT
+Domain Database Implementation
+Status: IMPLEMENTATION COMPLETE. Not committed, tagged, or pushed. Local for
+external architecture review.
+
+Authoritative source design: docs/phase-2a-final-domain-design.txt
+(frozen, PHASE 2A FINAL DESIGN CORRECTED AND READY FOR FREEZE)
+
+================================================================================
+A. FILES MODIFIED / CREATED
+================================================================================
+
+Modified:
+- apps/api/prisma/schema.prisma
+    Appended all Phase 2A enums and models to the existing generator/
+    datasource blocks. The generator and datasource blocks themselves were
+    left unchanged from Milestone M1 (see docs/architecture.md section 7 for
+    the Prisma 7 driver-adapter/CJS rationale already in place before this
+    milestone).
+
+Created:
+- apps/api/prisma/migrations/20260827094421_phase_2a_core_domain/migration.sql
+- apps/api/prisma/migrations/migration_lock.toml
+- docs/phase-2b-implementation-report.txt (this file)
+
+Generated (git-ignored, not part of git status):
+- apps/api/src/generated/prisma/**
+    Regenerated Prisma Client output. Git-ignored per existing repository
+    convention (docs/development.md: "must never be edited or committed").
+
+No other repository files were modified. No controllers, services, guards,
+authentication code, or frontend code were touched.
+
+Deliberately left untouched:
+- apps/web/next-env.d.ts
+    A pre-existing, unrelated modification to this Next.js auto-generated
+    type-reference file was present before Phase 2B began (noted during the
+    original repository audit and the Phase 2A git checkpoint). It was not
+    staged, committed, or otherwise acted upon during Phase 2B. By the time
+    of final verification in this milestone, running the workspace's own
+    typecheck/typegen steps had already caused Next.js to rewrite this file
+    back to a state matching HEAD, so it no longer appears in git status
+    (see section H) — this was an incidental side effect of running the
+    project's own scripts, not a deliberate edit made for this report.
+
+================================================================================
+B. PRISMA MODELS AND ENUMS IMPLEMENTED
+================================================================================
+
+Enums (8), matching docs/phase-2a-final-domain-design.txt section D exactly:
+- RoleName            (ADMIN, TEACHER, LEARNER)
+- DeliveryMode         (LIVE_AND_RECORDED, RECORDED_ONLY)
+- SessionStatus        (SCHEDULED, LIVE, ENDED, CANCELED)
+- TeacherRole          (PRIMARY, ASSISTANT, SUBSTITUTE)
+- CompletionMode       (LIVE, RECORDED)
+- AttendanceStatus     (PENDING, PRESENT, ABSENT)
+- SubscriptionStatus   (ACTIVE, PAST_DUE, CANCELED, EXPIRED)
+- ExceptionReason      (RECORDING_PROCESSING_DELAY, PLATFORM_OUTAGE,
+                        LEARNER_CIRCUMSTANCE, OTHER)
+
+Models (19), matching docs/phase-2a-final-domain-design.txt section M:
+- User
+- LearnerProfile
+- TeacherProfile
+- GradeLevel
+- Subject
+- AcademicTerm
+- Course
+- Offering
+- OfferingCourse
+- Session
+- SessionTeacher
+- SessionRecording
+- WatchedInterval
+- LiveAttendanceInterval
+- AttendanceRecord
+- AttendanceOverride
+- AttendanceWindowException
+- SessionEntitlementSnapshot
+- SubscriptionAccess
+
+All fields, nullability, unique constraints, indexes, and self-relations
+(Session.replacementForSessionId; SessionEntitlementSnapshot.
+inheritedFromSnapshotId) were implemented exactly as specified in the frozen
+design, with one mechanical addition documented in section D below.
+
+================================================================================
+C. MIGRATION NAME AND DETAILS
+================================================================================
+
+Migration name: phase_2a_core_domain
+Migration directory: apps/api/prisma/migrations/20260827094421_phase_2a_core_domain/
+Migration file: migration.sql (370 lines)
+
+Created via:
+  prisma migrate dev --name phase_2a_core_domain --create-only
+(created and reviewed before being applied, rather than auto-applied blind)
+
+Applied via:
+  prisma migrate deploy
+against the database configured in apps/api/.env at the time of this
+milestone (Neon PostgreSQL, database "neondb").
+
+Migration contents, summarized:
+- 8 CREATE TYPE statements (all enums in section B)
+- 19 CREATE TABLE statements (all models in section B)
+- Unique indexes: User.email, LearnerProfile.userId, TeacherProfile.userId,
+  GradeLevel.name, Subject.name, Session.replacementForSessionId,
+  SessionRecording.sessionId, AttendanceRecord(sessionId, learnerId),
+  SessionEntitlementSnapshot(sessionId, learnerId)
+- Non-unique indexes: Session(courseId, sessionDate),
+  WatchedInterval(sessionRecordingId, learnerId),
+  LiveAttendanceInterval(sessionId, learnerId), AttendanceRecord(status),
+  AttendanceWindowException(sessionId, learnerId),
+  SessionEntitlementSnapshot(inheritedFromSnapshotId) — explicitly NOT
+  unique, per founder correction 3
+  SubscriptionAccess(learnerId, offeringId)
+- Foreign keys for every relation described in section C of the design
+  document, including the two self-relations:
+    Session.replacementForSessionId -> Session.id (ON DELETE SET NULL)
+    SessionEntitlementSnapshot.inheritedFromSnapshotId ->
+      SessionEntitlementSnapshot.id (ON DELETE SET NULL)
+
+`prisma migrate status` after deployment reported:
+  "Database schema is up to date!"
+
+No seed data was created. No production-style business data was inserted.
+
+================================================================================
+D. MECHANICAL DEVIATIONS FROM docs/phase-2a-final-domain-design.txt
+================================================================================
+
+Exactly one deviation was required, and it is semantically inert:
+
+1. Added an explicit relation field on SessionEntitlementSnapshot:
+
+     subscriptionAccess SubscriptionAccess? @relation(fields: [subscriptionAccessId], references: [id])
+
+   The design document's plain-text schema (section M) declared
+   `subscriptionAccessId String?` on SessionEntitlementSnapshot and a
+   corresponding `entitlementSnapshots SessionEntitlementSnapshot[]`
+   back-relation on SubscriptionAccess, but never declared the `@relation`
+   object connecting the two sides. Prisma requires an explicit relation
+   field naming the foreign key before it will treat it as a navigable
+   relation rather than a bare scalar column.
+
+   This addition:
+   - Introduces no new column, table, or constraint beyond what the design
+     already specified (subscriptionAccessId was already a nullable
+     foreign-key-shaped field in the design).
+   - Does not change nullability, cardinality, or the ON DELETE behavior
+     implied by the design (defaults to SET NULL for a nullable FK, matching
+     the fact that a SessionEntitlementSnapshot's validity does not depend
+     on the SubscriptionAccess row continuing to exist).
+   - Does not alter any founder ruling, product rule, or attendance/
+     entitlement semantics.
+
+No other mechanical adaptations were necessary. Every nullable field, unique
+constraint, non-unique index, and self-relation cardinality specified in the
+frozen design transferred into valid Prisma schema syntax without further
+adjustment.
+
+No change was identified that would have altered product semantics. Nothing
+was escalated as a blocker.
+
+================================================================================
+E. COMMANDS EXECUTED
+================================================================================
+
+From apps/api:
+  pnpm exec prisma format
+  pnpm exec prisma validate
+  pnpm exec prisma generate
+  pnpm exec prisma migrate dev --name phase_2a_core_domain --create-only
+  pnpm exec prisma migrate deploy
+  pnpm exec prisma migrate status
+  pnpm run typecheck
+  pnpm exec eslint .
+  pnpm run build
+
+From packages/types, packages/utils, packages/ui, apps/web (each run directly
+in its own directory, see section G for why):
+  pnpm run typecheck
+
+From repository root:
+  pnpm run lint        (failed to spawn via Turbo — see section G)
+  git status
+  git diff --stat
+
+================================================================================
+F. RESULTS
+================================================================================
+
+Prisma format:
+  Succeeded. "Formatted prisma\schema.prisma in 92ms" — whitespace
+  normalization only, no semantic changes.
+
+Prisma validate:
+  Succeeded. "The schema at prisma\schema.prisma is valid" (also surfaced an
+  informational notice that Prisma 8.0.0-rc.12 is available; not acted on —
+  see section G).
+
+Prisma generate:
+  Succeeded. "Generated Prisma Client (7.9.1) to .\src\generated\prisma in
+  1.25s".
+
+Migration create (--create-only):
+  Succeeded. Connected to the configured Neon datasource, produced
+  20260827094421_phase_2a_core_domain/migration.sql without applying it.
+
+Migration deploy:
+  Succeeded. "1 migration found in prisma/migrations" /
+  "All migrations have been successfully applied."
+
+Migration status:
+  "Database schema is up to date!"
+
+Typecheck:
+  @tubi/api: succeeded, no errors (tsc --noEmit, no output).
+  @tubi/types: succeeded, no errors.
+  @tubi/utils: succeeded, no errors.
+  @tubi/ui: succeeded, no errors.
+  @tubi/web: succeeded — "Generating route types... Types generated
+  successfully", then tsc --noEmit with no errors.
+
+Lint:
+  Root `pnpm run lint` (which runs `turbo run lint && eslint .`) failed
+  before reaching any lint rule — see section G for the exact error. As a
+  substitute verification, `pnpm exec eslint .` was run directly inside
+  apps/api and completed with no output (i.e. no lint violations) against
+  the modified schema and generated client.
+
+Build:
+  Root-level `pnpm run build` was not exercised through Turbo for the same
+  spawn-failure reason (section G). `pnpm run build` (`nest build`) was run
+  directly inside apps/api and completed successfully with no errors.
+
+================================================================================
+G. WARNINGS OR UNRESOLVED ISSUES
+================================================================================
+
+1. Turbo cannot spawn its binary in this environment.
+   Running `pnpm run lint` from the repository root (which invokes
+   `turbo run lint && eslint .`) fails immediately with:
+
+     Error: spawn UNKNOWN
+       at ChildProcess.spawn (node:internal/child_process:421:11)
+       ...
+       errno: -4094, code: 'UNKNOWN', syscall: 'spawn'
+
+   This was reproduced identically in both Git Bash and PowerShell, and
+   fails before Turbo dispatches to any package — it is a pre-existing
+   local toolchain/environment issue, not something introduced by the
+   Phase 2B schema or migration changes. It was NOT fixed as part of this
+   milestone, per instruction to fix only issues directly caused by this
+   implementation. Lint and build were instead verified by running the
+   affected package's own scripts directly (`pnpm exec eslint .`,
+   `pnpm run build` from within apps/api), which both succeeded. This
+   should be investigated separately, since it currently blocks the
+   repository's own root-level `pnpm lint` and (presumably) `pnpm build`/
+   `pnpm typecheck` orchestration in this environment. CI runs on
+   ubuntu-latest and may not reproduce this Windows-specific spawn failure,
+   but that has not been independently confirmed in this session.
+
+2. Prisma CLI update notice.
+   `prisma validate` and other commands surfaced:
+     "Update available 7.9.1 -> 8.0.0-rc.12 ... This is a major update"
+   This is informational only. Per docs/architecture.md and
+   docs/development.md, dependency versions in this repository are pinned
+   deliberately, and no action was taken in response to this notice.
+
+3. Scope boundary note (not a defect).
+   SessionTeacher's exactly-one-PRIMARY invariant, WatchedInterval /
+   LiveAttendanceInterval merge-on-write logic, coverage calculations, and
+   SessionEntitlementSnapshot inheritance-copy logic are, per the frozen
+   design and this milestone's explicit instructions, schema-only in
+   Phase 2B. No service-layer code enforcing or computing any of these was
+   written, and none was expected to be.
+
+================================================================================
+H. EXACT FINAL GIT STATUS
+================================================================================
+
+$ git status
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   apps/api/prisma/schema.prisma
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	apps/api/prisma/migrations/
+
+no changes added to commit (use "git add" and/or "git commit -a")
+
+$ git diff --stat
+ apps/api/prisma/schema.prisma | 377 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 375 insertions(+), 2 deletions(-)
+
+No commits, tags, or pushes were made during Phase 2B. All changes remain
+local, uncommitted, and available for external review. (This report file,
+docs/phase-2b-implementation-report.txt, is untracked at the time of writing
+and will appear as an additional untracked file in any git status taken
+after this report is saved.)
+
+================================================================================
+FINAL ASSESSMENT
+================================================================================
+
+Phase 2B, as implemented, MATCHES the frozen Phase 2A design
+(docs/phase-2a-final-domain-design.txt) at the database level.
+
+Every entity, enum, field, nullability rule, unique constraint, non-unique
+index, and self-relation specified in that document's sections A through M
+is present in apps/api/prisma/schema.prisma and reflected identically in the
+applied migration. The single mechanical deviation (section D) adds a
+missing Prisma relation object implied by, but not spelled out in, the
+design's own foreign-key field — it introduces no new schema surface,
+changes no constraint, and alters no product semantics. No product-semantic
+change was required, so no blocker was raised for architecture review.
+
+The one outstanding issue (Turbo's spawn failure, section G.1) is an
+environment/toolchain matter unrelated to the correctness of the Phase 2A
+implementation itself; it was worked around for verification purposes and
+is flagged for separate investigation rather than treated as a Phase 2B
+defect.

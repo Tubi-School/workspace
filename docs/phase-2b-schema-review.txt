@@ -1,0 +1,777 @@
+TUBI WORKSPACE — PHASE 2B SCHEMA REVIEW EXPORT
+Solely for external architecture review. Neither source file was modified to
+produce this export. No commits, tags, or pushes were made.
+
+================================================================================
+FILE 1 OF 2: apps/api/prisma/schema.prisma
+================================================================================
+
+// TUBI Workspace — database schema.
+//
+// Phase 2A domain design frozen for external architecture review at
+// docs/phase-2a-final-domain-design.txt. Phase 2B implements that design at
+// the database level. Do not redesign, simplify, or reinterpret any model,
+// relation, enum, constraint or nullability below without reopening that
+// document through architecture review.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+
+  // The API is a CommonJS NestJS process. Without these, Prisma 7 emits an
+  // ESM-only client that uses `import.meta.url` and cannot be required.
+  moduleFormat           = "cjs"
+  generatedFileExtension = "ts"
+  importFileExtension    = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // Prisma 7 no longer accepts `url` here. The connection string is supplied
+  // by `prisma.config.ts` for the CLI, and by a driver adapter at runtime.
+}
+
+// ---------------------------------------------------------------------------
+// Enums (docs/phase-2a-final-domain-design.txt, section D)
+// ---------------------------------------------------------------------------
+
+enum RoleName {
+  ADMIN
+  TEACHER
+  LEARNER
+}
+
+enum DeliveryMode {
+  LIVE_AND_RECORDED
+  RECORDED_ONLY
+}
+
+enum SessionStatus {
+  SCHEDULED
+  LIVE
+  ENDED
+  CANCELED
+}
+
+enum TeacherRole {
+  PRIMARY
+  ASSISTANT
+  SUBSTITUTE
+}
+
+enum CompletionMode {
+  LIVE
+  RECORDED
+}
+
+enum AttendanceStatus {
+  PENDING
+  PRESENT
+  ABSENT
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  EXPIRED
+}
+
+enum ExceptionReason {
+  RECORDING_PROCESSING_DELAY
+  PLATFORM_OUTAGE
+  LEARNER_CIRCUMSTANCE
+  OTHER
+}
+
+// ---------------------------------------------------------------------------
+// Identity (section B)
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  role         RoleName
+  fullName     String
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  learnerProfile LearnerProfile?
+  teacherProfile TeacherProfile?
+}
+
+model LearnerProfile {
+  id              String    @id @default(uuid())
+  userId          String    @unique
+  user            User      @relation(fields: [userId], references: [id])
+  dateOfBirth     DateTime?
+  guardianContact String?
+  createdAt       DateTime  @default(now())
+
+  attendanceRecords       AttendanceRecord[]
+  watchedIntervals        WatchedInterval[]
+  liveAttendanceIntervals LiveAttendanceInterval[]
+  subscriptionAccess      SubscriptionAccess[]
+  entitlementSnapshots    SessionEntitlementSnapshot[]
+  windowExceptions        AttendanceWindowException[]
+}
+
+model TeacherProfile {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id])
+  bio       String?
+  createdAt DateTime @default(now())
+
+  primaryCourses  Course[]         @relation("CoursePrimaryTeacher")
+  sessionTeaching SessionTeacher[]
+}
+
+// ---------------------------------------------------------------------------
+// Curriculum taxonomy (section B — GradeLevel/AcademicTerm are first-class
+// per founder rulings 1 and 2)
+// ---------------------------------------------------------------------------
+
+model GradeLevel {
+  id      String   @id @default(uuid())
+  name    String   @unique
+  courses Course[]
+}
+
+model Subject {
+  id      String   @id @default(uuid())
+  name    String   @unique
+  courses Course[]
+}
+
+model AcademicTerm {
+  id        String   @id @default(uuid())
+  name      String
+  startDate DateTime @db.Date
+  endDate   DateTime @db.Date
+  timezone  String   @default("Africa/Johannesburg")
+  courses   Course[]
+}
+
+model Course {
+  id               String         @id @default(uuid())
+  subjectId        String
+  subject          Subject        @relation(fields: [subjectId], references: [id])
+  gradeLevelId     String
+  gradeLevel       GradeLevel     @relation(fields: [gradeLevelId], references: [id])
+  academicTermId   String
+  academicTerm     AcademicTerm   @relation(fields: [academicTermId], references: [id])
+  primaryTeacherId String
+  primaryTeacher   TeacherProfile @relation("CoursePrimaryTeacher", fields: [primaryTeacherId], references: [id])
+  title            String
+
+  sessions  Session[]
+  offerings OfferingCourse[]
+}
+
+// ---------------------------------------------------------------------------
+// Commercial layer (section B — Offering is the sellable unit; subscriptions
+// are never per-lesson, per founder ruling 10)
+// ---------------------------------------------------------------------------
+
+model Offering {
+  id           String       @id @default(uuid())
+  name         String
+  deliveryMode DeliveryMode
+  monthlyPrice Decimal
+
+  courses       OfferingCourse[]
+  subscriptions SubscriptionAccess[]
+}
+
+model OfferingCourse {
+  offeringId String
+  courseId   String
+  offering   Offering @relation(fields: [offeringId], references: [id])
+  course     Course   @relation(fields: [courseId], references: [id])
+
+  @@id([offeringId, courseId])
+}
+
+// ---------------------------------------------------------------------------
+// Session — the atomic teaching event (sections B, F, J)
+// ---------------------------------------------------------------------------
+
+model Session {
+  id                 String        @id @default(uuid())
+  courseId           String
+  course             Course        @relation(fields: [courseId], references: [id])
+  sessionDate        DateTime      @db.Date
+  startTime          DateTime
+  endTime            DateTime
+  attendanceCutoffAt DateTime
+  liveMeetingUrl     String
+  status             SessionStatus @default(SCHEDULED)
+  // Set the moment a session enters CANCELED, regardless of how far from its
+  // scheduled start that occurs. Together with startTime this defines the
+  // session's entitlement point as MIN(startTime, canceledAt) — founder
+  // ruling / correction 2, section I.
+  canceledAt         DateTime?
+
+  // A canceled session has at most one replacement (founder ruling 4,
+  // section J). The replacement chain is unbounded via repeated
+  // cancel-and-replace, but each individual session has exactly one
+  // predecessor and at most one successor.
+  replacementForSessionId String?  @unique
+  replacementForSession   Session? @relation("SessionReplacement", fields: [replacementForSessionId], references: [id])
+  replacementSession      Session? @relation("SessionReplacement")
+
+  teachers                SessionTeacher[]
+  recording               SessionRecording?
+  attendanceRecords       AttendanceRecord[]
+  windowExceptions        AttendanceWindowException[]
+  entitlementSnapshots    SessionEntitlementSnapshot[]
+  liveAttendanceIntervals LiveAttendanceInterval[]
+
+  @@index([courseId, sessionDate])
+}
+
+model SessionTeacher {
+  sessionId   String
+  teacherId   String
+  teacherRole TeacherRole
+  session     Session        @relation(fields: [sessionId], references: [id])
+  teacher     TeacherProfile @relation(fields: [teacherId], references: [id])
+
+  // Exactly-one-PRIMARY-per-session is an application-layer invariant only
+  // (founder ruling 15) — no partial unique index is introduced here.
+  @@id([sessionId, teacherId])
+}
+
+// ---------------------------------------------------------------------------
+// Recorded pathway (sections B, H1 — genuine 100% timeline coverage)
+// ---------------------------------------------------------------------------
+
+model SessionRecording {
+  id            String   @id @default(uuid())
+  sessionId     String   @unique
+  session       Session  @relation(fields: [sessionId], references: [id])
+  recordingUrl  String
+  availableFrom DateTime
+  totalSeconds  Int
+
+  watchedIntervals WatchedInterval[]
+}
+
+model WatchedInterval {
+  id                 String           @id @default(uuid())
+  sessionRecordingId String
+  recording          SessionRecording @relation(fields: [sessionRecordingId], references: [id])
+  learnerId          String
+  learner            LearnerProfile   @relation(fields: [learnerId], references: [id])
+  startSecond        Int
+  endSecond          Int
+
+  // Rows are merged/coalesced on write by the service layer; coverage is
+  // sum(endSecond - startSecond) across rows, compared against
+  // SessionRecording.totalSeconds. Never a row per second.
+  @@index([sessionRecordingId, learnerId])
+}
+
+// ---------------------------------------------------------------------------
+// Live pathway (sections B, H2 — cumulative 50%-of-scheduled-duration
+// coverage, founder ruling / correction 4)
+// ---------------------------------------------------------------------------
+
+model LiveAttendanceInterval {
+  id        String         @id @default(uuid())
+  sessionId String
+  session   Session        @relation(fields: [sessionId], references: [id])
+  learnerId String
+  learner   LearnerProfile @relation(fields: [learnerId], references: [id])
+  joinedAt  DateTime
+  // Null while the connection is currently open.
+  leftAt    DateTime?
+
+  // Rows are merged/coalesced on write by the service layer; coverage is the
+  // sum of clipped, merged durations within [session.startTime,
+  // session.endTime], compared against 50% of scheduled duration. Never a
+  // single "joined" boolean and never a row per heartbeat.
+  @@index([sessionId, learnerId])
+}
+
+// ---------------------------------------------------------------------------
+// Attendance (sections B, G — nullable completionMode/completedAt per
+// founder ruling / correction 1)
+// ---------------------------------------------------------------------------
+
+model AttendanceRecord {
+  id        String         @id @default(uuid())
+  sessionId String
+  session   Session        @relation(fields: [sessionId], references: [id])
+  learnerId String
+  learner   LearnerProfile @relation(fields: [learnerId], references: [id])
+
+  // Nullable: populated together only when status transitions to PRESENT.
+  // Both remain null for PENDING and ABSENT — no invented completion mode
+  // or timestamp is ever assigned to a learner who did not complete the
+  // session (founder ruling / correction 1).
+  completionMode CompletionMode?
+  completedAt    DateTime?
+  status         AttendanceStatus @default(PENDING)
+  createdAt      DateTime         @default(now())
+
+  overrides AttendanceOverride[]
+
+  @@unique([sessionId, learnerId])
+  @@index([status])
+}
+
+model AttendanceOverride {
+  id                 String           @id @default(uuid())
+  attendanceRecordId String
+  attendanceRecord   AttendanceRecord @relation(fields: [attendanceRecordId], references: [id])
+  previousStatus     AttendanceStatus
+  newStatus          AttendanceStatus
+  performedByUserId  String
+  reason             String
+  createdAt          DateTime         @default(now())
+}
+
+model AttendanceWindowException {
+  id        String          @id @default(uuid())
+  sessionId String
+  session   Session         @relation(fields: [sessionId], references: [id])
+  // Null = session-wide exception; set = learner-specific exception. A
+  // learner-specific exception takes precedence over a session-wide one for
+  // that learner when both exist (founder ruling / correction 4/18).
+  learnerId String?
+  learner   LearnerProfile? @relation(fields: [learnerId], references: [id])
+
+  reason           ExceptionReason
+  extendedCutoffAt DateTime
+  grantedByUserId  String
+  note             String?
+  createdAt        DateTime        @default(now())
+
+  @@index([sessionId, learnerId])
+}
+
+// ---------------------------------------------------------------------------
+// Entitlement (sections B, I, J — entitlement point is
+// MIN(session.startTime, session.canceledAt); inheritance chains are
+// unbounded and non-unique per founder rulings / corrections 2 and 3)
+// ---------------------------------------------------------------------------
+
+model SessionEntitlementSnapshot {
+  id        String         @id @default(uuid())
+  sessionId String
+  session   Session        @relation(fields: [sessionId], references: [id])
+  learnerId String
+  learner   LearnerProfile @relation(fields: [learnerId], references: [id])
+
+  subscriptionAccessId String?
+  subscriptionAccess   SubscriptionAccess? @relation(fields: [subscriptionAccessId], references: [id])
+  wasEntitled          Boolean
+  // Equal to the session's entitlement point:
+  // MIN(session.startTime, session.canceledAt).
+  snapshotAt           DateTime            @default(now())
+
+  // Ordinary indexed self-reference — deliberately NOT unique, so that
+  // replacement chains of arbitrary length (Original -> Replacement A ->
+  // Replacement B -> ...) remain fully traceable (founder ruling /
+  // correction 3).
+  inheritedFromSnapshotId String?
+  inheritedFromSnapshot   SessionEntitlementSnapshot?  @relation("EntitlementInheritance", fields: [inheritedFromSnapshotId], references: [id])
+  inheritedBySnapshots    SessionEntitlementSnapshot[] @relation("EntitlementInheritance")
+
+  @@unique([sessionId, learnerId])
+  @@index([inheritedFromSnapshotId])
+}
+
+model SubscriptionAccess {
+  id                 String             @id @default(uuid())
+  learnerId          String
+  learner            LearnerProfile     @relation(fields: [learnerId], references: [id])
+  offeringId         String
+  offering           Offering           @relation(fields: [offeringId], references: [id])
+  status             SubscriptionStatus
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+
+  entitlementSnapshots SessionEntitlementSnapshot[]
+
+  @@index([learnerId, offeringId])
+}
+
+================================================================================
+FILE 2 OF 2: apps/api/prisma/migrations/20260827094421_phase_2a_core_domain/migration.sql
+================================================================================
+
+-- CreateEnum
+CREATE TYPE "RoleName" AS ENUM ('ADMIN', 'TEACHER', 'LEARNER');
+
+-- CreateEnum
+CREATE TYPE "DeliveryMode" AS ENUM ('LIVE_AND_RECORDED', 'RECORDED_ONLY');
+
+-- CreateEnum
+CREATE TYPE "SessionStatus" AS ENUM ('SCHEDULED', 'LIVE', 'ENDED', 'CANCELED');
+
+-- CreateEnum
+CREATE TYPE "TeacherRole" AS ENUM ('PRIMARY', 'ASSISTANT', 'SUBSTITUTE');
+
+-- CreateEnum
+CREATE TYPE "CompletionMode" AS ENUM ('LIVE', 'RECORDED');
+
+-- CreateEnum
+CREATE TYPE "AttendanceStatus" AS ENUM ('PENDING', 'PRESENT', 'ABSENT');
+
+-- CreateEnum
+CREATE TYPE "SubscriptionStatus" AS ENUM ('ACTIVE', 'PAST_DUE', 'CANCELED', 'EXPIRED');
+
+-- CreateEnum
+CREATE TYPE "ExceptionReason" AS ENUM ('RECORDING_PROCESSING_DELAY', 'PLATFORM_OUTAGE', 'LEARNER_CIRCUMSTANCE', 'OTHER');
+
+-- CreateTable
+CREATE TABLE "User" (
+    "id" TEXT NOT NULL,
+    "email" TEXT NOT NULL,
+    "passwordHash" TEXT NOT NULL,
+    "role" "RoleName" NOT NULL,
+    "fullName" TEXT NOT NULL,
+    "isActive" BOOLEAN NOT NULL DEFAULT true,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "User_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "LearnerProfile" (
+    "id" TEXT NOT NULL,
+    "userId" TEXT NOT NULL,
+    "dateOfBirth" TIMESTAMP(3),
+    "guardianContact" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "LearnerProfile_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "TeacherProfile" (
+    "id" TEXT NOT NULL,
+    "userId" TEXT NOT NULL,
+    "bio" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "TeacherProfile_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "GradeLevel" (
+    "id" TEXT NOT NULL,
+    "name" TEXT NOT NULL,
+
+    CONSTRAINT "GradeLevel_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "Subject" (
+    "id" TEXT NOT NULL,
+    "name" TEXT NOT NULL,
+
+    CONSTRAINT "Subject_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "AcademicTerm" (
+    "id" TEXT NOT NULL,
+    "name" TEXT NOT NULL,
+    "startDate" DATE NOT NULL,
+    "endDate" DATE NOT NULL,
+    "timezone" TEXT NOT NULL DEFAULT 'Africa/Johannesburg',
+
+    CONSTRAINT "AcademicTerm_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "Course" (
+    "id" TEXT NOT NULL,
+    "subjectId" TEXT NOT NULL,
+    "gradeLevelId" TEXT NOT NULL,
+    "academicTermId" TEXT NOT NULL,
+    "primaryTeacherId" TEXT NOT NULL,
+    "title" TEXT NOT NULL,
+
+    CONSTRAINT "Course_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "Offering" (
+    "id" TEXT NOT NULL,
+    "name" TEXT NOT NULL,
+    "deliveryMode" "DeliveryMode" NOT NULL,
+    "monthlyPrice" DECIMAL(65,30) NOT NULL,
+
+    CONSTRAINT "Offering_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "OfferingCourse" (
+    "offeringId" TEXT NOT NULL,
+    "courseId" TEXT NOT NULL,
+
+    CONSTRAINT "OfferingCourse_pkey" PRIMARY KEY ("offeringId","courseId")
+);
+
+-- CreateTable
+CREATE TABLE "Session" (
+    "id" TEXT NOT NULL,
+    "courseId" TEXT NOT NULL,
+    "sessionDate" DATE NOT NULL,
+    "startTime" TIMESTAMP(3) NOT NULL,
+    "endTime" TIMESTAMP(3) NOT NULL,
+    "attendanceCutoffAt" TIMESTAMP(3) NOT NULL,
+    "liveMeetingUrl" TEXT NOT NULL,
+    "status" "SessionStatus" NOT NULL DEFAULT 'SCHEDULED',
+    "canceledAt" TIMESTAMP(3),
+    "replacementForSessionId" TEXT,
+
+    CONSTRAINT "Session_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "SessionTeacher" (
+    "sessionId" TEXT NOT NULL,
+    "teacherId" TEXT NOT NULL,
+    "teacherRole" "TeacherRole" NOT NULL,
+
+    CONSTRAINT "SessionTeacher_pkey" PRIMARY KEY ("sessionId","teacherId")
+);
+
+-- CreateTable
+CREATE TABLE "SessionRecording" (
+    "id" TEXT NOT NULL,
+    "sessionId" TEXT NOT NULL,
+    "recordingUrl" TEXT NOT NULL,
+    "availableFrom" TIMESTAMP(3) NOT NULL,
+    "totalSeconds" INTEGER NOT NULL,
+
+    CONSTRAINT "SessionRecording_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "WatchedInterval" (
+    "id" TEXT NOT NULL,
+    "sessionRecordingId" TEXT NOT NULL,
+    "learnerId" TEXT NOT NULL,
+    "startSecond" INTEGER NOT NULL,
+    "endSecond" INTEGER NOT NULL,
+
+    CONSTRAINT "WatchedInterval_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "LiveAttendanceInterval" (
+    "id" TEXT NOT NULL,
+    "sessionId" TEXT NOT NULL,
+    "learnerId" TEXT NOT NULL,
+    "joinedAt" TIMESTAMP(3) NOT NULL,
+    "leftAt" TIMESTAMP(3),
+
+    CONSTRAINT "LiveAttendanceInterval_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "AttendanceRecord" (
+    "id" TEXT NOT NULL,
+    "sessionId" TEXT NOT NULL,
+    "learnerId" TEXT NOT NULL,
+    "completionMode" "CompletionMode",
+    "completedAt" TIMESTAMP(3),
+    "status" "AttendanceStatus" NOT NULL DEFAULT 'PENDING',
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "AttendanceRecord_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "AttendanceOverride" (
+    "id" TEXT NOT NULL,
+    "attendanceRecordId" TEXT NOT NULL,
+    "previousStatus" "AttendanceStatus" NOT NULL,
+    "newStatus" "AttendanceStatus" NOT NULL,
+    "performedByUserId" TEXT NOT NULL,
+    "reason" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "AttendanceOverride_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "AttendanceWindowException" (
+    "id" TEXT NOT NULL,
+    "sessionId" TEXT NOT NULL,
+    "learnerId" TEXT,
+    "reason" "ExceptionReason" NOT NULL,
+    "extendedCutoffAt" TIMESTAMP(3) NOT NULL,
+    "grantedByUserId" TEXT NOT NULL,
+    "note" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "AttendanceWindowException_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "SessionEntitlementSnapshot" (
+    "id" TEXT NOT NULL,
+    "sessionId" TEXT NOT NULL,
+    "learnerId" TEXT NOT NULL,
+    "subscriptionAccessId" TEXT,
+    "wasEntitled" BOOLEAN NOT NULL,
+    "snapshotAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "inheritedFromSnapshotId" TEXT,
+
+    CONSTRAINT "SessionEntitlementSnapshot_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
+CREATE TABLE "SubscriptionAccess" (
+    "id" TEXT NOT NULL,
+    "learnerId" TEXT NOT NULL,
+    "offeringId" TEXT NOT NULL,
+    "status" "SubscriptionStatus" NOT NULL,
+    "currentPeriodStart" TIMESTAMP(3) NOT NULL,
+    "currentPeriodEnd" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "SubscriptionAccess_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateIndex
+CREATE UNIQUE INDEX "User_email_key" ON "User"("email");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "LearnerProfile_userId_key" ON "LearnerProfile"("userId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "TeacherProfile_userId_key" ON "TeacherProfile"("userId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "GradeLevel_name_key" ON "GradeLevel"("name");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Subject_name_key" ON "Subject"("name");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Session_replacementForSessionId_key" ON "Session"("replacementForSessionId");
+
+-- CreateIndex
+CREATE INDEX "Session_courseId_sessionDate_idx" ON "Session"("courseId", "sessionDate");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "SessionRecording_sessionId_key" ON "SessionRecording"("sessionId");
+
+-- CreateIndex
+CREATE INDEX "WatchedInterval_sessionRecordingId_learnerId_idx" ON "WatchedInterval"("sessionRecordingId", "learnerId");
+
+-- CreateIndex
+CREATE INDEX "LiveAttendanceInterval_sessionId_learnerId_idx" ON "LiveAttendanceInterval"("sessionId", "learnerId");
+
+-- CreateIndex
+CREATE INDEX "AttendanceRecord_status_idx" ON "AttendanceRecord"("status");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "AttendanceRecord_sessionId_learnerId_key" ON "AttendanceRecord"("sessionId", "learnerId");
+
+-- CreateIndex
+CREATE INDEX "AttendanceWindowException_sessionId_learnerId_idx" ON "AttendanceWindowException"("sessionId", "learnerId");
+
+-- CreateIndex
+CREATE INDEX "SessionEntitlementSnapshot_inheritedFromSnapshotId_idx" ON "SessionEntitlementSnapshot"("inheritedFromSnapshotId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "SessionEntitlementSnapshot_sessionId_learnerId_key" ON "SessionEntitlementSnapshot"("sessionId", "learnerId");
+
+-- CreateIndex
+CREATE INDEX "SubscriptionAccess_learnerId_offeringId_idx" ON "SubscriptionAccess"("learnerId", "offeringId");
+
+-- AddForeignKey
+ALTER TABLE "LearnerProfile" ADD CONSTRAINT "LearnerProfile_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "TeacherProfile" ADD CONSTRAINT "TeacherProfile_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Course" ADD CONSTRAINT "Course_subjectId_fkey" FOREIGN KEY ("subjectId") REFERENCES "Subject"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Course" ADD CONSTRAINT "Course_gradeLevelId_fkey" FOREIGN KEY ("gradeLevelId") REFERENCES "GradeLevel"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Course" ADD CONSTRAINT "Course_academicTermId_fkey" FOREIGN KEY ("academicTermId") REFERENCES "AcademicTerm"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Course" ADD CONSTRAINT "Course_primaryTeacherId_fkey" FOREIGN KEY ("primaryTeacherId") REFERENCES "TeacherProfile"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "OfferingCourse" ADD CONSTRAINT "OfferingCourse_offeringId_fkey" FOREIGN KEY ("offeringId") REFERENCES "Offering"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "OfferingCourse" ADD CONSTRAINT "OfferingCourse_courseId_fkey" FOREIGN KEY ("courseId") REFERENCES "Course"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Session" ADD CONSTRAINT "Session_courseId_fkey" FOREIGN KEY ("courseId") REFERENCES "Course"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "Session" ADD CONSTRAINT "Session_replacementForSessionId_fkey" FOREIGN KEY ("replacementForSessionId") REFERENCES "Session"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "SessionTeacher" ADD CONSTRAINT "SessionTeacher_sessionId_fkey" FOREIGN KEY ("sessionId") REFERENCES "Session"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "SessionTeacher" ADD CONSTRAINT "SessionTeacher_teacherId_fkey" FOREIGN KEY ("teacherId") REFERENCES "TeacherProfile"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "SessionRecording" ADD CONSTRAINT "SessionRecording_sessionId_fkey" FOREIGN KEY ("sessionId") REFERENCES "Session"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "WatchedInterval" ADD CONSTRAINT "WatchedInterval_sessionRecordingId_fkey" FOREIGN KEY ("sessionRecordingId") REFERENCES "SessionRecording"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "WatchedInterval" ADD CONSTRAINT "WatchedInterval_learnerId_fkey" FOREIGN KEY ("learnerId") REFERENCES "LearnerProfile"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "LiveAttendanceInterval" ADD CONSTRAINT "LiveAttendanceInterval_sessionId_fkey" FOREIGN KEY ("sessionId") REFERENCES "Session"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "LiveAttendanceInterval" ADD CONSTRAINT "LiveAttendanceInterval_learnerId_fkey" FOREIGN KEY ("learnerId") REFERENCES "LearnerProfile"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "AttendanceRecord" ADD CONSTRAINT "AttendanceRecord_sessionId_fkey" FOREIGN KEY ("sessionId") REFERENCES "Session"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "AttendanceRecord" ADD CONSTRAINT "AttendanceRecord_learnerId_fkey" FOREIGN KEY ("learnerId") REFERENCES "LearnerProfile"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "AttendanceOverride" ADD CONSTRAINT "AttendanceOverride_attendanceRecordId_fkey" FOREIGN KEY ("attendanceRecordId") REFERENCES "AttendanceRecord"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "AttendanceWindowException" ADD CONSTRAINT "AttendanceWindowException_sessionId_fkey" FOREIGN KEY ("sessionId") REFERENCES "Session"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "AttendanceWindowException" ADD CONSTRAINT "AttendanceWindowException_learnerId_fkey" FOREIGN KEY ("learnerId") REFERENCES "LearnerProfile"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "SessionEntitlementSnapshot" ADD CONSTRAINT "SessionEntitlementSnapshot_sessionId_fkey" FOREIGN KEY ("sessionId") REFERENCES "Session"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "SessionEntitlementSnapshot" ADD CONSTRAINT "SessionEntitlementSnapshot_learnerId_fkey" FOREIGN KEY ("learnerId") REFERENCES "LearnerProfile"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "SessionEntitlementSnapshot" ADD CONSTRAINT "SessionEntitlementSnapshot_subscriptionAccessId_fkey" FOREIGN KEY ("subscriptionAccessId") REFERENCES "SubscriptionAccess"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "SessionEntitlementSnapshot" ADD CONSTRAINT "SessionEntitlementSnapshot_inheritedFromSnapshotId_fkey" FOREIGN KEY ("inheritedFromSnapshotId") REFERENCES "SessionEntitlementSnapshot"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "SubscriptionAccess" ADD CONSTRAINT "SubscriptionAccess_learnerId_fkey" FOREIGN KEY ("learnerId") REFERENCES "LearnerProfile"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "SubscriptionAccess" ADD CONSTRAINT "SubscriptionAccess_offeringId_fkey" FOREIGN KEY ("offeringId") REFERENCES "Offering"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
