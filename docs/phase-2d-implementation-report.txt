@@ -1,0 +1,402 @@
+TUBI WORKSPACE — PHASE 2D IMPLEMENTATION REPORT
+School Administration Backend (GradeLevel, AcademicTerm, Subject, Course).
+Status: IMPLEMENTATION COMPLETE, UNCOMMITTED. Includes the post-review
+correction pass (missing-Course-reference status-code fix). Prepared for
+final external architecture/security review. No commit, tag, or push has
+been made.
+
+================================================================================
+CORRECTION PASS SUMMARY (applied after the first external review)
+================================================================================
+
+REQUIRED CORRECTION — missing Course references (implemented):
+  Course create/update now distinguishes two previously-conflated failure
+  modes for subjectId, gradeLevelId, academicTermId, and primaryTeacherId:
+    - a malformed UUID -> 400 Bad Request (unchanged; enforced by
+      @IsUUID() at the DTO/ValidationPipe layer, before the service ever
+      runs)
+    - a syntactically valid UUID that matches no row -> 404 Not Found
+      (changed; previously this also returned 400)
+  Multiple missing references are still collected and reported together in
+  one response, now with 404 instead of 400. No Prisma schema or
+  referential-action change was made — this is a service-layer exception
+  type change only. This resolves the open item previously flagged in
+  section I ("HTTP status choice for missing Course references").
+
+================================================================================
+A. FILES CREATED / MODIFIED
+================================================================================
+
+Created:
+- apps/api/src/grade-levels/dto/create-grade-level.dto.ts
+- apps/api/src/grade-levels/dto/update-grade-level.dto.ts
+- apps/api/src/grade-levels/grade-levels.service.ts
+- apps/api/src/grade-levels/grade-levels.service.spec.ts
+- apps/api/src/grade-levels/grade-levels.controller.ts
+- apps/api/src/grade-levels/grade-levels.module.ts
+- apps/api/src/subjects/dto/create-subject.dto.ts
+- apps/api/src/subjects/dto/update-subject.dto.ts
+- apps/api/src/subjects/subjects.service.ts
+- apps/api/src/subjects/subjects.service.spec.ts
+- apps/api/src/subjects/subjects.controller.ts
+- apps/api/src/subjects/subjects.module.ts
+- apps/api/src/academic-terms/dto/create-academic-term.dto.ts
+- apps/api/src/academic-terms/dto/update-academic-term.dto.ts
+- apps/api/src/academic-terms/academic-terms.service.ts
+- apps/api/src/academic-terms/academic-terms.service.spec.ts
+- apps/api/src/academic-terms/academic-terms.controller.ts
+- apps/api/src/academic-terms/academic-terms.module.ts
+- apps/api/src/courses/dto/create-course.dto.ts
+- apps/api/src/courses/dto/update-course.dto.ts
+- apps/api/src/courses/courses.service.ts
+- apps/api/src/courses/courses.service.spec.ts
+- apps/api/src/courses/courses.controller.ts
+- apps/api/src/courses/courses.module.ts
+- apps/api/src/admin-rbac.http.spec.ts (integration RBAC test spanning all
+  four controllers)
+
+Modified (original Phase 2D pass):
+- apps/api/src/app.module.ts — registered GradeLevelsModule,
+  AcademicTermsModule, SubjectsModule, CoursesModule.
+
+Modified further, in the correction pass:
+- apps/api/src/courses/courses.service.ts — assertReferencesExist now
+  throws NotFoundException (404) instead of BadRequestException (400) for
+  a syntactically valid but non-existent reference; removed the now-unused
+  BadRequestException import; updated the method's doc comment to explain
+  the 400-vs-404 boundary.
+- apps/api/src/courses/courses.service.spec.ts — updated the
+  "missing teacher", "multiple missing references", and "update to
+  non-existent subject" tests to assert NotFoundException instead of
+  BadRequestException.
+- apps/api/src/admin-rbac.http.spec.ts — hoisted teacherProfile.findUnique
+  to an outer-scope jest.Mock so a single test can override one call;
+  clarified the malformed-UUID test's name (still 400); added a new test
+  proving a syntactically valid but non-existent primaryTeacherId now
+  returns 404 with a message naming the missing reference.
+
+No other files were touched. apps/api/prisma/schema.prisma and every
+migration are unchanged from the Phase 2C commit
+(1b8074c7a23910a48f22c32287035bdbc09b83ad) — including through this
+correction pass.
+
+================================================================================
+B. MODULES / CONTROLLERS / SERVICES / DTOs IMPLEMENTED
+================================================================================
+
+Four parallel feature modules, each following the same shape (mirroring the
+auth module's conventions):
+
+  Entity        Module                 Controller               Service               DTOs
+  ------------  ---------------------  -----------------------  --------------------  ------------------------------------------
+  GradeLevel    GradeLevelsModule      GradeLevelsController    GradeLevelsService    CreateGradeLevelDto, UpdateGradeLevelDto
+  Subject       SubjectsModule         SubjectsController       SubjectsService       CreateSubjectDto, UpdateSubjectDto
+  AcademicTerm  AcademicTermsModule    AcademicTermsController  AcademicTermsService  CreateAcademicTermDto, UpdateAcademicTermDto
+  Course        CoursesModule          CoursesController        CoursesService        CreateCourseDto, UpdateCourseDto
+
+CoursesService additionally exports a CourseWithRelations type
+(Prisma.CourseGetPayload) whose primaryTeacher field is built from an
+explicit Prisma `select` (id, bio, createdAt, userId) — the `user` relation
+is never joined, so passwordHash cannot reach a Course response regardless
+of future changes to User.
+
+================================================================================
+C. ENDPOINTS IMPLEMENTED
+================================================================================
+
+All four resources expose the identical shape:
+
+POST   /admin/grade-levels        ADMIN
+GET    /admin/grade-levels        ADMIN, TEACHER
+GET    /admin/grade-levels/:id    ADMIN, TEACHER
+PATCH  /admin/grade-levels/:id    ADMIN
+DELETE /admin/grade-levels/:id    ADMIN
+
+POST   /admin/subjects            ADMIN
+GET    /admin/subjects            ADMIN, TEACHER
+GET    /admin/subjects/:id        ADMIN, TEACHER
+PATCH  /admin/subjects/:id        ADMIN
+DELETE /admin/subjects/:id        ADMIN
+
+POST   /admin/academic-terms      ADMIN
+GET    /admin/academic-terms      ADMIN, TEACHER
+GET    /admin/academic-terms/:id  ADMIN, TEACHER
+PATCH  /admin/academic-terms/:id  ADMIN
+DELETE /admin/academic-terms/:id  ADMIN
+
+POST   /admin/courses             ADMIN
+GET    /admin/courses             ADMIN, TEACHER
+GET    /admin/courses/:id         ADMIN, TEACHER
+PATCH  /admin/courses/:id         ADMIN
+DELETE /admin/courses/:id         ADMIN
+
+Status codes: 201 create, 200 read/update, 204 delete, 400 validation
+failure (including a malformed UUID reference), 401 unauthenticated, 403
+wrong role, 404 missing entity (including a syntactically valid Course
+reference that matches no row — corrected in this pass, see the Correction
+Pass Summary above), 409 uniqueness/deletion conflict.
+
+================================================================================
+D. AUTHORIZATION BEHAVIOR
+================================================================================
+
+Every controller is @UseGuards(JwtAuthGuard, RolesGuard) at the class
+level, with @Roles('ADMIN') on every mutation and @Roles('ADMIN',
+'TEACHER') on every read route — LEARNER is never named, so RolesGuard
+denies it everywhere on these controllers (it only defaults to "any
+authenticated user" when a route has NO @Roles() at all, which none of
+these routes do). This is the first production use of the reusable
+JwtAuthGuard/RolesGuard/@Roles infrastructure built in Phase 2C outside the
+auth module itself, and the admin-rbac.http.spec.ts suite exercises it
+end-to-end (real guards, real strategy, real signed tokens) rather than
+only at the unit level.
+
+================================================================================
+E. VALIDATION / BUSINESS RULES
+================================================================================
+
+- GradeLevel / Subject: unique name, enforced via a pre-check (findUnique)
+  on create and on update-with-name-change, returning 409 Conflict.
+
+- AcademicTerm: startDate strictly before endDate, enforced by
+  assertValidDateRange, applied on create and on update (re-validating
+  against whichever date wasn't changed, so a partial update can't produce
+  an invalid range by omission). timezone is optional in the DTO — when
+  omitted, the value is left out of the Prisma `data` object entirely so
+  the schema's own @default("Africa/Johannesburg") applies; when supplied,
+  the caller's value is used.
+
+- Course: all four references (subjectId, gradeLevelId, academicTermId,
+  primaryTeacherId) are checked for existence via Promise.all before any
+  write; every missing reference is collected and reported together in one
+  response (assertReferencesExist), rather than failing on the first one
+  found. UPDATED by the correction pass: a malformed UUID is rejected at
+  the DTO layer with 400 Bad Request (via @IsUUID()) before this method
+  ever runs; a syntactically valid UUID that resolves to no row is now
+  reported with 404 Not Found, not 400 — the input was well-formed, the
+  entity it points to simply doesn't exist.
+
+- Deletion safety: GradeLevel/Subject/AcademicTerm refuse deletion (409
+  Conflict) if any Course still references them (prisma.course.count);
+  Course refuses deletion if any Session still references it
+  (prisma.session.count). No cascade deletes were introduced, and no
+  Prisma referential action (onDelete) was changed.
+
+- DTOs: the global ValidationPipe (already configured in main.ts) with
+  whitelist/forbidNonWhitelisted rejects unknown fields; @IsUUID() rejects
+  malformed IDs; @MinLength(1) rejects empty names/titles.
+
+================================================================================
+F. TESTS ADDED AND EXACT RESULTS
+================================================================================
+
+8 test files total (4 service specs + 1 integration spec + 3 pre-existing
+auth specs), 70 tests, all passing (69 from the original Phase 2D pass + 1
+new in the correction pass):
+
+  Test Suites: 8 passed, 8 total
+  Tests:       70 passed, 70 total
+
+New in the original Phase 2D pass (46 tests across 5 files), updated where
+noted by the correction pass:
+
+grade-levels.service.spec.ts
+  - create success
+  - duplicate-name conflict
+  - not-found
+  - same-name update allowed
+  - conflicting-name update rejected
+  - delete success
+  - delete blocked by referencing courses
+
+subjects.service.spec.ts
+  - create success
+  - duplicate-name conflict
+  - not-found
+  - delete blocked / allowed
+
+academic-terms.service.spec.ts
+  - create success
+  - reversed date range rejected
+  - zero-duration range rejected
+  - timezone-default passthrough (omitted -> Prisma schema default applies)
+  - partial update re-validated against existing date
+  - not-found
+  - delete blocked by referencing courses
+
+courses.service.spec.ts
+  - create success (all references resolved)
+  - missing-teacher rejected with 404 [UPDATED — was 400 before the
+    correction pass]
+  - multiple-missing-references rejected with 404, naming all of them
+    [UPDATED — was 400 before the correction pass]
+  - not-found (Course itself, GET-by-id path — unchanged, always 404)
+  - update to a non-existent subject rejected with 404 [UPDATED — was 400
+    before the correction pass]
+  - delete blocked / allowed by referencing sessions
+
+admin-rbac.http.spec.ts (integration, real guards/strategy/signed tokens,
+fake PrismaService)
+  - unauthenticated read rejected (401)
+  - unauthenticated write rejected (401)
+  - ADMIN creates a GradeLevel (201)
+  - ADMIN creates a Subject (201)
+  - ADMIN creates an AcademicTerm (201)
+  - ADMIN creates a Course, every reference resolved (201)
+  - TEACHER forbidden from creating a GradeLevel (403)
+  - TEACHER allowed to read GradeLevels (200)
+  - LEARNER forbidden from creating a GradeLevel (403)
+  - LEARNER forbidden from reading GradeLevels (403)
+  - ADMIN allowed to read the Subject list (200)
+  - DTO: unrecognised field rejected (400)
+  - DTO: empty name rejected (400)
+  - DTO: malformed (non-UUID) Course reference rejected with 400, not 404
+    (title clarified in the correction pass; behavior unchanged)
+  - [NEW, correction pass] Course create with a syntactically valid UUID
+    that matches no teacher rejected with 404, not 400 — response message
+    names "primaryTeacherId"
+
+================================================================================
+G. COMMANDS RUN AND EXACT RESULTS
+================================================================================
+
+Original Phase 2D pass results are unchanged and not repeated in full here
+except where the correction pass re-ran them. This section reports the
+correction pass's own verification run, performed after implementing the
+404-vs-400 fix described in the Correction Pass Summary.
+
+  pnpm run test
+    -> Test Suites: 8 passed, 8 total
+       Tests:       70 passed, 70 total
+
+  pnpm run typecheck   (tsc --noEmit)
+    -> PASS, no errors.
+
+  pnpm exec eslint .   (run directly; root `pnpm run lint` still hits the
+  pre-existing Turbo `spawn UNKNOWN` issue, unrelated to this milestone —
+  see section I)
+    -> 0 problems.
+
+  pnpm run build   (nest build)
+    -> PASS, exit code 0, no errors.
+
+  pnpm exec prisma validate
+    -> "The schema at prisma\schema.prisma is valid" — confirms this
+       correction introduced no schema drift.
+
+  Other workspace packages, re-typechecked directly during the original
+  pass to confirm no regression (not re-run in the correction pass, since
+  no file outside apps/api/src/courses and apps/api/src/admin-rbac.http.spec.ts
+  changed):
+    packages/types  -> tsc --noEmit: PASS
+    packages/utils  -> tsc --noEmit: PASS
+    packages/ui     -> tsc --noEmit: PASS
+    apps/web        -> next typegen && tsc --noEmit: PASS
+
+Two issues were found and fixed during the original pass's verification,
+both surfaced by tests, one a genuine production bug fix and one a
+test-data fix — neither changed any product/business rule described in
+section E, and neither was revisited by this correction pass:
+
+1. AcademicTermsService.create was not declared `async`, so its
+   synchronous assertValidDateRange throw bypassed Jest's `.rejects`
+   matcher — a real inconsistency, since `update` on the same class was
+   already `async` and behaved correctly. Fixed by adding `async` to
+   `create`. This changes nothing about what the method validates or
+   returns; it only makes a synchronous throw surface as a rejected
+   Promise, consistent with the rest of the class and with how NestJS
+   exception filters expect controller-bound methods to behave.
+2. Two test files used hand-written placeholder UUIDs with an invalid
+   variant nibble (e.g. "22222222-2222-2222-2222-222222222222"), which
+   class-validator's @IsUUID() correctly rejected as malformed. Fixed by
+   generating real UUIDs with `randomUUID()` in the test file. This was a
+   test-data defect, not a validation-logic defect — @IsUUID() was working
+   as intended.
+
+================================================================================
+H. SCHEMA CHANGES / DEVIATIONS
+================================================================================
+
+No Phase 2D database schema changes were required — including through the
+correction pass.
+
+apps/api/prisma/schema.prisma and every migration file are unchanged from
+the Phase 2C commit (1b8074c7a23910a48f22c32287035bdbc09b83ad). All CRUD
+and validation logic, both in the original pass and in the correction
+pass, was implemented entirely against the existing frozen GradeLevel,
+Subject, AcademicTerm, and Course models — the correction was a
+service-layer exception-type change (BadRequestException ->
+NotFoundException) only, with no schema or referential-action
+implications. `prisma validate` confirms no drift.
+
+================================================================================
+I. WARNINGS / UNRESOLVED ISSUES
+================================================================================
+
+1. [RESOLVED by the correction pass] HTTP status choice for missing Course
+   references: previously flagged because 400 Bad Request was used for a
+   Course create/update referencing a non-existent
+   Subject/GradeLevel/AcademicTerm/TeacherProfile. The correction pass now
+   returns 404 Not Found for a syntactically valid UUID that matches no
+   row, while a malformed UUID still correctly returns 400 at the DTO
+   layer. No further ambiguity remains on this point.
+
+2. TeacherProfile has no CRUD in this milestone (correctly out of scope
+   per the brief) — CoursesService only ever reads it to validate a
+   reference exists; it cannot be created, listed, or deleted through this
+   milestone's API. A future milestone will need to introduce that.
+   Unchanged by the correction pass.
+
+3. The pre-existing Turbo `spawn UNKNOWN` issue (documented in the Phase
+   2B/2C reports) is unchanged and unrelated to this milestone;
+   package-level commands were used throughout, as in prior phases.
+
+4. No pagination exists on any findAll (GET /admin/...) endpoint —
+   acceptable at this milestone's data volume, but worth a
+   founder/architecture note before this data grows significantly.
+   Unchanged by the correction pass.
+
+No new founder-decision-required blockers were identified while
+implementing this correction.
+
+================================================================================
+J. EXACT GIT STATUS
+================================================================================
+
+$ git status
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   apps/api/src/app.module.ts
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	apps/api/src/academic-terms/
+	apps/api/src/admin-rbac.http.spec.ts
+	apps/api/src/courses/
+	apps/api/src/grade-levels/
+	apps/api/src/subjects/
+	docs/phase-2d-implementation-report.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+
+$ git diff --stat
+ apps/api/src/app.module.ts | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+(courses.service.ts, courses.service.spec.ts, and admin-rbac.http.spec.ts
+are modified as part of the still-untracked apps/api/src/courses/ and
+apps/api/src/admin-rbac.http.spec.ts entries above, so they do not appear
+as separate "modified" lines — they were never committed in the first
+place.)
+
+No commit, tag, or push has been made. Phase 2D, including this correction
+pass, remains fully local, uncommitted, and ready for final external
+review.
+
+================================================================================
+END OF REPORT
+================================================================================

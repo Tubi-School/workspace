@@ -1,10 +1,14 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 
+import { AcademicTermsModule } from './academic-terms/academic-terms.module.js';
 import { AuthModule } from './auth/auth.module.js';
 import { validateEnvironment } from './config/environment.js';
+import { CoursesModule } from './courses/courses.module.js';
+import { GradeLevelsModule } from './grade-levels/grade-levels.module.js';
 import { HealthModule } from './health/health.module.js';
 import { PrismaModule } from './prisma/prisma.module.js';
+import { SubjectsModule } from './subjects/subjects.module.js';
 
 /**
  * Composition root.
@@ -27,6 +31,10 @@ import { PrismaModule } from './prisma/prisma.module.js';
     PrismaModule,
     HealthModule,
     AuthModule,
+    GradeLevelsModule,
+    AcademicTermsModule,
+    SubjectsModule,
+    CoursesModule,
   ],
 })
 export class AppModule {}
