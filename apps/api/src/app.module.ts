@@ -8,7 +8,9 @@ import { CoursesModule } from './courses/courses.module.js';
 import { GradeLevelsModule } from './grade-levels/grade-levels.module.js';
 import { HealthModule } from './health/health.module.js';
 import { PrismaModule } from './prisma/prisma.module.js';
+import { SessionsModule } from './sessions/sessions.module.js';
 import { SubjectsModule } from './subjects/subjects.module.js';
+import { TeachersModule } from './teachers/teachers.module.js';
 
 /**
  * Composition root.
@@ -35,6 +37,8 @@ import { SubjectsModule } from './subjects/subjects.module.js';
     AcademicTermsModule,
     SubjectsModule,
     CoursesModule,
+    TeachersModule,
+    SessionsModule,
   ],
 })
 export class AppModule {}

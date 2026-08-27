@@ -1,0 +1,524 @@
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+
+import { Prisma, RoleName, SessionStatus, TeacherRole } from '../generated/prisma/client.js';
+import { PrismaService } from '../prisma/prisma.service.js';
+import { computeAttendanceCutoffAtUtc, toAcademicDateString } from './academic-timezone.util.js';
+import type { AssignSessionTeacherDto } from './dto/assign-session-teacher.dto.js';
+import type { CreateSessionDto } from './dto/create-session.dto.js';
+import { OutgoingPrimaryAction, type ReassignPrimaryTeacherDto } from './dto/reassign-primary-teacher.dto.js';
+import type { UpdateSessionDto } from './dto/update-session.dto.js';
+import type { UpdateSessionTeacherDto } from './dto/update-session-teacher.dto.js';
+
+const PRISMA_UNIQUE_CONSTRAINT_ERROR_CODE = 'P2002';
+
+const sessionInclude = {
+  course: true,
+  teachers: {
+    include: {
+      teacher: {
+        select: {
+          id: true,
+          bio: true,
+          createdAt: true,
+          userId: true,
+          user: { select: { id: true, email: true, fullName: true, isActive: true } },
+        },
+      },
+    },
+  },
+} satisfies Prisma.SessionInclude;
+
+export type SessionWithRelations = Prisma.SessionGetPayload<{ include: typeof sessionInclude }>;
+
+interface TeacherAssignmentPlan {
+  teacherId: string;
+  role: TeacherRole;
+}
+
+@Injectable()
+export class SessionsService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async create(dto: CreateSessionDto): Promise<SessionWithRelations> {
+    const course = await this.prisma.course.findUnique({
+      where: { id: dto.courseId },
+      include: { academicTerm: true },
+    });
+
+    if (!course) {
+      throw new NotFoundException(`Course ${dto.courseId} not found`);
+    }
+
+    const sessionDate = new Date(dto.sessionDate);
+    const startTime = new Date(dto.startTime);
+    const endTime = new Date(dto.endTime);
+
+    this.assertChronology(startTime, endTime);
+    this.assertSessionDateMatchesStart(sessionDate, startTime);
+    this.assertWithinAcademicTerm(sessionDate, course.academicTerm);
+
+    if (dto.replacementForSessionId !== undefined) {
+      await this.assertValidReplacementTarget(dto.replacementForSessionId);
+    }
+
+    const assignments = await this.resolveTeacherAssignments(
+      course.primaryTeacherId,
+      dto.assistantTeacherIds ?? [],
+      dto.substituteTeacherIds ?? [],
+    );
+
+    const attendanceCutoffAt = computeAttendanceCutoffAtUtc(sessionDate);
+
+    try {
+      const created = await this.prisma.session.create({
+        data: {
+          courseId: dto.courseId,
+          sessionDate,
+          startTime,
+          endTime,
+          liveMeetingUrl: dto.liveMeetingUrl,
+          attendanceCutoffAt,
+          ...(dto.replacementForSessionId !== undefined
+            ? { replacementForSessionId: dto.replacementForSessionId }
+            : {}),
+          teachers: {
+            create: assignments.map((assignment) => ({
+              teacherId: assignment.teacherId,
+              teacherRole: assignment.role,
+            })),
+          },
+        },
+        include: sessionInclude,
+      });
+
+      return created;
+    } catch (error) {
+      if (this.isUniqueConstraintViolation(error)) {
+        throw new ConflictException(
+          `Session ${dto.replacementForSessionId ?? ''} already has a replacement session`,
+        );
+      }
+      throw error;
+    }
+  }
+
+  findAll(): Promise<SessionWithRelations[]> {
+    return this.prisma.session.findMany({ include: sessionInclude, orderBy: { startTime: 'asc' } });
+  }
+
+  async findOne(id: string): Promise<SessionWithRelations> {
+    const session = await this.prisma.session.findUnique({ where: { id }, include: sessionInclude });
+
+    if (!session) {
+      throw new NotFoundException(`Session ${id} not found`);
+    }
+
+    return session;
+  }
+
+  /**
+   * Only a still-SCHEDULED session is editable. Once it has gone LIVE,
+   * ENDED, or CANCELED, its schedule is part of the historical record —
+   * changing it out from under a session learners may already be tracking
+   * against would corrupt that record rather than correct it.
+   */
+  async update(id: string, dto: UpdateSessionDto): Promise<SessionWithRelations> {
+    const existing = await this.findOne(id);
+
+    if (existing.status !== SessionStatus.SCHEDULED) {
+      throw new ConflictException(`Session ${id} is ${existing.status} and can no longer be edited`);
+    }
+
+    const courseId = dto.courseId ?? existing.courseId;
+    const course = await this.prisma.course.findUnique({ where: { id: courseId }, include: { academicTerm: true } });
+
+    if (!course) {
+      throw new NotFoundException(`Course ${courseId} not found`);
+    }
+
+    const sessionDate = dto.sessionDate !== undefined ? new Date(dto.sessionDate) : existing.sessionDate;
+    const startTime = dto.startTime !== undefined ? new Date(dto.startTime) : existing.startTime;
+    const endTime = dto.endTime !== undefined ? new Date(dto.endTime) : existing.endTime;
+
+    this.assertChronology(startTime, endTime);
+    this.assertSessionDateMatchesStart(sessionDate, startTime);
+    this.assertWithinAcademicTerm(sessionDate, course.academicTerm);
+
+    const attendanceCutoffAt = computeAttendanceCutoffAtUtc(sessionDate);
+
+    return this.prisma.session.update({
+      where: { id },
+      data: {
+        ...(dto.courseId !== undefined ? { courseId: dto.courseId } : {}),
+        sessionDate,
+        startTime,
+        endTime,
+        attendanceCutoffAt,
+        ...(dto.liveMeetingUrl !== undefined ? { liveMeetingUrl: dto.liveMeetingUrl } : {}),
+      },
+      include: sessionInclude,
+    });
+  }
+
+  async markLive(id: string): Promise<SessionWithRelations> {
+    const existing = await this.findOne(id);
+    this.assertTransition(existing.status, SessionStatus.SCHEDULED, SessionStatus.LIVE);
+
+    return this.prisma.session.update({
+      where: { id },
+      data: { status: SessionStatus.LIVE },
+      include: sessionInclude,
+    });
+  }
+
+  async markEnded(id: string): Promise<SessionWithRelations> {
+    const existing = await this.findOne(id);
+    this.assertTransition(existing.status, SessionStatus.LIVE, SessionStatus.ENDED);
+
+    return this.prisma.session.update({
+      where: { id },
+      data: { status: SessionStatus.ENDED },
+      include: sessionInclude,
+    });
+  }
+
+  async cancel(id: string): Promise<SessionWithRelations> {
+    const existing = await this.findOne(id);
+
+    if (existing.status !== SessionStatus.SCHEDULED && existing.status !== SessionStatus.LIVE) {
+      throw new ConflictException(
+        `Session ${id} is ${existing.status} and cannot be canceled (only SCHEDULED or LIVE sessions can be)`,
+      );
+    }
+
+    return this.prisma.session.update({
+      where: { id },
+      data: { status: SessionStatus.CANCELED, canceledAt: new Date() },
+      include: sessionInclude,
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // SessionTeacher staffing
+  // ---------------------------------------------------------------------
+
+  async listTeachers(sessionId: string): Promise<SessionWithRelations['teachers']> {
+    const session = await this.findOne(sessionId);
+    return session.teachers;
+  }
+
+  /**
+   * Adds a teacher to a session. Rejects a duplicate assignment (the same
+   * teacher already staffed on this session, in any role) and rejects
+   * adding a second PRIMARY outright — this API never silently replaces an
+   * existing PRIMARY; the caller must remove or reassign the current one
+   * first (see `updateRole`/`remove`, which themselves refuse to ever leave
+   * a session with zero PRIMARY teachers).
+   */
+  async addTeacher(sessionId: string, dto: AssignSessionTeacherDto): Promise<SessionWithRelations> {
+    await this.findOne(sessionId);
+    await this.assertTeacherActive(dto.teacherId);
+
+    const existingAssignment = await this.prisma.sessionTeacher.findUnique({
+      where: { sessionId_teacherId: { sessionId, teacherId: dto.teacherId } },
+    });
+
+    if (existingAssignment) {
+      throw new ConflictException(`Teacher ${dto.teacherId} is already assigned to session ${sessionId}`);
+    }
+
+    if (dto.role === TeacherRole.PRIMARY) {
+      await this.assertNoPrimaryExists(sessionId);
+    }
+
+    await this.prisma.sessionTeacher.create({
+      data: { sessionId, teacherId: dto.teacherId, teacherRole: dto.role },
+    });
+
+    return this.findOne(sessionId);
+  }
+
+  /**
+   * Changes an existing assignment's role.
+   *
+   * Refuses to leave the session with zero PRIMARY teachers (demoting the
+   * sole PRIMARY away) and refuses to create a second PRIMARY (promoting a
+   * teacher to PRIMARY while a different teacher already holds it) — this
+   * milestone does not implement an atomic "swap the PRIMARY" operation;
+   * see the completion report for the limitation this reflects.
+   */
+  async updateTeacherRole(
+    sessionId: string,
+    teacherId: string,
+    dto: UpdateSessionTeacherDto,
+  ): Promise<SessionWithRelations> {
+    const assignment = await this.getAssignmentOrThrow(sessionId, teacherId);
+
+    if (assignment.teacherRole === TeacherRole.PRIMARY && dto.role !== TeacherRole.PRIMARY) {
+      throw new ConflictException(
+        `Cannot change session ${sessionId}'s PRIMARY teacher's role — this would leave zero PRIMARY teachers`,
+      );
+    }
+
+    if (dto.role === TeacherRole.PRIMARY && assignment.teacherRole !== TeacherRole.PRIMARY) {
+      await this.assertNoPrimaryExists(sessionId);
+    }
+
+    await this.prisma.sessionTeacher.update({
+      where: { sessionId_teacherId: { sessionId, teacherId } },
+      data: { teacherRole: dto.role },
+    });
+
+    return this.findOne(sessionId);
+  }
+
+  /** Refuses to remove the sole PRIMARY teacher (would leave zero PRIMARY). */
+  async removeTeacher(sessionId: string, teacherId: string): Promise<SessionWithRelations> {
+    const assignment = await this.getAssignmentOrThrow(sessionId, teacherId);
+
+    if (assignment.teacherRole === TeacherRole.PRIMARY) {
+      throw new ConflictException(
+        `Cannot remove session ${sessionId}'s PRIMARY teacher — this would leave zero PRIMARY teachers`,
+      );
+    }
+
+    await this.prisma.sessionTeacher.delete({ where: { sessionId_teacherId: { sessionId, teacherId } } });
+
+    return this.findOne(sessionId);
+  }
+
+  /**
+   * Atomically reassigns a session's PRIMARY teacher.
+   *
+   * The single operation this milestone's founder correction requires:
+   * `addTeacher`/`updateTeacherRole`/`removeTeacher` each individually
+   * refuse any write that would leave zero or two PRIMARY teachers, which
+   * made a plain reassignment impossible to express as two separate calls
+   * without an externally-visible zero- or two-PRIMARY moment in between.
+   * This method performs both halves — demoting/removing the outgoing
+   * PRIMARY and promoting the incoming teacher — inside one
+   * `prisma.$transaction`, so no caller can ever observe an intermediate
+   * state, and a failure partway through leaves the original staffing
+   * completely unchanged (the transaction is not committed).
+   */
+  async reassignPrimaryTeacher(
+    sessionId: string,
+    dto: ReassignPrimaryTeacherDto,
+  ): Promise<SessionWithRelations> {
+    await this.findOne(sessionId);
+    await this.assertTeacherActive(dto.incomingTeacherId);
+
+    const primaryAssignments = await this.prisma.sessionTeacher.findMany({
+      where: { sessionId, teacherRole: TeacherRole.PRIMARY },
+    });
+
+    if (primaryAssignments.length !== 1) {
+      throw new ConflictException(
+        `Session ${sessionId} does not currently have exactly one PRIMARY teacher (found ${primaryAssignments.length})`,
+      );
+    }
+
+    const outgoingTeacherId = primaryAssignments[0]!.teacherId;
+
+    if (outgoingTeacherId === dto.incomingTeacherId) {
+      throw new ConflictException(`Teacher ${dto.incomingTeacherId} is already the PRIMARY teacher`);
+    }
+
+    const incomingExistingAssignment = await this.prisma.sessionTeacher.findUnique({
+      where: { sessionId_teacherId: { sessionId, teacherId: dto.incomingTeacherId } },
+    });
+
+    await this.prisma.$transaction(async (tx) => {
+      // Resolve the outgoing PRIMARY first, per the explicit (never
+      // inferred) action the caller supplied.
+      if (dto.outgoingTeacherAction === OutgoingPrimaryAction.REMOVE) {
+        await tx.sessionTeacher.delete({
+          where: { sessionId_teacherId: { sessionId, teacherId: outgoingTeacherId } },
+        });
+      } else {
+        const newOutgoingRole =
+          dto.outgoingTeacherAction === OutgoingPrimaryAction.BECOME_ASSISTANT
+            ? TeacherRole.ASSISTANT
+            : TeacherRole.SUBSTITUTE;
+
+        await tx.sessionTeacher.update({
+          where: { sessionId_teacherId: { sessionId, teacherId: outgoingTeacherId } },
+          data: { teacherRole: newOutgoingRole },
+        });
+      }
+
+      // Promote the incoming teacher. If they already hold a non-PRIMARY
+      // assignment on this session, that assignment is unambiguously the
+      // one being promoted — updating it in place is safe and avoids a
+      // duplicate-membership conflict; otherwise a fresh PRIMARY row is
+      // created for them.
+      if (incomingExistingAssignment) {
+        await tx.sessionTeacher.update({
+          where: { sessionId_teacherId: { sessionId, teacherId: dto.incomingTeacherId } },
+          data: { teacherRole: TeacherRole.PRIMARY },
+        });
+      } else {
+        await tx.sessionTeacher.create({
+          data: { sessionId, teacherId: dto.incomingTeacherId, teacherRole: TeacherRole.PRIMARY },
+        });
+      }
+    });
+
+    return this.findOne(sessionId);
+  }
+
+  private async getAssignmentOrThrow(sessionId: string, teacherId: string) {
+    await this.findOne(sessionId);
+
+    const assignment = await this.prisma.sessionTeacher.findUnique({
+      where: { sessionId_teacherId: { sessionId, teacherId } },
+    });
+
+    if (!assignment) {
+      throw new NotFoundException(`Teacher ${teacherId} is not assigned to session ${sessionId}`);
+    }
+
+    return assignment;
+  }
+
+  private async assertNoPrimaryExists(sessionId: string): Promise<void> {
+    const existingPrimary = await this.prisma.sessionTeacher.findFirst({
+      where: { sessionId, teacherRole: TeacherRole.PRIMARY },
+    });
+
+    if (existingPrimary) {
+      throw new ConflictException(
+        `Session ${sessionId} already has a PRIMARY teacher (${existingPrimary.teacherId}) — reassign or remove it first`,
+      );
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Validation helpers
+  // ---------------------------------------------------------------------
+
+  private assertChronology(startTime: Date, endTime: Date): void {
+    if (startTime.getTime() >= endTime.getTime()) {
+      throw new BadRequestException('startTime must be strictly before endTime');
+    }
+  }
+
+  private assertSessionDateMatchesStart(sessionDate: Date, startTime: Date): void {
+    const sessionDateString = toAcademicDateString(sessionDate);
+    const startDateString = toAcademicDateString(startTime);
+
+    if (sessionDateString !== startDateString) {
+      throw new BadRequestException(
+        `sessionDate (${sessionDateString}) must match the academic calendar day (Africa/Johannesburg) that startTime falls on (${startDateString})`,
+      );
+    }
+  }
+
+  private assertWithinAcademicTerm(
+    sessionDate: Date,
+    academicTerm: { id: string; startDate: Date; endDate: Date },
+  ): void {
+    if (sessionDate.getTime() < academicTerm.startDate.getTime() || sessionDate.getTime() > academicTerm.endDate.getTime()) {
+      throw new BadRequestException(
+        `sessionDate must fall within the referenced course's academic term (${academicTerm.id})`,
+      );
+    }
+  }
+
+  private assertTransition(current: SessionStatus, requiredFrom: SessionStatus, to: SessionStatus): void {
+    if (current !== requiredFrom) {
+      throw new ConflictException(`Cannot move session from ${current} to ${to} (requires ${requiredFrom})`);
+    }
+  }
+
+  private async assertValidReplacementTarget(targetId: string): Promise<void> {
+    const target = await this.prisma.session.findUnique({ where: { id: targetId } });
+
+    if (!target) {
+      throw new NotFoundException(`Replacement target session ${targetId} not found`);
+    }
+
+    if (target.status !== SessionStatus.CANCELED) {
+      throw new ConflictException(`Replacement target session ${targetId} is not CANCELED`);
+    }
+
+    // Defensive cycle guard. In practice a cycle cannot form through this
+    // API — replacementForSessionId is set only at creation time and is
+    // never itself mutated afterwards — but a session's ancestry chain is
+    // walked here so a corrupted or externally-written chain is still
+    // rejected rather than silently accepted.
+    const visited = new Set<string>([targetId]);
+    let cursor: string | null = target.replacementForSessionId;
+    let hops = 0;
+    const MAX_HOPS = 1000;
+
+    while (cursor !== null && hops < MAX_HOPS) {
+      if (visited.has(cursor)) {
+        throw new ConflictException('Replacement chain contains a cycle');
+      }
+      visited.add(cursor);
+
+      const ancestor: { replacementForSessionId: string | null } | null = await this.prisma.session.findUnique({
+        where: { id: cursor },
+        select: { replacementForSessionId: true },
+      });
+
+      cursor = ancestor?.replacementForSessionId ?? null;
+      hops += 1;
+    }
+  }
+
+  /**
+   * Resolves and validates the full teacher roster for a new session:
+   * exactly one PRIMARY (defaulted from the course), plus any requested
+   * ASSISTANT/SUBSTITUTE teachers. Every teacher must exist and belong to
+   * an active User; every teacher may appear at most once across all
+   * roles.
+   */
+  private async resolveTeacherAssignments(
+    primaryTeacherId: string,
+    assistantTeacherIds: string[],
+    substituteTeacherIds: string[],
+  ): Promise<TeacherAssignmentPlan[]> {
+    const allIds = [primaryTeacherId, ...assistantTeacherIds, ...substituteTeacherIds];
+    const duplicates = allIds.filter((id, index) => allIds.indexOf(id) !== index);
+
+    if (duplicates.length > 0) {
+      throw new ConflictException(
+        `The same teacher cannot be assigned more than once to a session: ${[...new Set(duplicates)].join(', ')}`,
+      );
+    }
+
+    await Promise.all(allIds.map((id) => this.assertTeacherActive(id)));
+
+    return [
+      { teacherId: primaryTeacherId, role: TeacherRole.PRIMARY },
+      ...assistantTeacherIds.map((teacherId) => ({ teacherId, role: TeacherRole.ASSISTANT })),
+      ...substituteTeacherIds.map((teacherId) => ({ teacherId, role: TeacherRole.SUBSTITUTE })),
+    ];
+  }
+
+  /** Throws 404 if the TeacherProfile doesn't exist, 409 if it exists but
+   * its User is inactive or not actually a TEACHER. */
+  async assertTeacherActive(teacherId: string): Promise<void> {
+    const teacher = await this.prisma.teacherProfile.findUnique({
+      where: { id: teacherId },
+      include: { user: true },
+    });
+
+    if (!teacher) {
+      throw new NotFoundException(`Teacher ${teacherId} not found`);
+    }
+
+    if (!teacher.user.isActive || teacher.user.role !== RoleName.TEACHER) {
+      throw new ConflictException(`Teacher ${teacherId} does not belong to an active TEACHER account`);
+    }
+  }
+
+  private isUniqueConstraintViolation(error: unknown): boolean {
+    return (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === PRISMA_UNIQUE_CONSTRAINT_ERROR_CODE
+    );
+  }
+}

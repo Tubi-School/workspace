@@ -1,0 +1,428 @@
+TUBI WORKSPACE — PHASE 2E IMPLEMENTATION REPORT
+Teacher Provisioning + Session Scheduling.
+Status: IMPLEMENTATION COMPLETE, UNCOMMITTED. Includes the post-review
+correction pass (atomic PRIMARY-teacher reassignment). Prepared for final
+external architecture/security review. No commit, tag, or push has been
+made.
+
+================================================================================
+CORRECTION PASS SUMMARY (applied after the first external review)
+================================================================================
+
+REQUIRED CORRECTION — atomic PRIMARY teacher reassignment (implemented):
+  Added PATCH /admin/sessions/:id/primary-teacher (ADMIN only). Request
+  body: { incomingTeacherId, outgoingTeacherAction }, where
+  outgoingTeacherAction is one of BECOME_ASSISTANT, BECOME_SUBSTITUTE, or
+  REMOVE — the outgoing PRIMARY's new state is always explicit, never
+  inferred. The entire reassignment (resolving the outgoing teacher's new
+  role/removal, then promoting the incoming teacher) runs inside a single
+  prisma.$transaction, so no caller can ever observe an intermediate state
+  with zero or two PRIMARY teachers, and a failure partway through leaves
+  the original staffing completely unchanged. If the incoming teacher
+  already holds a non-PRIMARY assignment on the session, that assignment
+  is unambiguously promoted in place (avoiding a duplicate-membership
+  conflict) rather than creating a second row. This resolves the gap
+  previously flagged in section L ("No atomic PRIMARY-reassignment
+  operation").
+
+================================================================================
+A. FILES CREATED / MODIFIED
+================================================================================
+
+Created:
+- apps/api/src/teachers/dto/create-teacher.dto.ts
+- apps/api/src/teachers/dto/update-teacher.dto.ts
+- apps/api/src/teachers/teachers.service.ts
+- apps/api/src/teachers/teachers.service.spec.ts
+- apps/api/src/teachers/teachers.controller.ts
+- apps/api/src/teachers/teachers.module.ts
+- apps/api/src/sessions/academic-timezone.util.ts
+- apps/api/src/sessions/academic-timezone.util.spec.ts
+- apps/api/src/sessions/dto/create-session.dto.ts
+- apps/api/src/sessions/dto/update-session.dto.ts
+- apps/api/src/sessions/dto/assign-session-teacher.dto.ts
+- apps/api/src/sessions/dto/update-session-teacher.dto.ts
+- apps/api/src/sessions/dto/reassign-primary-teacher.dto.ts [added in the
+  correction pass — ReassignPrimaryTeacherDto and OutgoingPrimaryAction]
+- apps/api/src/sessions/sessions.service.ts
+- apps/api/src/sessions/sessions.service.spec.ts
+- apps/api/src/sessions/sessions.controller.ts
+- apps/api/src/sessions/sessions.module.ts
+- apps/api/src/teachers-sessions-rbac.http.spec.ts (integration RBAC test
+  spanning both new controllers)
+
+Modified (original Phase 2E pass):
+- apps/api/src/app.module.ts — registered TeachersModule, SessionsModule.
+
+Modified further, in the correction pass:
+- apps/api/src/sessions/sessions.service.ts — added
+  reassignPrimaryTeacher(sessionId, dto): validates session/incoming
+  teacher/exactly-one-PRIMARY/not-already-PRIMARY, then performs the
+  reassignment inside prisma.$transaction.
+- apps/api/src/sessions/sessions.controller.ts — added
+  PATCH :id/primary-teacher (ADMIN only).
+- apps/api/src/sessions/sessions.service.spec.ts — added a
+  reassignPrimaryTeacher describe block (10 tests) and the
+  $transaction/sessionTeacher.findMany mock plumbing needed to support it.
+- apps/api/src/teachers-sessions-rbac.http.spec.ts — added 4 HTTP-level
+  tests for the new route (TEACHER/LEARNER 403, unauthenticated 401,
+  malformed outgoingTeacherAction 400).
+
+No other files were touched. apps/api/prisma/schema.prisma and every
+migration are unchanged from the Phase 2D commit
+(fbe414eef0072404ee5e654cf4acb5df6038f8cb) — including through this
+correction pass.
+
+================================================================================
+B. TEACHER PROVISIONING ARCHITECTURE
+================================================================================
+
+TeachersService.create runs inside prisma.$transaction, creating the User
+(role: RoleName.TEACHER, hardcoded — never read from the request) and its
+TeacherProfile atomically; either both rows exist or neither does. Same
+standards as Phase 2C's AuthService: email normalized via
+trim().toLowerCase() before lookup/storage, password hashed with bcryptjs
+at cost factor 12, a findUnique pre-check plus a P2002-catching fallback
+both collapse to the identical 409 Conflict for a duplicate email (closing
+the same registration race Phase 2C hardened). Every read returns a
+TeacherWithUser shape built from an explicit Prisma select (id, email,
+fullName, role, isActive, createdAt, updatedAt) — passwordHash is never
+included in the query, so it structurally cannot leak. There is NO DELETE
+ENDPOINT: a TeacherProfile may be referenced by Course.primaryTeacherId or
+SessionTeacher at any time, so TeachersService.update supports
+isActive: false as the controlled way to revoke access without destroying
+those references (consistent with Phase 2D's deletion-safety convention).
+email/password are not editable through UpdateTeacherDto in this
+milestone — credential rotation is deliberately out of scope here.
+
+================================================================================
+C. TEACHER ENDPOINTS
+================================================================================
+
+POST   /admin/teachers        ADMIN only        — create User(TEACHER)+TeacherProfile atomically
+GET    /admin/teachers        ADMIN, TEACHER     — list
+GET    /admin/teachers/:id    ADMIN, TEACHER     — read one
+PATCH  /admin/teachers/:id    ADMIN only         — update fullName/bio/isActive
+
+No DELETE route (see section B).
+
+================================================================================
+D. SESSION ENDPOINTS
+================================================================================
+
+POST   /admin/sessions                         ADMIN only
+GET    /admin/sessions                         ADMIN, TEACHER
+GET    /admin/sessions/:id                     ADMIN, TEACHER
+PATCH  /admin/sessions/:id                     ADMIN only (SCHEDULED only — see F)
+POST   /admin/sessions/:id/mark-live           ADMIN only
+POST   /admin/sessions/:id/mark-ended          ADMIN only
+POST   /admin/sessions/:id/cancel              ADMIN only
+GET    /admin/sessions/:id/teachers            ADMIN, TEACHER
+POST   /admin/sessions/:id/teachers            ADMIN only  (assign)
+PATCH  /admin/sessions/:id/teachers/:teacherId ADMIN only  (change role)
+DELETE /admin/sessions/:id/teachers/:teacherId ADMIN only  (unassign)
+PATCH  /admin/sessions/:id/primary-teacher     ADMIN only  (atomic PRIMARY
+                                                reassignment — added in the
+                                                correction pass, see G)
+
+CreateSessionDto requires courseId, sessionDate, startTime, endTime,
+liveMeetingUrl, and accepts optional replacementForSessionId,
+assistantTeacherIds[], substituteTeacherIds[]. attendanceCutoffAt is never
+accepted from the client — CreateSessionDto and UpdateSessionDto both
+carry no such field, and the global ValidationPipe (forbidNonWhitelisted)
+rejects it outright if sent.
+
+================================================================================
+E. SESSIONTEACHER / STAFFING BEHAVIOR
+================================================================================
+
+On creation, the PRIMARY teacher always defaults from
+Course.primaryTeacherId; any requested assistantTeacherIds/
+substituteTeacherIds are validated and attached in the same session.create
+call via nested teachers: { create: [...] }. Every teacher id (including
+the defaulted PRIMARY) is checked: 404 if the TeacherProfile doesn't
+exist, 409 if it exists but its User is inactive or not role TEACHER.
+Duplicate teacher ids across roles in one request are rejected (409)
+before any database write.
+
+Post-creation staffing goes through addTeacher/updateTeacherRole/
+removeTeacher:
+- adding a duplicate assignment is 409
+- adding a second PRIMARY while one exists is 409 ("reassign or remove it
+  first" — never silently replaced)
+- removing the sole PRIMARY is 409
+- demoting the sole PRIMARY to ASSISTANT/SUBSTITUTE is 409
+
+RESOLVED BY THE CORRECTION PASS — atomic PRIMARY reassignment:
+PATCH /admin/sessions/:id/primary-teacher (ADMIN only) reassigns PRIMARY
+in one prisma.$transaction. Request body: { incomingTeacherId,
+outgoingTeacherAction }, where outgoingTeacherAction is explicitly one of
+BECOME_ASSISTANT, BECOME_SUBSTITUTE, or REMOVE — the outgoing teacher's
+new state is never inferred. Preconditions, each independently checked
+before the transaction opens: the session exists (404); the incoming
+TeacherProfile exists (404) and belongs to an active TEACHER account
+(409); the session currently has exactly one PRIMARY (409 otherwise); the
+incoming teacher is not already the PRIMARY (409). Inside the transaction,
+the outgoing teacher is updated to their new role or deleted from the
+session first, then the incoming teacher is promoted — updated in place if
+they already hold a non-PRIMARY assignment on the session (unambiguous,
+avoids a duplicate-membership conflict), or given a fresh PRIMARY row
+otherwise. Because both halves commit together, no caller can ever observe
+an intermediate zero- or two-PRIMARY state, and a failure partway through
+(verified by test — see section I) leaves the original staffing completely
+unchanged.
+
+================================================================================
+F. SESSION LIFECYCLE BEHAVIOR
+================================================================================
+
+SCHEDULED -> LIVE -> ENDED and SCHEDULED -> CANCELED / LIVE -> CANCELED are
+the only permitted transitions, each its own dedicated endpoint (markLive,
+markEnded, cancel) rather than an arbitrary status field — UpdateSessionDto
+carries no status. Any other requested transition (e.g. ENDED directly
+from SCHEDULED, canceling an already-ENDED/CANCELED session) is rejected
+with 409. cancel sets canceledAt = new Date(). PATCH /admin/sessions/:id
+(schedule edits) is only permitted while status === SCHEDULED; once
+LIVE/ENDED/CANCELED it's rejected with 409 — the schedule becomes part of
+the historical record. No entitlement-snapshot or attendance-record
+generation was implemented, per the brief.
+
+================================================================================
+G. REPLACEMENT-SESSION BEHAVIOR
+================================================================================
+
+A replacement is created by passing replacementForSessionId on
+CreateSessionDto (a normal Session create — no separate endpoint). The
+service validates the target exists (404), is CANCELED (409 otherwise),
+and walks the target's replacementForSessionId ancestry chain with a
+visited-set to reject a cycle (409) defensively — in practice a cycle
+can't form through this API since replacementForSessionId is set only at
+creation and never mutated afterward, but a corrupted chain is still
+rejected rather than silently accepted. "At most one direct replacement"
+is enforced by the EXISTING DB-LEVEL UNIQUE CONSTRAINT on
+Session.replacementForSessionId (frozen schema, unchanged) — a second
+attempt to replace the same target throws Prisma's P2002, caught and
+translated to 409 Conflict. Entitlement copying is explicitly out of
+scope and was not implemented.
+
+================================================================================
+H. VALIDATION / SECURITY RULES
+================================================================================
+
+Every controller uses @UseGuards(JwtAuthGuard, RolesGuard) + @Roles(...),
+matching Phase 2D's convention exactly: ADMIN-only for all mutations
+(teacher provisioning/update, session create/update/lifecycle/staffing),
+ADMIN+TEACHER for reads, LEARNER excluded from everything in this
+milestone. Error-code convention preserved: malformed UUID -> 400
+(@IsUUID()/ParseUUIDPipe), valid UUID pointing to a missing entity -> 404,
+business/uniqueness conflicts -> 409, unauthenticated -> 401, wrong role
+-> 403. passwordHash cannot reach any response — both TeachersService and
+SessionsService build their response shapes from explicit Prisma selects
+that never include it, and no User internals beyond
+id/email/fullName/role/isActive/createdAt/updatedAt are ever exposed.
+
+================================================================================
+I. TESTS ADDED AND EXACT RESULTS
+================================================================================
+
+Test Suites: 12 passed, 12 total
+Tests:       140 passed, 140 total
+
+(126 from the original Phase 2E pass + 14 new in the correction pass: 10
+SessionsService reassignPrimaryTeacher tests + 4 HTTP-level RBAC tests for
+the new route. Original-pass breakdown unchanged: 69 from Phase 2D's
+baseline + 57 from Phase 2E's first pass — 4 timezone-util tests, 9
+TeachersService tests, 33 SessionsService tests covering create/update/
+lifecycle/replacement/staffing, and 11 RBAC/integration tests in
+teachers-sessions-rbac.http.spec.ts.)
+
+Coverage against the brief's required test list:
+
+Teacher provisioning
+  - ADMIN creates TEACHER User + TeacherProfile atomically     PASS
+  - created User role is TEACHER                                PASS
+  - password is hashed                                          PASS
+  - passwordHash never serialized                                PASS
+  - duplicate email -> 409 (pre-check + database-race path)     PASS
+  - non-ADMIN cannot provision teacher (403, TEACHER & LEARNER) PASS
+
+Session creation
+  - ADMIN can create a valid session                             PASS
+  - TEACHER cannot create session (403)                          PASS
+  - LEARNER cannot create session (403)                          PASS
+  - unauthenticated rejected (401)                                PASS
+  - missing course -> 404                                        PASS
+  - malformed courseId -> 400                                    PASS
+  - startTime >= endTime rejected                                 PASS
+  - attendance cutoff correctly derived for Africa/Johannesburg   PASS
+  - PRIMARY teacher defaults from Course                           PASS
+
+Staffing
+  - exactly one PRIMARY after creation                            PASS
+  - assistant can be added                                        PASS
+  - substitute can be added                                       PASS
+  - missing teacher -> 404                                        PASS
+  - inactive teacher rejected -> 409                              PASS
+  - duplicate teacher assignment rejected                         PASS
+  - second PRIMARY rejected                                       PASS
+  - removing/reassigning PRIMARY cannot leave zero PRIMARY         PASS
+
+Lifecycle
+  - SCHEDULED -> LIVE allowed                                     PASS
+  - LIVE -> ENDED allowed                                         PASS
+  - SCHEDULED -> CANCELED allowed                                 PASS
+  - LIVE -> CANCELED allowed                                      PASS
+  - invalid status transition rejected                            PASS
+  - canceledAt set on cancellation                                 PASS
+
+Replacement
+  - replacement links to canceled original                        PASS
+  - cannot replace non-canceled session                            PASS
+  - cannot create second direct replacement (DB unique constraint) PASS
+  - replacement loop rejected                                     PASS
+
+Primary-teacher reassignment [NEW, correction pass]
+  - PRIMARY -> new PRIMARY, old teacher becomes ASSISTANT           PASS
+  - PRIMARY -> new PRIMARY, old teacher becomes SUBSTITUTE           PASS
+  - PRIMARY -> new PRIMARY, old teacher removed from session         PASS
+  - incoming teacher already assigned (non-PRIMARY) is unambiguously
+    promoted in place, not duplicated                                PASS
+  - incoming teacher missing -> 404                                 PASS
+  - incoming teacher inactive -> 409                                 PASS
+  - session without exactly one PRIMARY -> 409                      PASS
+  - incoming teacher already PRIMARY -> 409                          PASS
+  - transaction failure leaves original staffing unchanged           PASS
+  - final staffing always contains exactly one PRIMARY                PASS
+  - non-ADMIN (TEACHER, LEARNER) rejected -> 403                     PASS
+  - unauthenticated rejected -> 401                                  PASS
+  - malformed outgoingTeacherAction -> 400                            PASS
+
+================================================================================
+J. COMMANDS RUN AND EXACT RESULTS
+================================================================================
+
+Original Phase 2E pass results are unchanged and not repeated in full
+here. This section reports the correction pass's own verification run.
+
+  pnpm run typecheck
+    -> tsc --noEmit: clean, no errors
+
+  pnpm exec eslint .
+    -> 0 problems (run directly; root `pnpm run lint` still hits the
+       pre-existing Turbo `spawn UNKNOWN` issue — unrelated to this
+       milestone, see section L)
+
+  pnpm run test
+    -> Test Suites: 12 passed, 12 total
+       Tests:       140 passed, 140 total
+
+  pnpm run build
+    -> nest build: clean, exit 0
+
+  pnpm exec prisma validate
+    -> "The schema at prisma\schema.prisma is valid" — confirms this
+       correction introduced no schema drift
+
+Two issues surfaced and fixed during the original pass's test-writing,
+both test-infrastructure fixes, no production-behavior change (unchanged
+by this correction pass):
+1. Three "Unsafe member access" lint errors from indexing
+   jest.Mock.mock.calls[0] directly — fixed by introducing a small typed
+   helper (lastSessionCreateArgs()).
+2. The RBAC integration spec's fake Prisma initially lacked $transaction/
+   teacherProfile.findMany and, once added, initially leaked the raw
+   passwordHash through a fake that ignored Prisma's `select` shape —
+   fixed by making the fake mirror the real query's field selection.
+
+================================================================================
+K. SCHEMA CHANGES / DEVIATIONS
+================================================================================
+
+No Phase 2E database schema changes were required — including through the
+correction pass.
+
+apps/api/prisma/schema.prisma and every migration are unchanged from
+Phase 2D. All provisioning, staffing, and scheduling logic, including the
+correction pass's atomic PRIMARY-reassignment operation, was implemented
+entirely against the existing frozen User, TeacherProfile, Course,
+Session, SessionTeacher, and AcademicTerm models — including relying on
+the schema's existing unique constraint on Session.replacementForSessionId
+to enforce "at most one direct replacement" rather than adding new
+validation machinery for it. The reassignment operation itself required
+no new column, table, or constraint — it is composed entirely from
+existing SessionTeacher reads/writes inside a transaction.
+
+================================================================================
+L. WARNINGS / UNRESOLVED ISSUES
+================================================================================
+
+1. [RESOLVED by the correction pass] No atomic PRIMARY-reassignment
+   operation. PATCH /admin/sessions/:id/primary-teacher now provides this,
+   with the outgoing teacher's new state always explicit (never inferred)
+   and the whole operation atomic. No further ambiguity remains on this
+   point.
+
+2. Business-rule status-code judgment calls, consistent with Phase 2D's
+   own resolved precedent: sessionDate/academic-term-range validation
+   failures use 400 (business input validation, like Phase 2D's
+   AcademicTerm date-range check) rather than 409; a teacher that exists
+   but is inactive uses 409 (state conflict) distinct from a teacher that
+   doesn't exist at all (404) — mirroring the Phase 2D 400-vs-404
+   correction's underlying principle.
+
+3. startTime/endTime are trusted as absolute instants (new Date(iso)); the
+   DTO requires ISO 8601 but doesn't enforce a Z/offset suffix — a client
+   omitting one would have it interpreted per JS's ISO-parsing rules (UTC
+   for date-only, but time-with-no-offset strings are also treated as UTC
+   per the ECMAScript spec, so this is safe in practice, but worth calling
+   out as an assumption).
+
+4. The pre-existing Turbo `spawn UNKNOWN` issue remains unchanged and
+   unrelated to this milestone.
+
+5. No pagination on any findAll, consistent with the same known gap
+   already flagged in the Phase 2D report.
+
+No new founder-decision-required blockers were identified while
+implementing this correction.
+
+================================================================================
+M. EXACT GIT STATUS
+================================================================================
+
+$ git status
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   apps/api/src/app.module.ts
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	apps/api/src/sessions/
+	apps/api/src/teachers-sessions-rbac.http.spec.ts
+	apps/api/src/teachers/
+	docs/phase-2e-implementation-report.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+
+$ git diff --stat
+ apps/api/src/app.module.ts | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+(reassign-primary-teacher.dto.ts and the correction-pass edits to
+sessions.service.ts, sessions.controller.ts, sessions.service.spec.ts and
+teachers-sessions-rbac.http.spec.ts are all inside the still-untracked
+apps/api/src/sessions/ and apps/api/src/teachers-sessions-rbac.http.spec.ts
+entries above, so they do not appear as separate "modified" lines — they
+were never committed in the first place.)
+
+No commit, tag, or push has been made. Phase 2E, including this correction
+pass, remains fully local, uncommitted, and ready for final external
+review.
+
+================================================================================
+END OF REPORT
+================================================================================
