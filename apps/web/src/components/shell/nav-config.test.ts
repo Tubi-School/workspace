@@ -19,9 +19,9 @@ describe('NAV_BY_ROLE (RBAC navigation)', () => {
     expect(hrefs.some((href) => href.startsWith('/admin'))).toBe(false);
   });
 
-  it('gives LEARNER only their own session-centric navigation', () => {
+  it('gives LEARNER only their own session-centric and commercial navigation', () => {
     const hrefs = NAV_BY_ROLE.LEARNER.map((item) => item.href);
-    expect(hrefs).toEqual(['/learner']);
+    expect(hrefs).toEqual(['/learner', '/learner/subscription']);
     expect(hrefs.some((href) => href.startsWith('/admin') || href.startsWith('/teacher'))).toBe(
       false,
     );

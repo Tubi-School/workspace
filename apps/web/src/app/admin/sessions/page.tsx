@@ -29,7 +29,9 @@ export default function SessionsPage() {
       sessionDate,
       startTime: new Date(startTime).toISOString(),
       endTime: new Date(endTime).toISOString(),
-      liveMeetingUrl: liveMeetingUrl.trim(),
+      // Leave unset unless an ADMIN explicitly overrides it — automatic
+      // Zoom meeting provisioning fills this in (section E).
+      ...(liveMeetingUrl.trim() ? { liveMeetingUrl: liveMeetingUrl.trim() } : {}),
     });
     setCourseId('');
     setSessionDate('');
@@ -41,7 +43,7 @@ export default function SessionsPage() {
 
   function handleSubmit(event: FormEvent) {
     event.preventDefault();
-    if (!courseId || !sessionDate || !startTime || !endTime || !liveMeetingUrl.trim()) return;
+    if (!courseId || !sessionDate || !startTime || !endTime) return;
     void createAction.run();
   }
 
@@ -108,13 +110,13 @@ export default function SessionsPage() {
               />
             </Field>
             <div className="sm:col-span-2">
-              <Field label="Live meeting URL">
+              <Field label="Live meeting URL (optional — leave blank to auto-provision via Zoom)">
                 <TextInput
                   type="url"
                   value={liveMeetingUrl}
                   onChange={(e) => setLiveMeetingUrl(e.target.value)}
                   disabled={createAction.isSubmitting}
-                  placeholder="https://…"
+                  placeholder="Leave blank for automatic provisioning"
                 />
               </Field>
             </div>

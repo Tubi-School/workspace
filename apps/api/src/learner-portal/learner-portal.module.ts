@@ -8,5 +8,6 @@ import { LearnerPortalService } from './learner-portal.service.js';
   imports: [AttendanceModule],
   controllers: [LearnerPortalController],
   providers: [LearnerPortalService],
+  exports: [LearnerPortalService],
 })
 export class LearnerPortalModule {}

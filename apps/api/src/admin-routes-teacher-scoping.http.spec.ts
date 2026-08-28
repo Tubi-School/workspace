@@ -13,7 +13,9 @@ import { CoursesController } from './courses/courses.controller.js';
 import { CoursesService } from './courses/courses.service.js';
 import { EntitlementService } from './entitlements/entitlement.service.js';
 import { RoleName, type TeacherProfile, type User } from './generated/prisma/client.js';
+import { NotificationsService } from './notifications/notifications.service.js';
 import { PrismaService } from './prisma/prisma.service.js';
+import { MeetingProvisioningService } from './sessions/meeting-provisioning.service.js';
 import { SessionsController } from './sessions/sessions.controller.js';
 import { SessionsService } from './sessions/sessions.service.js';
 import { TeacherPortalController } from './teacher-portal/teacher-portal.controller.js';
@@ -130,12 +132,25 @@ describe('Admin resource routes are ADMIN-only; teacher reads go through /teache
         JwtStrategy,
         { provide: PrismaService, useValue: fakePrisma },
         { provide: ConfigService, useValue: fakeConfigService },
-        // SessionsService's constructor requires EntitlementService, but
-        // findAll/findOne (the only methods this test exercises) never
-        // call it — a bare stub is enough.
+        // SessionsService's constructor requires EntitlementService and
+        // MeetingProvisioningService, but findAll/findOne (the only
+        // methods this test exercises) never call either — bare stubs are
+        // enough.
         {
           provide: EntitlementService,
           useValue: { evaluateForSession: jest.fn(), inheritForReplacement: jest.fn() },
+        },
+        {
+          provide: MeetingProvisioningService,
+          useValue: { provisionForSession: jest.fn(), releaseForCanceledSession: jest.fn() },
+        },
+        {
+          provide: NotificationsService,
+          useValue: {
+            enqueue: jest.fn(),
+            enqueueForEntitledLearners: jest.fn(),
+            enqueueForAssignedTeachers: jest.fn(),
+          },
         },
       ],
     }).compile();

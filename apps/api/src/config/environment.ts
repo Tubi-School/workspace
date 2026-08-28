@@ -36,6 +36,40 @@ export const environmentSchema = z.object({
 
   /** Passed straight to `jsonwebtoken` as the `expiresIn` option. */
   JWT_EXPIRES_IN: z.string().default('1d'),
+
+  // --- Phase 4: Zoom (live classroom provider) --------------------------
+  // All optional. Missing credentials mean the Zoom integration runs in an
+  // explicit "unconfigured" state (meeting provisioning fails closed with a
+  // readable error; the webhook endpoint rejects everything) rather than
+  // fabricating provider behavior — see MeetingProvisioningService and
+  // ZoomWebhooksController.
+  ZOOM_ACCOUNT_ID: z.string().optional(),
+  ZOOM_CLIENT_ID: z.string().optional(),
+  ZOOM_CLIENT_SECRET: z.string().optional(),
+  /** Verifies the `x-zm-signature` header on inbound Zoom webhooks. */
+  ZOOM_WEBHOOK_SECRET_TOKEN: z.string().optional(),
+
+  // --- Phase 4: payment provider (commercial layer) ----------------------
+  // Paystack is the conventional choice for a South African ZAR launch
+  // (native ZAR support, hosted checkout, HMAC-signed webhooks). Optional —
+  // absence puts checkout initialization into an explicit
+  // "payments unconfigured" 503 rather than faking a successful payment.
+  PAYSTACK_SECRET_KEY: z.string().optional(),
+  PAYMENTS_CALLBACK_URL: z.string().optional(),
+
+  // --- Phase 4: essential notifications (email) --------------------------
+  // Optional SMTP transport. Missing configuration leaves every enqueued
+  // notification permanently visible as FAILED with a readable reason,
+  // never silently dropped and never blocking the school-domain operation
+  // that enqueued it (section N/O).
+  SMTP_HOST: z.string().optional(),
+  SMTP_PORT: z.coerce.number().int().min(1).max(65_535).optional(),
+  SMTP_USER: z.string().optional(),
+  SMTP_PASSWORD: z.string().optional(),
+  SMTP_FROM_ADDRESS: z.string().optional(),
+
+  /** Minutes before a session's scheduled start that its reminder fires. */
+  SESSION_REMINDER_LOOKAHEAD_MINUTES: z.coerce.number().int().min(1).default(60),
 });
 
 export type RawEnvironment = z.infer<typeof environmentSchema>;

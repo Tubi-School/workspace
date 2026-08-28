@@ -1,6 +1,8 @@
 import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
 
 import type { EntitlementService } from '../entitlements/entitlement.service.js';
+import type { NotificationsService } from '../notifications/notifications.service.js';
+import type { MeetingProvisioningService } from './meeting-provisioning.service.js';
 import { Prisma, RoleName, SessionStatus, TeacherRole } from '../generated/prisma/client.js';
 import type { PrismaService } from '../prisma/prisma.service.js';
 import { OutgoingPrimaryAction } from './dto/reassign-primary-teacher.dto.js';
@@ -40,6 +42,7 @@ function buildSession(overrides: Record<string, unknown> = {}) {
   return {
     id: 'session-1',
     courseId: COURSE_ID,
+    course: { id: COURSE_ID, title: 'Test Course' },
     sessionDate: new Date('2026-07-01'),
     startTime: new Date('2026-07-01T11:00:00Z'),
     endTime: new Date('2026-07-01T12:00:00Z'),
@@ -69,6 +72,15 @@ describe('SessionsService', () => {
     $transaction: jest.Mock;
   };
   let entitlementService: { evaluateForSession: jest.Mock; inheritForReplacement: jest.Mock };
+  let meetingProvisioningService: {
+    provisionForSession: jest.Mock;
+    releaseForCanceledSession: jest.Mock;
+  };
+  let notifications: {
+    enqueue: jest.Mock;
+    enqueueForEntitledLearners: jest.Mock;
+    enqueueForAssignedTeachers: jest.Mock;
+  };
   let service: SessionsService;
 
   function lastSessionCreateArgs(): SessionCreateCallArgs {
@@ -111,9 +123,20 @@ describe('SessionsService', () => {
       evaluateForSession: jest.fn().mockResolvedValue(undefined),
       inheritForReplacement: jest.fn().mockResolvedValue(undefined),
     };
+    meetingProvisioningService = {
+      provisionForSession: jest.fn().mockResolvedValue(undefined),
+      releaseForCanceledSession: jest.fn().mockResolvedValue(undefined),
+    };
+    notifications = {
+      enqueue: jest.fn().mockResolvedValue(undefined),
+      enqueueForEntitledLearners: jest.fn().mockResolvedValue(undefined),
+      enqueueForAssignedTeachers: jest.fn().mockResolvedValue(undefined),
+    };
     service = new SessionsService(
       prisma as unknown as PrismaService,
       entitlementService as unknown as EntitlementService,
+      meetingProvisioningService as unknown as MeetingProvisioningService,
+      notifications as unknown as NotificationsService,
     );
   });
 

@@ -27,7 +27,52 @@ export class SubscriptionAccessService {
   constructor(private readonly prisma: PrismaService) {}
 
   async create(dto: CreateSubscriptionAccessDto): Promise<SubscriptionAccess> {
-    const learner = await this.prisma.learnerProfile.findUnique({
+    const validated = await this.validateGrantInputs(this.prisma, dto);
+
+    // The overlap pre-check and the create must be indivisible from the
+    // perspective of any other concurrent grant request for the same
+    // (learnerId, offeringId) pair — otherwise two simultaneous requests
+    // can each pass the pre-check before either commits, producing two
+    // conflicting ACTIVE grants (the concurrency gap flagged in the
+    // Phase 2F review, closed here per Phase 2G Correction A). A
+    // Postgres advisory lock, held for one transaction, serializes only
+    // requests that collide on this exact learner+offering pair —
+    // unrelated grants never contend.
+    return withAdvisoryLock(
+      this.prisma,
+      `subscription-access:${dto.learnerId}:${dto.offeringId}`,
+      (tx) => this.createLocked(tx, validated),
+    );
+  }
+
+  /**
+   * For a caller (`PaymentsService.confirmPayment`) that already holds an
+   * open transaction and has ALREADY acquired the exact same advisory lock
+   * (`subscription-access:{learnerId}:{offeringId}`) within it — reuses
+   * this service's own validation and overlap-check rather than
+   * duplicating it, without opening a second, nested transaction/lock of
+   * its own (Prisma transaction clients cannot be nested). The caller is
+   * responsible for the lock; this method only assumes it is already held.
+   */
+  async createWithinExistingLock(
+    tx: Prisma.TransactionClient,
+    dto: CreateSubscriptionAccessDto,
+  ): Promise<SubscriptionAccess> {
+    const validated = await this.validateGrantInputs(tx, dto);
+    return this.createLocked(tx, validated);
+  }
+
+  private async validateGrantInputs(
+    db: Db,
+    dto: CreateSubscriptionAccessDto,
+  ): Promise<{
+    learnerId: string;
+    offeringId: string;
+    status: SubscriptionStatus;
+    currentPeriodStart: Date;
+    currentPeriodEnd: Date;
+  }> {
+    const learner = await db.learnerProfile.findUnique({
       where: { id: dto.learnerId },
       include: { user: true },
     });
@@ -43,7 +88,7 @@ export class SubscriptionAccessService {
       throw new ConflictException(`User ${learner.user.id} is not a LEARNER`);
     }
 
-    const offering = await this.prisma.offering.findUnique({ where: { id: dto.offeringId } });
+    const offering = await db.offering.findUnique({ where: { id: dto.offeringId } });
 
     if (!offering) {
       throw new NotFoundException(`Offering ${dto.offeringId} not found`);
@@ -53,43 +98,45 @@ export class SubscriptionAccessService {
     const currentPeriodEnd = new Date(dto.currentPeriodEnd);
     this.assertValidWindow(currentPeriodStart, currentPeriodEnd);
 
-    const status = dto.status ?? SubscriptionStatus.ACTIVE;
+    return {
+      learnerId: dto.learnerId,
+      offeringId: dto.offeringId,
+      status: dto.status ?? SubscriptionStatus.ACTIVE,
+      currentPeriodStart,
+      currentPeriodEnd,
+    };
+  }
 
-    // The overlap pre-check and the create must be indivisible from the
-    // perspective of any other concurrent grant request for the same
-    // (learnerId, offeringId) pair — otherwise two simultaneous requests
-    // can each pass the pre-check before either commits, producing two
-    // conflicting ACTIVE grants (the concurrency gap flagged in the
-    // Phase 2F review, closed here per Phase 2G Correction A). A
-    // Postgres advisory lock, held for one transaction, serializes only
-    // requests that collide on this exact learner+offering pair —
-    // unrelated grants never contend.
-    return withAdvisoryLock(
-      this.prisma,
-      `subscription-access:${dto.learnerId}:${dto.offeringId}`,
-      async (tx) => {
-        if (status === SubscriptionStatus.ACTIVE) {
-          await this.assertNoOverlappingActiveGrant(
-            dto.learnerId,
-            dto.offeringId,
-            currentPeriodStart,
-            currentPeriodEnd,
-            undefined,
-            tx,
-          );
-        }
+  private async createLocked(
+    tx: Prisma.TransactionClient,
+    validated: {
+      learnerId: string;
+      offeringId: string;
+      status: SubscriptionStatus;
+      currentPeriodStart: Date;
+      currentPeriodEnd: Date;
+    },
+  ): Promise<SubscriptionAccess> {
+    if (validated.status === SubscriptionStatus.ACTIVE) {
+      await this.assertNoOverlappingActiveGrant(
+        validated.learnerId,
+        validated.offeringId,
+        validated.currentPeriodStart,
+        validated.currentPeriodEnd,
+        undefined,
+        tx,
+      );
+    }
 
-        return tx.subscriptionAccess.create({
-          data: {
-            learnerId: dto.learnerId,
-            offeringId: dto.offeringId,
-            status,
-            currentPeriodStart,
-            currentPeriodEnd,
-          },
-        });
+    return tx.subscriptionAccess.create({
+      data: {
+        learnerId: validated.learnerId,
+        offeringId: validated.offeringId,
+        status: validated.status,
+        currentPeriodStart: validated.currentPeriodStart,
+        currentPeriodEnd: validated.currentPeriodEnd,
       },
-    );
+    });
   }
 
   findAll(): Promise<SubscriptionAccess[]> {

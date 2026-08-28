@@ -131,6 +131,37 @@ describe('SubscriptionAccessService', () => {
     });
   });
 
+  describe('createWithinExistingLock', () => {
+    it('reuses the same validation and overlap-check as create(), against the caller-supplied tx', async () => {
+      prisma.subscriptionAccess.findFirst.mockResolvedValue(null);
+      prisma.subscriptionAccess.create.mockResolvedValue({ id: 'grant-1', ...validDto });
+
+      const result = await service.createWithinExistingLock(prisma as never, validDto);
+
+      expect(result).toEqual({ id: 'grant-1', ...validDto });
+      expect(prisma.subscriptionAccess.findFirst).toHaveBeenCalled();
+      // Never opens its own transaction/lock — the caller (PaymentsService)
+      // already holds one.
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('still rejects an overlapping ACTIVE grant', async () => {
+      prisma.subscriptionAccess.findFirst.mockResolvedValue({ id: 'existing-grant' });
+
+      await expect(
+        service.createWithinExistingLock(prisma as never, validDto),
+      ).rejects.toBeInstanceOf(ConflictException);
+    });
+
+    it('still rejects a non-existent learner', async () => {
+      prisma.learnerProfile.findUnique.mockResolvedValue(null);
+
+      await expect(
+        service.createWithinExistingLock(prisma as never, validDto),
+      ).rejects.toBeInstanceOf(NotFoundException);
+    });
+  });
+
   describe('revoke', () => {
     it('moves an ACTIVE grant to CANCELED', async () => {
       prisma.subscriptionAccess.findUnique.mockResolvedValue({

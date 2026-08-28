@@ -20,6 +20,7 @@ export const NAV_BY_ROLE: Record<RoleName, NavItem[]> = {
     { href: '/admin/teachers', label: 'Teachers' },
     { href: '/admin/learners', label: 'Learners' },
     { href: '/admin/subscription-access', label: 'Subscription Access' },
+    { href: '/admin/payments', label: 'Payments' },
     { href: '/admin/academic-terms', label: 'Academic Terms' },
     { href: '/admin/subjects', label: 'Subjects' },
     { href: '/admin/grade-levels', label: 'Grade Levels' },
@@ -28,7 +29,10 @@ export const NAV_BY_ROLE: Record<RoleName, NavItem[]> = {
     { href: '/teacher', label: 'Overview' },
     { href: '/teacher/sessions', label: 'My Sessions' },
   ],
-  LEARNER: [{ href: '/learner', label: 'My Sessions' }],
+  LEARNER: [
+    { href: '/learner', label: 'My Sessions' },
+    { href: '/learner/subscription', label: 'Subscription' },
+  ],
 };
 
 export function homeRouteForRole(role: RoleName): string {

@@ -79,15 +79,16 @@ describe('LearnerSessionDetailPage — DeliveryMode UI enforcement', () => {
     expect(screen.getByText(/not included in your current plan/i)).toBeInTheDocument();
   });
 
-  it('shows the recording section only when the backend has published one', async () => {
+  it('opens a Zoom-ingested recording externally rather than embedding it (Zoom cannot report progress back)', async () => {
     getSessionMock.mockResolvedValue(
       buildSession({
         recording: {
           id: 'rec-1',
           sessionId: 'session-1',
-          recordingUrl: 'https://cdn.example.com/rec.mp4',
+          recordingUrl: 'https://zoom.us/rec/share/rec-1',
           availableFrom: '2026-07-01T13:00:00Z',
           totalSeconds: 3600,
+          provider: 'ZOOM',
         },
       }),
     );
@@ -97,6 +98,31 @@ describe('LearnerSessionDetailPage — DeliveryMode UI enforcement', () => {
 
     expect(await screen.findByRole('link', { name: /open recording/i })).toHaveAttribute(
       'href',
+      'https://zoom.us/rec/share/rec-1',
+    );
+  });
+
+  it('embeds the real player for a manually-published, directly playable recording (no provider)', async () => {
+    getSessionMock.mockResolvedValue(
+      buildSession({
+        recording: {
+          id: 'rec-1',
+          sessionId: 'session-1',
+          recordingUrl: 'https://cdn.example.com/rec.mp4',
+          availableFrom: '2026-07-01T13:00:00Z',
+          totalSeconds: 3600,
+          provider: null,
+        },
+      }),
+    );
+    getAttendanceMock.mockResolvedValue(buildAttendance());
+
+    const { container } = render(<LearnerSessionDetailPage />);
+
+    await screen.findByText('Algebra I');
+    expect(screen.queryByRole('link', { name: /open recording/i })).not.toBeInTheDocument();
+    expect(container.querySelector('video')).toHaveAttribute(
+      'src',
       'https://cdn.example.com/rec.mp4',
     );
   });

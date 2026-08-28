@@ -18,8 +18,15 @@ export class CreateSessionDto {
   @IsISO8601()
   endTime!: string;
 
+  /** Optional as of Phase 4 — normal production operation leaves this
+   * unset and relies on automatic Zoom meeting provisioning
+   * (MeetingProvisioningService) to populate it. Supplying a value here is
+   * still accepted as a manual fallback (e.g. local dev with no Zoom
+   * credentials, or a provider outage an ADMIN is working around), and
+   * automatic provisioning will still attempt to run afterwards. */
+  @IsOptional()
   @IsUrl({ require_tld: false }, { message: 'liveMeetingUrl must be a valid URL' })
-  liveMeetingUrl!: string;
+  liveMeetingUrl?: string;
 
   /** Links this session as the replacement for a CANCELED session. Optional
    * — most sessions are not replacements. */

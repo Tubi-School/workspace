@@ -1,7 +1,8 @@
-import { ConflictException, Injectable, UnauthorizedException } from '@nestjs/common';
+import { ConflictException, Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcryptjs';
 
+import { NotificationsService } from '../notifications/notifications.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { Prisma, RoleName, type User } from '../generated/prisma/client.js';
 import type { LoginDto } from './dto/login.dto.js';
@@ -37,9 +38,12 @@ function normalizeEmail(email: string): string {
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
+    private readonly notifications: NotificationsService,
   ) {}
 
   /**
@@ -93,6 +97,22 @@ export class AuthService {
         throw new ConflictException(DUPLICATE_EMAIL_MESSAGE);
       }
       throw error;
+    }
+
+    // Best-effort — a notification-enqueue failure must never fail
+    // registration itself (section N/O; Phase 4 external review
+    // Correction 8 — the account was already committed above, so an
+    // un-caught throw here would have reported registration as failed to
+    // the caller despite it having genuinely succeeded). enqueue() only
+    // ever writes one outbox row; delivery/retry is handled entirely by
+    // NotificationDispatchScheduler.
+    try {
+      await this.notifications.enqueue('ACCOUNT_REGISTERED', user.id, { fullName: user.fullName });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      this.logger.warn(
+        `Failed to enqueue ACCOUNT_REGISTERED notification for user ${user.id}: ${message}`,
+      );
     }
 
     return sanitizeUser(user);

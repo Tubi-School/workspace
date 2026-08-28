@@ -1,0 +1,1721 @@
+================================================================================
+TUBI WORKSPACE — PHASE 4: SCHOOL LAUNCH CORE
+ACCELERATED COMBINED MILESTONE — EXTERNAL REVIEW HANDOFF
+================================================================================
+
+Status: COMPLETE for every non-blocked workstream, INCLUDING the five
+pre-commit corrections from the first external review pass (section AA),
+the ten further findings from a second, independent adversarial review
+pass (section AB), and two final post-op corrections from a third review
+pass (section AD). NOT committed, tagged, or pushed — left local for a
+fourth (final) external review gate, per the founder's explicit
+instruction.
+
+Baseline before this milestone (Phase 3, tag v0.3.0-phase3-production-frontend):
+  backend:  286/286 tests (30 suites)
+  frontend: 46/46 tests (11 files)
+
+Baseline after the original Phase 4 implementation (first review pass):
+  backend:  370/370 tests (44 suites)
+  frontend: 60/60 tests (15 files)
+
+Baseline after the five pre-commit corrections (second review pass, AA):
+  backend:  391/391 tests (44 suites)
+  frontend: 63/63 tests (15 files)
+
+Baseline after the ten further corrections (third pass, AB):
+  backend:  412/412 tests (44 suites)
+  frontend:  65/65 tests (15 files)
+
+Current — after the two final post-op corrections (fourth pass, AD):
+  backend:  414/414 tests (44 suites)   — net +128 tests vs. Phase 3, +2 vs. AB
+  frontend:  68/68 tests (15 files)     — net +22 tests vs. Phase 3, +3 vs. AB
+
+No regression in either suite at any point. Full verification detail:
+section AE (supersedes sections V and AC's earlier snapshots). Full
+account of the five corrections: section AA. Full account of the ten
+further corrections: section AB. Full account of the two final post-op
+corrections: section AD.
+
+
+--------------------------------------------------------------------------------
+A. SCOPE COMPLETED
+--------------------------------------------------------------------------------
+
+Workstream A — Live Classroom & Recording Automation
+  - Zoom provider boundary (create/delete meeting, webhook signature
+    verification, URL-validation handshake).
+  - Automated, idempotent, retry-safe meeting provisioning on Session
+    creation; manual ADMIN retry endpoint; best-effort release on
+    cancellation.
+  - Zoom webhook ingestion: participant join/leave -> existing (frozen,
+    unmodified) LiveAttendanceIntervalService; recording.completed ->
+    existing (frozen) RecordingService via a new provider-aware publish
+    path.
+  - Webhook signature verification + replay/duplicate protection via a
+    shared ProviderWebhookEvent idempotency ledger.
+  - Teacher "Join/Start class" action wired to the real, auto-provisioned
+    liveMeetingUrl.
+  - Learner "Join live class" unchanged in mechanism (still fail-closed,
+    backend-redacted liveMeetingUrl) — now populated automatically instead
+    of admin-typed.
+  - Recording playback: a real HTML5 `<video>` player with batched,
+    seek-safe watched-interval reporting for directly-hosted recordings;
+    Zoom-ingested recordings (Zoom's own hosted playback page, which
+    cannot report progress back into TUBI) continue to open externally.
+    See section X for why this is a genuine, disclosed limitation rather
+    than a fabricated capability.
+
+Workstream B — Commercial Subscription & Payment Foundation
+  - New PaymentOrder model upstream of SubscriptionAccess (never
+    contaminating it with payment internals).
+  - Paystack provider boundary (ZAR, integer minor units, hosted checkout,
+    HMAC-SHA512 webhook verification) — the conventional choice for a South
+    African launch.
+  - Checkout initiation (learner-facing) and verified-webhook-only access
+    activation, reusing the existing (frozen, Phase 2G) concurrency-safe
+    SubscriptionAccessService.create for the grant itself.
+  - Admin payments launch-console (read-only).
+  - Learner-facing offering discovery (`GET /learner/offerings`) and
+    subscription/checkout page.
+
+Workstream C — Learner Onboarding / Access Activation
+  - Public registration frontend page (backend registration already
+    existed and already enforced LEARNER-only role assignment).
+  - Login page links to registration; registration logs the new learner in
+    and routes them to their home workspace.
+
+Workstream D — Essential School Notifications
+  - NotificationOutboxItem-backed outbox + NotificationsService (single
+    enqueue seam) + NotificationDispatchScheduler (retry with a bounded
+    attempt count, permanent-failure marking) + EmailProviderService (SMTP,
+    explicit "unconfigured" state).
+  - Events wired: ACCOUNT_REGISTERED, PAYMENT_CONFIRMED (via
+    SubscriptionAccess creation — see note in section L), SESSION_REMINDER
+    (scheduled), SESSION_CANCELED, SESSION_REPLACEMENT, RECORDING_AVAILABLE.
+  - SessionReminderScheduler: configurable lookahead, claim-before-enqueue
+    concurrency guard via a conditional update.
+
+Workstream E — Launch-readiness integration
+  - Admin session detail: live-classroom provisioning status + manual
+    retry action.
+  - Admin payments console.
+  - All new routes RBAC-correct and tested (see section Q).
+
+
+--------------------------------------------------------------------------------
+B. FILES MODIFIED / CREATED (by area)
+--------------------------------------------------------------------------------
+
+Backend — new modules:
+  apps/api/src/providers/zoom/{zoom-provider.service.ts,zoom.module.ts,*.spec.ts}
+  apps/api/src/sessions/meeting-provisioning.service.ts (+ .spec.ts)
+  apps/api/src/webhooks/{webhook-idempotency.service.ts,webhooks-shared.module.ts,
+    webhooks.module.ts,zoom-webhooks.controller.ts,
+    zoom-live-attendance-ingestion.service.ts,zoom-recording-ingestion.service.ts,
+    * .spec.ts for each}
+  apps/api/src/payments/{payment-provider.interface.ts,paystack-provider.service.ts,
+    payments.service.ts,payments.controller.ts,payments-webhooks.controller.ts,
+    payments.module.ts,payments.constants.ts,dto/checkout.dto.ts, *.spec.ts}
+  apps/api/src/notifications/{notifications.service.ts,notification-templates.ts,
+    email-provider.service.ts,notification-dispatch.scheduler.ts,
+    session-reminder.scheduler.ts,notifications.module.ts, *.spec.ts}
+  apps/api/src/common/raw-body-request.ts
+
+Backend — modified:
+  apps/api/prisma/schema.prisma (see section C)
+  apps/api/src/main.ts (raw-body capture for webhook signature verification)
+  apps/api/src/config/environment.ts (Zoom/Paystack/SMTP/reminder config, all
+    optional)
+  apps/api/src/app.module.ts (registers WebhooksModule, PaymentsModule,
+    NotificationsModule)
+  apps/api/src/sessions/{sessions.service.ts,sessions.controller.ts,
+    sessions.module.ts,dto/create-session.dto.ts} (auto-provisioning wiring,
+    notification wiring, liveMeetingUrl now optional)
+  apps/api/src/attendance/{attendance.module.ts,recording.service.ts}
+    (publishFromProvider — new method, manual publish() untouched)
+  apps/api/src/auth/{auth.service.ts,auth.module.ts} (registration
+    notification, best-effort)
+  apps/api/src/offerings/offerings.module.ts,
+    apps/api/src/learner-portal/learner-portal.module.ts (export their
+    services for reuse by the payments module)
+  Existing RBAC/integration spec files updated only where a new required
+    constructor dependency needed a fake provider (see section T for the
+    exact list) — no test's asserted behavior was weakened.
+
+Frontend — new pages/components:
+  apps/web/src/app/register/{page.tsx,page.test.tsx}
+  apps/web/src/app/learner/subscription/{page.tsx,page.test.tsx}
+  apps/web/src/app/admin/payments/{page.tsx,page.test.tsx}
+  apps/web/src/components/recording-player.{tsx,test.tsx}
+
+Frontend — modified:
+  apps/web/src/lib/{types.ts,endpoints.ts} (Offering/PaymentOrder discovery,
+    checkout, meeting-provisioning fields, liveMeetingUrl optional on create)
+  apps/web/src/app/login/page.tsx (link to /register)
+  apps/web/src/app/admin/sessions/page.tsx (liveMeetingUrl now optional in
+    the create form)
+  apps/web/src/app/admin/sessions/[id]/page.tsx (live-classroom status +
+    retry-provisioning action)
+  apps/web/src/app/teacher/sessions/[id]/page.tsx (Join/Start class action)
+  apps/web/src/app/learner/sessions/[id]/page.tsx (real player vs. external
+    Zoom link, replacing the manual watched-interval entry form)
+  apps/web/src/components/shell/nav-config.ts (+Payments for ADMIN,
+    +Subscription for LEARNER)
+
+
+--------------------------------------------------------------------------------
+C. SCHEMA / MIGRATIONS
+--------------------------------------------------------------------------------
+
+Two migrations:
+  apps/api/prisma/migrations/20260828113958_phase4_school_launch_core
+  apps/api/prisma/migrations/20260828134044_phase4_correction_crash_safety
+    (added by the five pre-commit corrections — section AA)
+
+New enums: MeetingProvisioningStatus, PaymentStatus, NotificationStatus,
+WebhookEventStatus (added by the corrections migration).
+
+Session (additive only):
+  meetingProvider, providerMeetingId (unique), meetingProvisioningStatus,
+  meetingProvisioningError, meetingProvisioningClaimedAt (added by the
+  corrections migration — Correction 3's atomic-claim timestamp),
+  reminderSentAt.
+
+SessionRecording (additive only): provider, providerRecordingId (unique).
+
+New models: LiveParticipantSession (transient join-tracking, consumed and
+deleted on the matching leave event — never accumulates), ProviderWebhookEvent
+(webhook idempotency ledger, shared by Zoom and payments — gained `status`
+(WebhookEventStatus), `claimedAt` in the corrections migration, Correction 1),
+PaymentOrder, NotificationOutboxItem (gained `claimedAt` in the corrections
+migration, Correction 4B; NotificationStatus gained the `SENDING` value).
+
+No existing column was renamed, retyped, or made non-nullable in either
+migration. No historical migration was touched. `prisma migrate deploy`
+applies both cleanly (verified against the shared dev database — see section
+V).
+
+
+--------------------------------------------------------------------------------
+D. LIVE PROVIDER ARCHITECTURE
+--------------------------------------------------------------------------------
+
+TUBI Session remains the domain object; Zoom Meeting is infrastructure
+referenced by `providerMeetingId`. `ZoomProviderService` is the entire Zoom
+surface: create/delete meeting, webhook signature verification, URL-validation
+handshake, OAuth token caching. Nothing else in the codebase imports the Zoom
+SDK or knows Zoom's REST shapes directly — `zoom-webhooks.controller.ts` and
+the two ingestion services translate Zoom's specific event/payload shapes into
+calls against domain-shaped methods.
+
+Outside `production`, with no ZOOM_* credentials configured, `createMeeting`
+returns a deterministic local-development fake meeting (logged loudly) so the
+rest of the school can be exercised without a Zoom account. This path is
+gated on `NODE_ENV !== 'production'`, not merely on credential absence, so it
+can never silently activate in a real deployment — a misconfigured production
+environment fails closed (ServiceUnavailableException) instead.
+
+
+--------------------------------------------------------------------------------
+E. MEETING PROVISIONING
+--------------------------------------------------------------------------------
+
+`MeetingProvisioningService.provisionForSession`:
+  - CORRECTED (Correction 3, section AA): the original design read the
+    session's status, decided whether to proceed, and only then wrote
+    PENDING — two concurrent calls (an automatic call racing a manual
+    retry) could both read a claimable session before either wrote
+    PENDING, both call Zoom, and both write a `providerMeetingId`. The
+    claim is now one atomic conditional `updateMany` (PENDING is only
+    ever written by the same statement that verifies nobody else holds an
+    active claim), so only one caller ever proceeds to call Zoom.
+  - Still idempotent under retry, duplicate call, or a Railway restart —
+    PROVISIONED remains a permanent no-op, and a stale (crashed) PENDING
+    claim is reclaimable after a bounded window (see section AA).
+  - Sets PENDING (via the atomic claim above), calls the provider, and on
+    success writes providerMeetingId + the real Zoom join URL onto the
+    *same* `liveMeetingUrl` field every existing learner/teacher read path
+    already redacts/exposes — no new field for those paths to learn about.
+  - On failure, records FAILED + a readable error message and returns
+    normally (never throws) — a Zoom outage can never block Session
+    creation. FAILED remains freely retryable.
+`releaseForCanceledSession` best-effort deletes the provider meeting on
+cancellation; failures are logged, never reversing the cancellation.
+`SessionsController.provisionMeeting` (`POST
+/admin/sessions/:id/provision-meeting`, ADMIN-only) is the manual retry.
+
+`CreateSessionDto.liveMeetingUrl` is now optional. An ADMIN who supplies one
+explicitly is understood as a deliberate manual override (e.g. no Zoom
+account yet) and automatic provisioning is skipped for that session —
+provisioning never silently clobbers an explicit choice.
+
+
+--------------------------------------------------------------------------------
+F. TEACHER CLASSROOM
+--------------------------------------------------------------------------------
+
+`apps/web/src/app/teacher/sessions/[id]/page.tsx` gained a "Live classroom"
+card: a real "Join class" (LIVE) / "Start class" (SCHEDULED) action against
+the auto-provisioned `liveMeetingUrl`, or a readable "still being set up" /
+"contact an administrator" message when no meeting exists yet. No new
+mutation capability was added — the page remains read-only for lifecycle
+actions, exactly as the Phase 3 review already established (ADMIN retains
+sole authority over mark-live/mark-ended/cancel/recording-publish). PRIMARY/
+ASSISTANT/SUBSTITUTE semantics are completely untouched; Zoom's own host/
+co-host mapping is out of scope for this milestone — TUBI's own
+teacher-role model is what the roster displays.
+
+
+--------------------------------------------------------------------------------
+G. LEARNER CLASSROOM
+--------------------------------------------------------------------------------
+
+Unchanged in mechanism (the redaction logic in
+`learner-portal.service.ts:redactLiveAccess` is untouched — same fail-closed
+behavior), changed only in where `liveMeetingUrl` comes from: automatic
+provisioning instead of admin free-text entry. The learner "Join live class"
+button opens the real Zoom join URL externally — no in-app conferencing
+client was built, per the brief's explicit instruction not to build "a
+fragile imitation video-conferencing client."
+
+
+--------------------------------------------------------------------------------
+H. LIVE ATTENDANCE / WEBHOOKS
+--------------------------------------------------------------------------------
+
+`meeting.participant_joined` opens a `LiveParticipantSession` row keyed by
+(sessionId, providerParticipantId) — a duplicate/replayed join for the same
+connection collides on the unique constraint and is a safe no-op.
+`meeting.participant_left` consumes (deletes) that row and calls the
+existing, completely unmodified
+`LiveAttendanceIntervalService.ingest(sessionId, { learnerId, joinedAt,
+leftAt })` — the exact seam that service's own Phase 2F doc comment
+describes as "the seam a future Zoom adapter attaches to." Every frozen
+guarantee (clipping to [startTime, endTime], merge-based coverage, 50%
+cumulative qualification, reconnects accumulating, duplicates never
+double-counting) is inherited unchanged because the ingestion code path
+itself was never touched.
+
+A participant is resolved to a TUBI learner by normalized email lookup
+(User -> LearnerProfile) — identical normalization rule to
+`AuthService`'s `normalizeEmail`. An unresolvable participant or unknown
+meeting is logged and ignored, never a 500.
+
+
+--------------------------------------------------------------------------------
+I. WEBHOOK SECURITY & IDEMPOTENCY
+--------------------------------------------------------------------------------
+
+Signature verification (`ZoomProviderService.verifyWebhookSignature`):
+Zoom's `v0=` HMAC-SHA256 scheme over `v0:{timestamp}:{rawBody}`, using
+`node:crypto`'s `timingSafeEqual` (constant-time comparison — never a `===`
+string compare). Missing header, missing secret, or length mismatch all
+return `false` (never throw), and the controller turns `false` into a 401
+before any event is parsed for meaning.
+
+Idempotency — CORRECTED (Correction 1, section AA): the original design
+inserted a `ProviderWebhookEvent` row before business processing and treated
+any later unique conflict as "already processed," which meant a crash
+between claiming and completing an event left it permanently unprocessable.
+`WebhookIdempotencyService.claim` now returns one of `PROCEED` /
+`ALREADY_PROCESSED` / `CLAIMED_BY_OTHER`, backed by a `RECEIVED` /
+`PROCESSING` / `PROCESSED` state machine with a stale-claim reclaim window.
+See section AA, Correction 1 for the full mechanism and its honestly-bounded
+crash-recovery window.
+
+`main.ts` disables Nest's default body parser and re-applies `express.json`
+with a `verify` hook that stashes the exact raw bytes on the request —
+signatures are computed over raw bytes, not a re-serialization of parsed
+JSON, which would not be guaranteed byte-identical.
+
+
+--------------------------------------------------------------------------------
+J. SESSION LIFECYCLE INTEGRATION
+--------------------------------------------------------------------------------
+
+Zoom's `recording.completed` (`ZoomRecordingIngestionService.ingest`):
+  - CANCELED or SCHEDULED session: ignored, logged — never resurrects or
+    fabricates a transition.
+  - LIVE session: performs the ordinary, already-valid LIVE -> ENDED
+    transition (`SessionsService.markEnded`) — ending a class really is
+    the correct real-world implication of its recording having completed.
+    A lost race against another caller already ending it is tolerated
+    (ConflictException swallowed), not surfaced as a webhook failure.
+  - ENDED session: proceeds directly to publishing.
+No other Session field is ever written by a provider callback except
+through the exact same paths ADMIN or the existing lifecycle methods
+already use.
+
+
+--------------------------------------------------------------------------------
+K. RECORDING AUTOMATION
+--------------------------------------------------------------------------------
+
+`RecordingService.publishFromProvider` — a new method alongside the frozen,
+untouched `publish` (still used by ADMIN's manual-entry path). Same
+"ENDED-only" invariant; a duplicate/replayed webhook that finds the
+recording already published returns the existing row rather than
+conflicting, so a resend is idempotent by nature and not merely by the
+outer webhook ledger. `SessionRecording.provider` +
+`SessionRecording.providerRecordingId` distinguish an automated ingestion
+from a manual one.
+
+
+--------------------------------------------------------------------------------
+L. PLAYBACK / RECORDED ATTENDANCE
+--------------------------------------------------------------------------------
+
+`RecordingPlayer` (new): a real `<video>` element, batched and flushed every
+15 seconds (and on pause/end) to the same, completely unmodified `POST
+/learner/sessions/:id/recording/watched-intervals` endpoint the previous
+manual-entry form called — `WatchedIntervalService`'s merge-based, 100%-
+unique-coverage qualification is untouched.
+
+CORRECTED (Correction 5, section AA): the original design classified any
+>2-second jump between consecutive `timeupdate` events as a seek — fragile,
+since legitimate continuous playback can produce sparsely-spaced
+`timeupdate` events under background-tab throttling or device load. The
+player now closes a segment only on the browser's real `seeking` event
+(authoritative — fires exactly when, and only when, the browser is about to
+jump `currentTime`), never on an elapsed-time guess. See section AA for the
+full mechanism.
+
+This player is only ever rendered for a recording with `provider === null`
+(a manually-published, directly-hosted file). A Zoom-ingested recording
+(`provider === 'ZOOM'`) is opened externally instead — see section X for
+why.
+
+
+--------------------------------------------------------------------------------
+M. COMMERCIAL / PAYMENT ARCHITECTURE
+--------------------------------------------------------------------------------
+
+`PaymentOrder` sits entirely upstream of `SubscriptionAccess` — it never
+gains SubscriptionAccess's own fields, and SubscriptionAccess never gains
+payment fields. The one meeting point is `PaymentsService.confirmPayment`.
+
+CORRECTED (Correction 2, section AA): `confirmPayment` originally called
+`SubscriptionAccessService.create(...)` and then, in a separate write,
+updated `PaymentOrder` to PAID — not atomic, so a crash between the two
+could leave a granted access with its originating order stuck PENDING
+forever. The grant and the order update are now one Postgres transaction
+via a new `SubscriptionAccessService.createWithinExistingLock`, which reuses
+(never duplicates) the existing concurrency-safe validation/overlap-check
+logic under the same advisory lock key `create()` would otherwise take for
+itself. See section AA for the full mechanism.
+
+`PaymentProvider` interface (`isConfigured`, `initializeCheckout`,
+`verifyWebhookSignature`, `parseWebhookEvent`) is implemented once, by
+`PaystackProviderService` — the conventional choice for a South African ZAR
+launch (native ZAR, hosted checkout, HMAC-SHA512 webhooks). Injected via a
+`PAYMENT_PROVIDER` token so a second provider could be added later without
+touching `PaymentsService` or its controllers.
+
+Amounts are stored as `amountMinor: Int` (integer cents) — never a floating-
+point amount — with `currency` defaulting to `'ZAR'`.
+
+
+--------------------------------------------------------------------------------
+N. PAYMENT VERIFICATION / ACCESS ACTIVATION
+--------------------------------------------------------------------------------
+
+`initiateCheckout`: rejects outright (no PaymentOrder row created) if the
+provider is unconfigured — never fakes a checkout. Otherwise creates a
+PENDING order first, then calls the provider; a provider-call failure marks
+that specific order FAILED and rethrows, so a checkout attempt is never left
+silently ambiguous.
+
+`confirmPayment` (called only from `PaymentsWebhooksController`, only after
+signature verification and idempotency-ledger claim):
+  - Unknown reference: 404 — a forged/garbage reference grants nothing.
+  - Already PAID: no-op (idempotent — a redelivered webhook never grants a
+    second access; the unique `PaymentOrder.subscriptionAccessId` column is
+    the database-level backstop even if this in-memory check were ever
+    bypassed).
+  - Not PENDING (e.g. FAILED/CANCELED/REFUNDED): 409 — refuses to
+    resurrect a resolved order.
+  - Amount/currency mismatch against the stored order: 400 — a tampered or
+    wrong-amount confirmation grants nothing.
+  - Only once all of the above pass does it call
+    `SubscriptionAccessService.create` (the existing, Phase 2G
+    advisory-lock-protected method) and atomically record the resulting
+    `subscriptionAccessId` back onto the order.
+
+A client-side "payment successful" redirect is never trusted — the
+subscription page only ever hands the learner a real provider checkout URL
+and never itself claims access was granted (see the frontend test
+`payments-webhooks.controller.spec.ts` / `payments.service.spec.ts` for the
+exact adversarial cases: forged reference, amount tamper, duplicate
+webhook, concurrency).
+
+
+--------------------------------------------------------------------------------
+O. LEARNER ONBOARDING
+--------------------------------------------------------------------------------
+
+Backend registration (`AuthService.register`) already existed from an
+earlier phase and already enforced LEARNER-only public registration — this
+milestone added the missing frontend: `apps/web/src/app/register/page.tsx`.
+No role selector exists in the UI, matching the backend's own fixed
+behavior; the registration request body is exactly
+`{ email, password, fullName }` (verified directly in
+`register/page.test.tsx`). On success the page logs the new learner in and
+routes them to `/learner`. Registration also enqueues an
+`ACCOUNT_REGISTERED` notification (best-effort — never blocks the account
+creation itself).
+
+
+--------------------------------------------------------------------------------
+P. NOTIFICATIONS / REMINDERS
+--------------------------------------------------------------------------------
+
+`NotificationsService.enqueue` is the only write path onto
+`NotificationOutboxItem` — every domain service (auth, sessions, payments,
+the Zoom recording-ingestion service) calls it and nothing else; none of
+them call an email provider directly. `NotificationDispatchScheduler`
+(`@Cron(EVERY_MINUTE)`) picks up to 25 candidate items per tick, and:
+  - CORRECTED (Correction 4B, section AA): the original design selected
+    PENDING items, then sent, then updated status — nothing stopped two
+    Railway instances from both selecting and sending the same item. Each
+    candidate is now claimed with an atomic conditional `updateMany`
+    (PENDING -> SENDING, or a stale SENDING reclaimed) before this
+    instance ever calls the email provider; an instance whose claim
+    matches zero rows skips the item.
+  - on success: SENT + sentAt (+ clears claimedAt).
+  - on failure: reverts to PENDING (not left SENDING) with incremented
+    `attempts` and recorded `lastError`, retrying on the next tick, up to
+    `MAX_ATTEMPTS = 5`, after which the item is permanently FAILED
+    (visible to nothing yet in this milestone's UI, but durably recorded —
+    a future admin polish item, not required for launch).
+  - a failure for one item never prevents the rest of the batch from being
+    attempted (each item's send/update is wrapped independently).
+
+`SessionReminderScheduler` (`@Cron(EVERY_MINUTE)`, configurable
+`SESSION_REMINDER_LOOKAHEAD_MINUTES`, default 60):
+  - CORRECTED (Correction 4A, section AA): the original design claimed
+    `reminderSentAt` and then, in a separate write, created the
+    `NotificationOutboxItem` rows — a crash between the two permanently
+    lost the reminder (the session's claim would never be retried, and no
+    notification had actually been enqueued). The claim (a conditional
+    `updateMany`) and the notification creation now run inside one
+    `prisma.$transaction` — either both commit or neither does.
+
+
+--------------------------------------------------------------------------------
+Q. ADMIN LAUNCH OPERATIONS
+--------------------------------------------------------------------------------
+
+`apps/web/src/app/admin/sessions/[id]/page.tsx`: a "Live classroom" card
+showing `meetingProvisioningStatus` (badge-coded), the resolved provider,
+a direct "Open meeting" link when provisioned, the recorded error message
+when FAILED, and a "Retry provisioning" action
+(`POST /admin/sessions/:id/provision-meeting`) for a SCHEDULED or LIVE
+session not yet PROVISIONED.
+
+`apps/web/src/app/admin/payments/page.tsx`: read-only list of every
+PaymentOrder with its verified status — no mutation control, since a
+PaymentOrder's true state can only ever change through a verified provider
+webhook.
+
+RBAC for both: `payments-rbac.http.spec.ts` proves LEARNER/TEACHER get 403
+from `/admin/payments`; the existing ADMIN-only guard pattern
+(`@Roles('ADMIN')` + real `JwtAuthGuard`/`RolesGuard`) is unchanged from
+every prior phase.
+
+
+--------------------------------------------------------------------------------
+R. RECONCILIATION / IDEMPOTENCY
+--------------------------------------------------------------------------------
+
+  - Meeting provisioning: idempotent by `meetingProvisioningStatus`
+    short-circuit; manual retry endpoint for reconciliation after a
+    transient Zoom outage.
+  - Zoom webhooks: `ProviderWebhookEvent` unique constraint — redelivery
+    safe.
+  - Live participant tracking: `LiveParticipantSession` unique constraint
+    on (sessionId, providerParticipantId) — duplicate join events are a
+    no-op; a leave with no matching open row is logged and ignored rather
+    than guessed at.
+  - Recording ingestion: `SessionRecording` unique constraint on
+    `sessionId` (frozen from Phase 2F) — a duplicate `recording.completed`
+    finds the row already there and returns it rather than conflicting.
+  - Payments: `PaymentOrder.providerReference` unique; `confirmPayment`'s
+    already-PAID short-circuit; `PaymentOrder.subscriptionAccessId` unique
+    — three independent layers, any one of which alone prevents a double
+    grant.
+  - Notifications: bounded-retry outbox; a permanently-FAILED item is
+    recorded, never retried forever.
+  - Session reminders: conditional-update claim prevents double-sending
+    across concurrent scheduler ticks or Railway instances.
+
+None of this required a message broker, an event-sourcing platform, or
+distributed-transaction infrastructure — every guarantee above is a single
+unique constraint or conditional update against the existing PostgreSQL
+database.
+
+
+--------------------------------------------------------------------------------
+S. SECURITY REVIEW
+--------------------------------------------------------------------------------
+
+Performed as an explicit pass over this milestone's own new surface area
+(the Phase 3 adversarial review already covered everything from before):
+
+  - Zoom credentials/host tokens: never exposed to the frontend; all
+    provider calls happen server-side in `ZoomProviderService`. The
+    learner and teacher never see anything but a join URL.
+  - Zoom webhook signature: HMAC verified with `timingSafeEqual`
+    (constant-time); missing/invalid signature -> 401 before any body
+    parsing for meaning.
+  - Webhook replay: shared idempotency ledger, tested explicitly for both
+    Zoom and payments (`zoom-webhooks.controller.spec.ts`,
+    `payments-webhooks.controller.spec.ts`).
+  - Payment amount tampering: `confirmPayment` rejects any
+    amount/currency mismatch against the stored order (`payments.service.
+    spec.ts`).
+  - Fake success redirects: the learner subscription page never grants
+    itself access on redirect — it only ever requests a checkout URL; a
+    forged frontend "success" state has literally nothing to write to,
+    since SubscriptionAccess is created exclusively by the verified
+    webhook path.
+  - Payment webhook replay: covered above; confirmed idempotent by test.
+  - SubscriptionAccess creation: unchanged, still the sole,
+    concurrency-safe `SubscriptionAccessService.create` — this milestone's
+    new payment path is simply one more caller of it, with no new
+    creation logic of its own.
+  - Learner/teacher IDOR: no new broad route was added that bypasses the
+    Phase 3 Correction 4 scoping (`/teacher/*` scoped, `/admin/*`
+    ADMIN-only); the new `/learner/offerings` and `/learner/payments/
+    checkout` routes are `@Roles('LEARNER')` only, verified against
+    TEACHER/unauthenticated in `payments-rbac.http.spec.ts`.
+  - Notification data leakage: outbox payloads carry only course
+    titles/timestamps/names already visible to their recipient through
+    existing entitled reads — no cross-learner data is ever included.
+  - Secrets in the frontend bundle: no `NEXT_PUBLIC_*` variable was
+    introduced; `.env.example` additions are all backend-only.
+  - Sensitive logs: provisioning/webhook log lines include session/meeting
+    ids and error messages, never credentials, tokens, or payment card
+    data (there is none — Paystack's hosted checkout means TUBI never
+    touches card details at all).
+
+No findings required a fix beyond what's already reflected in the
+implementation above — the adversarial cases (forged reference, amount
+tamper, replay, IDOR) are each backed by a passing test, not merely an
+assertion in this document.
+
+
+--------------------------------------------------------------------------------
+T. ENVIRONMENT VARIABLES
+--------------------------------------------------------------------------------
+
+Added to `apps/api/.env.example`, all optional (absence -> explicit
+"unconfigured" state, never fabricated behavior):
+
+  Zoom:        ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET,
+               ZOOM_WEBHOOK_SECRET_TOKEN
+  Payments:    PAYSTACK_SECRET_KEY, PAYMENTS_CALLBACK_URL
+  Notification:SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD,
+               SMTP_FROM_ADDRESS
+  Scheduling:  SESSION_REMINDER_LOOKAHEAD_MINUTES (default 60)
+
+No `NEXT_PUBLIC_*` addition to `apps/web/.env.example` — nothing in this
+milestone needs frontend-visible configuration.
+
+
+--------------------------------------------------------------------------------
+U. DEPLOYMENT / OPERATOR REQUIREMENTS
+--------------------------------------------------------------------------------
+
+Frontend remains Vercel, backend remains Railway, database remains Neon —
+unchanged. Nothing in this milestone's code depends on localhost, ngrok, a
+LAN IP, or a local process; Zoom and Paystack webhooks are configured
+against the real Railway public API URL (`https://<railway-domain>/api/v1/
+webhooks/zoom` and `.../webhooks/payments`) once the founder has the
+respective account credentials — that account/URL configuration is
+external-system work, not a code change, and is not performed here (see
+section W).
+
+`npm run start:prod` continues to run `prisma migrate deploy` before
+boot — the new migration applies the same way every prior migration has.
+
+
+--------------------------------------------------------------------------------
+V. FULL VERIFICATION
+--------------------------------------------------------------------------------
+
+  This is the re-run AFTER applying all five pre-commit corrections
+  (section AA) — not merely the original Phase 4 pass.
+
+  backend tests:        391/391 passing (44 suites)   [was 286/286 pre-Phase-4,
+                                                         370/370 pre-corrections]
+  frontend tests:        63/63 passing (15 files)      [was 46/46 pre-Phase-4,
+                                                         60/60 pre-corrections]
+  root typecheck:        clean (no changes needed)
+  frontend typecheck:    clean
+  backend typecheck:     clean
+  backend ESLint:        clean (zero eslint-disable in any Phase 4 file)
+  frontend ESLint:       clean (zero eslint-disable in any Phase 4 file)
+  API production build:  clean (`nest build`)
+  web production build:  clean — 21 routes (18 static, 3 dynamic), including
+                          new /register, /learner/subscription,
+                          /admin/payments — unchanged by the corrections
+                          (no new routes/pages, only internal hardening)
+  Prisma format:          clean
+  Prisma validate:        clean
+  Prisma generate:        clean
+  Migration verification: `prisma migrate status` reports "Database schema
+                          is up to date!" against the shared dev database
+                          after applying BOTH migrations
+                          (20260828113958_phase4_school_launch_core and
+                          20260828134044_phase4_correction_crash_safety) via
+                          `prisma migrate deploy`
+  repository format check: clean (`prettier --check .`)
+
+
+--------------------------------------------------------------------------------
+W. EXTERNAL PROVIDER ACTIONS STILL REQUIRED (operator decisions, not blocked
+   code)
+--------------------------------------------------------------------------------
+
+These are the only remaining steps, and none of them block anything else in
+this milestone — every other workstream is complete and independently
+functional in the meantime (per the brief's own accelerated-execution rule):
+
+  1. Create/select the TUBI Zoom account; generate Server-to-Server OAuth
+     credentials (ZOOM_ACCOUNT_ID/CLIENT_ID/CLIENT_SECRET) and register the
+     production webhook URL (Zoom will call the URL-validation handshake
+     this code already answers); set ZOOM_WEBHOOK_SECRET_TOKEN from Zoom's
+     generated secret.
+  2. Create/select the TUBI Paystack account (or confirm Paystack as final
+     — this was implemented as the conventional South African choice, not
+     dictated by the founder); set PAYSTACK_SECRET_KEY and
+     PAYMENTS_CALLBACK_URL; register the production webhook URL.
+  3. Choose and configure an SMTP provider (or a transactional-email
+     service with SMTP credentials) and set SMTP_HOST/PORT/USER/PASSWORD/
+     FROM_ADDRESS.
+  4. Set all of the above as Railway environment variables (never
+     committed) once the corresponding accounts exist.
+
+Until each of these is configured, its integration runs in the explicit
+"unconfigured" state this milestone deliberately built (local-dev Zoom
+fake outside production; checkout returns a clear error; notifications
+record FAILED with a readable reason) — never fabricated production
+behavior.
+
+
+--------------------------------------------------------------------------------
+X. KNOWN LIMITATIONS
+--------------------------------------------------------------------------------
+
+  1. Zoom-ingested recording playback is not embedded with automatic
+     telemetry. Zoom's cloud-recording `share_url` is a hosted page on
+     Zoom's own domain — it cannot report playback progress back into
+     TUBI without either (a) Zoom's paid recording-download API plus TUBI
+     re-hosting the file itself (meaningfully more infrastructure, out of
+     scope per the brief's own "introduce additional video-storage
+     infrastructure only if truly required"), or (b) a browser extension/
+     screen-capture hack, which was explicitly rejected as "a fragile
+     imitation." The real, automatically-telemetered `<video>` player is
+     fully built and works for any directly-hosted recording file (e.g. a
+     manually-published one); for a Zoom-ingested recording, the learner
+     opens it externally and RECORDED attendance for that session
+     continues to rely on whatever watched-interval reporting mechanism
+     is available for that file — for a pure Zoom-only launch with no
+     other hosting, this means recorded-completion attendance for
+     Zoom-only recordings needs either founder guidance on acceptable
+     interim behavior, or the video-rehosting investment above.
+  2. `NotificationDispatchScheduler`'s permanently-FAILED notifications
+     have no dedicated ADMIN visibility yet (they exist and are durably
+     recorded, just not surfaced in a UI) — a reasonable next-polish item,
+     not required for launch.
+  3. Zoom host/co-host role mapping for PRIMARY/ASSISTANT/SUBSTITUTE was
+     not implemented (Zoom's server-to-server meeting creation in this
+     milestone does not assign alternative hosts) — every assigned
+     teacher currently gets the same join URL; a genuine "host controls"
+     distinction would require Zoom's alternative-host or role-management
+     APIs and is deferred as a future-polish item, not a launch blocker
+     (the learner-facing entitlement/security boundary is unaffected).
+  4. Phase 3's remaining disclosed UI gaps (attendance-window-exception
+     authoring UI, AcademicTerm edit) were not revisited in this
+     milestone — time was spent on the new launch-critical workstreams
+     instead, per the brief's own "do not let rare admin polish delay the
+     primary launch flow."
+
+
+--------------------------------------------------------------------------------
+Y. EXACT GIT STATUS
+--------------------------------------------------------------------------------
+
+On branch main. Up to date with origin/main. NOT committed.
+
+This is the status AFTER applying all three correction passes (AA's five,
+AB's ten, and AD's two post-op fixes) — `apps/web/src/lib/api-client.ts`
+is newly modified by AD's M1 (the `keepalive` request option); no further
+files became newly untracked in this final pass (H1/M1 only touched
+already-tracked-as-new-this-milestone or already-modified files).
+
+Modified (36 files):
+  apps/api/.env.example
+  apps/api/package.json
+  apps/api/prisma/schema.prisma
+  apps/api/src/admin-routes-teacher-scoping.http.spec.ts
+  apps/api/src/app.module.ts
+  apps/api/src/attendance/attendance.module.ts
+  apps/api/src/attendance/recording.service.spec.ts
+  apps/api/src/attendance/recording.service.ts
+  apps/api/src/auth/auth-rate-limit.http.spec.ts
+  apps/api/src/auth/auth.http.spec.ts
+  apps/api/src/auth/auth.module.ts
+  apps/api/src/auth/auth.service.spec.ts
+  apps/api/src/auth/auth.service.ts
+  apps/api/src/config/environment.ts
+  apps/api/src/learner-portal/learner-portal.module.ts
+  apps/api/src/main.ts
+  apps/api/src/offerings/offerings.module.ts
+  apps/api/src/sessions/dto/create-session.dto.ts
+  apps/api/src/sessions/sessions.controller.ts
+  apps/api/src/sessions/sessions.module.ts
+  apps/api/src/sessions/sessions.service.spec.ts
+  apps/api/src/sessions/sessions.service.ts
+  apps/api/src/subscription-access/subscription-access.service.spec.ts
+  apps/api/src/subscription-access/subscription-access.service.ts
+  apps/api/src/teachers-sessions-rbac.http.spec.ts
+  apps/web/src/app/admin/sessions/[id]/page.tsx
+  apps/web/src/app/admin/sessions/page.tsx
+  apps/web/src/app/learner/sessions/[id]/page.test.tsx
+  apps/web/src/app/learner/sessions/[id]/page.tsx
+  apps/web/src/app/login/page.tsx
+  apps/web/src/app/teacher/sessions/[id]/page.test.tsx
+  apps/web/src/app/teacher/sessions/[id]/page.tsx
+  apps/web/src/components/shell/nav-config.test.ts
+  apps/web/src/components/shell/nav-config.ts
+  apps/web/src/lib/api-client.ts
+  apps/web/src/lib/endpoints.ts
+  apps/web/src/lib/types.ts
+  pnpm-lock.yaml
+
+Untracked (15 paths):
+  apps/api/prisma/migrations/20260828113958_phase4_school_launch_core/
+  apps/api/prisma/migrations/20260828134044_phase4_correction_crash_safety/
+  apps/api/prisma/migrations/20260828221907_phase4_correction_claim_fencing/
+  apps/api/src/common/raw-body-request.ts
+  apps/api/src/notifications/
+  apps/api/src/payments/
+  apps/api/src/providers/
+  apps/api/src/sessions/meeting-provisioning.service.spec.ts
+  apps/api/src/sessions/meeting-provisioning.service.ts
+  apps/api/src/webhooks/
+  apps/web/src/app/admin/payments/
+  apps/web/src/app/learner/subscription/
+  apps/web/src/app/register/
+  apps/web/src/components/recording-player.test.tsx
+  apps/web/src/components/recording-player.tsx
+
+Plus this document itself (docs/phase-4-school-launch-core-review.txt,
+untracked).
+
+No `.env` files, credentials, secrets, build output, or unrelated files are
+present. `pnpm-lock.yaml` changed solely from adding `nodemailer` +
+`@types/nodemailer` to `apps/api` (unchanged by the corrections round — no
+new dependency was needed for any of the five fixes).
+
+
+--------------------------------------------------------------------------------
+Z. CRITICAL SOURCE EXCERPTS
+--------------------------------------------------------------------------------
+
+--- Provider abstraction (apps/api/src/providers/zoom/zoom-provider.service.ts) ---
+
+  async createMeeting(request: ZoomMeetingRequest): Promise<ZoomMeetingResult> {
+    if (this.isLocalDevFakeAllowed()) {
+      this.logger.warn(
+        'ZOOM_* credentials are not configured — using a local-development fake meeting. ' +
+          'This path never activates when NODE_ENV=production.',
+      );
+      const fakeId = `local-dev-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+      return {
+        providerMeetingId: fakeId,
+        joinUrl: `https://zoom.example.invalid/local-dev/${fakeId}`,
+      };
+    }
+
+    if (!this.isConfigured()) {
+      throw new ServiceUnavailableException(
+        'Zoom integration is not configured (ZOOM_ACCOUNT_ID/ZOOM_CLIENT_ID/ZOOM_CLIENT_SECRET missing)',
+      );
+    }
+    // ... real fetch() call to https://api.zoom.us/v2/users/me/meetings
+  }
+
+  verifyWebhookSignature(rawBody: string, signatureHeader: string | undefined, timestampHeader: string | undefined): boolean {
+    const secret = this.config.get('ZOOM_WEBHOOK_SECRET_TOKEN', { infer: true });
+    if (!secret || !signatureHeader || !timestampHeader) return false;
+    const expected = `v0=${createHmac('sha256', secret).update(`v0:${timestampHeader}:${rawBody}`).digest('hex')}`;
+    const expectedBuffer = Buffer.from(expected);
+    const actualBuffer = Buffer.from(signatureHeader);
+    if (expectedBuffer.length !== actualBuffer.length) return false;
+    return timingSafeEqual(expectedBuffer, actualBuffer);
+  }
+
+--- Meeting provisioning idempotency (apps/api/src/sessions/meeting-provisioning.service.ts) ---
+
+  async provisionForSession(sessionId: string): Promise<void> {
+    const session = await this.prisma.session.findUnique({ where: { id: sessionId } });
+    if (!session) return;
+
+    if (
+      session.status === SessionStatus.CANCELED ||
+      session.meetingProvisioningStatus === MeetingProvisioningStatus.PROVISIONED
+    ) {
+      return;
+    }
+    // ... sets PENDING, calls provider, writes PROVISIONED or FAILED —
+    // never throws, session creation is never blocked by a Zoom outage.
+  }
+
+--- Webhook deduplication (apps/api/src/webhooks/webhook-idempotency.service.ts) ---
+
+  async claim(provider: string, externalEventId: string, eventType: string): Promise<boolean> {
+    try {
+      await this.prisma.providerWebhookEvent.create({ data: { provider, externalEventId, eventType } });
+      return true;
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        return false; // already processed
+      }
+      throw error;
+    }
+  }
+
+--- Live interval ingestion (apps/api/src/webhooks/zoom-live-attendance-ingestion.service.ts) ---
+
+  async handleParticipantLeft(providerMeetingId: string, providerParticipantId: string, leftAt: Date): Promise<void> {
+    const session = await this.prisma.session.findUnique({ where: { providerMeetingId } });
+    if (!session) { this.logger.warn(...); return; }
+
+    const open = await this.prisma.liveParticipantSession.findUnique({
+      where: { sessionId_providerParticipantId: { sessionId: session.id, providerParticipantId } },
+    });
+    if (!open) { this.logger.warn(...); return; } // duplicate leave or missed join
+
+    await this.prisma.liveParticipantSession.delete({ where: { id: open.id } });
+    await this.liveAttendanceIntervalService.ingest(session.id, {
+      learnerId: open.learnerId,
+      joinedAt: open.joinedAt.toISOString(),
+      leftAt: leftAt.toISOString(),
+    }); // <- the frozen, unmodified Phase 2F ingestion path
+  }
+
+--- Recording ingestion (apps/api/src/attendance/recording.service.ts, new method) ---
+
+  async publishFromProvider(sessionId: string, data: {...}): Promise<SessionRecording | null> {
+    const session = await this.prisma.session.findUnique({ where: { id: sessionId } });
+    if (!session || session.status !== SessionStatus.ENDED) return null;
+    try {
+      return await this.prisma.sessionRecording.create({ data: { sessionId, ...data } });
+    } catch (error) {
+      if (isUniqueConstraintViolation(error)) {
+        return this.prisma.sessionRecording.findUnique({ where: { sessionId } }); // idempotent
+      }
+      throw error;
+    }
+  }
+
+--- Player telemetry batching (apps/web/src/components/recording-player.tsx) ---
+
+  function handleTimeUpdate() {
+    const current = video.currentTime;
+    const last = lastReportedTimeRef.current;
+    if (last === null || Math.abs(current - last) > 2) {
+      pendingStartRef.current = current; // seek: start a fresh range
+    } else if (pendingStartRef.current === null) {
+      pendingStartRef.current = last;
+    }
+    pendingEndRef.current = current;
+    lastReportedTimeRef.current = current;
+  }
+  // flush() runs on a 15s interval and on pause/end — never per timeupdate tick.
+
+--- Payment verification / access activation (apps/api/src/payments/payments.service.ts) ---
+
+  async confirmPayment(providerReference: string, amountMinor: number, currency: string): Promise<void> {
+    const order = await this.prisma.paymentOrder.findUnique({ where: { providerReference } });
+    if (!order) throw new NotFoundException(...);
+    if (order.status === PaymentStatus.PAID) return; // idempotent no-op
+    if (order.status !== PaymentStatus.PENDING) throw new ConflictException(...);
+    if (order.amountMinor !== amountMinor || order.currency !== currency) {
+      throw new BadRequestException(...); // tamper/mismatch protection
+    }
+
+    const access = await this.subscriptionAccessService.create({ ... }); // the ONE frozen, concurrency-safe grant path
+    await this.prisma.paymentOrder.update({
+      where: { id: order.id },
+      data: { status: PaymentStatus.PAID, subscriptionAccessId: access.id },
+    });
+  }
+
+--- New Prisma models (apps/api/prisma/schema.prisma) ---
+
+  model PaymentOrder {
+    id                 String        @id @default(uuid())
+    learnerId          String
+    offeringId         String
+    provider           String
+    providerReference  String?       @unique
+    amountMinor        Int
+    currency           String        @default("ZAR")
+    status             PaymentStatus @default(PENDING)
+    subscriptionAccessId String?     @unique
+    subscriptionAccess    SubscriptionAccess? @relation(fields: [subscriptionAccessId], references: [id])
+    ...
+  }
+
+  model ProviderWebhookEvent {
+    id              String   @id @default(uuid())
+    provider        String
+    externalEventId String
+    eventType       String
+    receivedAt      DateTime @default(now())
+    @@unique([provider, externalEventId])
+  }
+
+--- Learner access authorization (apps/api/src/learner-portal/learner-portal.service.ts — UNCHANGED, still frozen) ---
+
+  function redactLiveAccess(session, deliveryMode) {
+    if (deliveryMode === DeliveryMode.LIVE_AND_RECORDED) return session;
+    return { ...session, liveMeetingUrl: '' }; // fail closed, exactly as before
+  }
+
+  // Phase 4 changes only WHERE `liveMeetingUrl` is populated FROM
+  // (automatic provisioning instead of admin free-text) — never this
+  // redaction logic itself.
+
+
+--------------------------------------------------------------------------------
+AA. PRE-COMMIT CORRECTIONS (SECOND EXTERNAL REVIEW PASS)
+--------------------------------------------------------------------------------
+
+The first external review pass accepted Phase 4's overall architecture but
+withheld commit approval pending five failure-mode findings, all now
+addressed. None of the frozen semantics listed in that review's boundary
+(50% LIVE rule, 100% RECORDED rule, same-Session live/recorded, DeliveryMode
+semantics, subscription entitlement semantics, teacher role semantics, admin
+authority, Vercel/Railway/Neon architecture) were touched — every correction
+below is a crash-safety/concurrency hardening of the Phase 4 mechanics that
+sit around those rules, not a change to the rules themselves.
+
+--- Correction 1: webhook idempotency — claim-before-processing poison event ---
+
+Finding: `ProviderWebhookEvent` was inserted before business processing, and
+any later unique-constraint conflict was treated as "already processed." A
+crash between claiming and finishing (process death, DB failure, Railway
+restart) left the event permanently stuck — a provider retry would see the
+existing row and return 200 without ever completing the original operation.
+
+Fix: `ProviderWebhookEvent` gained a `status` (`RECEIVED` / `PROCESSING` /
+`PROCESSED`) and `claimedAt`. `WebhookIdempotencyService.claim` now:
+  1. Ensures a row exists (`RECEIVED` on first sight).
+  2. Returns `ALREADY_PROCESSED` immediately if the row is already
+     `PROCESSED` — permanent, safe no-op.
+  3. Otherwise attempts an atomic conditional `updateMany` moving the row
+     to `PROCESSING`, matching only a `RECEIVED` row or a `PROCESSING` row
+     whose `claimedAt` is older than a 120-second stale window. Exactly one
+     concurrent caller's `updateMany` can match and win; every other
+     simultaneous caller's identical `updateMany` matches zero rows and
+     gets `CLAIMED_BY_OTHER`.
+  4. The winning caller runs business processing, then calls
+     `markProcessed` (-> `PROCESSED`) on success or `markFailed` (back to
+     `RECEIVED`, immediately reclaimable — never waits out the stale
+     window) on failure; both Zoom's and the payments controller's
+     `handle()` wrap their routing in a try/catch that calls exactly one of
+     these.
+
+Both webhook controllers (`zoom-webhooks.controller.ts`,
+`payments-webhooks.controller.ts`) were updated identically: `claim()`'s
+three-way outcome replaces the old boolean, and a try/catch around business
+processing calls `markProcessed`/`markFailed`.
+
+Residual, honestly-disclosed limit: a crash exactly inside the 120-second
+PROCESSING window leaves the event temporarily unresolved — a retry
+arriving inside that window is told `CLAIMED_BY_OTHER` and skips, since
+nothing distinguishes "someone is actively working on this" from "someone
+was working on this and died" until the window elapses. After it elapses,
+the very next retry (both Zoom and Paystack retry failed webhooks over a
+much longer horizon than 120 seconds) reclaims and completes it. This is
+"at least once, with a bounded resolution window" — the strongest guarantee
+a single Postgres database can offer without a message broker, and no
+stronger claim is made anywhere in the code or this document.
+
+Tests added (`webhook-idempotency.service.spec.ts`, 6 tests, using a real
+in-memory state machine rather than canned mock returns): first delivery
+claims (`PROCEED`); an already-`PROCESSED` event is a permanent no-op; a
+`markFailed`-ed attempt is immediately retryable and can complete; two
+simultaneous `claim()` calls resolve to exactly one `PROCEED` and one
+`CLAIMED_BY_OTHER`; a stale `PROCESSING` row is reclaimed after the window
+elapses (and rejected before it does); an unrelated DB error still
+propagates. Plus controller-level tests (`zoom-webhooks.controller.spec.ts`
++3, `payments-webhooks.controller.spec.ts` +2) proving `markProcessed`/
+`markFailed` are called at the right times and `CLAIMED_BY_OTHER` short-
+circuits routing.
+
+--- Correction 2: payment confirmation atomicity ---
+
+Finding: `confirmPayment` called `SubscriptionAccessService.create(...)`
+and then, in a separate write, updated `PaymentOrder` to PAID. A crash
+between the two could leave a genuinely-granted SubscriptionAccess with its
+originating order stuck PENDING forever, or (under concurrency) let two
+racing confirmations both pass `create()`'s own overlap check before either
+committed.
+
+Fix: `SubscriptionAccessService` was refactored (no behavior change to
+`create()` itself) so its validation and overlap-check are reusable as
+`createWithinExistingLock(tx, dto)` — for a caller that already holds an
+open transaction and has already acquired the exact advisory lock key
+`create()` would otherwise take for itself
+(`subscription-access:{learnerId}:{offeringId}`). `PaymentsService.
+confirmPayment` now:
+  1. Opens one `prisma.$transaction`, immediately taking an advisory lock
+     on `payment-order:{providerReference}` (via `withAdvisoryLock`) —
+     this alone serializes concurrent deliveries of the same confirmation.
+  2. Reads the order, validates status/amount/currency exactly as before.
+  3. Takes the `subscription-access:{learnerId}:{offeringId}` advisory
+     lock inside the SAME transaction.
+  4. Calls `createWithinExistingLock` and updates `PaymentOrder` to PAID
+     with the resulting `subscriptionAccessId` — both in the one
+     transaction. Either both commit or neither does; there is no
+     "between" any crash can land in.
+
+This reuses the existing concurrency-safe overlap-check rather than
+duplicating it, exactly as the review asked.
+
+Tests added/changed (`payments.service.spec.ts`): a new concurrency test
+serializes two simultaneous `confirmPayment` calls through a promise-queue
+`$transaction` mock (modeling the advisory lock's real effect) and proves
+`createWithinExistingLock` is called exactly once and the order ends up
+PAID; `subscription-access.service.spec.ts` gained 3 tests for
+`createWithinExistingLock` (reuses validation, rejects overlap, rejects a
+missing learner, never opens its own transaction). All prior confirmPayment
+tests (idempotent no-op, amount/currency mismatch, non-PENDING rejection,
+forged reference) continue to pass against the transactional rewrite.
+
+--- Correction 3: meeting provisioning concurrent duplicate creation ---
+
+Finding: `provisionForSession` read the session, decided it was claimable,
+and only then wrote PENDING — two concurrent calls (an automatic call from
+`create()` overlapping a manual ADMIN retry, or two rapid retry clicks)
+could both observe a claimable session and both call Zoom before either
+wrote PROVISIONED.
+
+Fix: `Session` gained `meetingProvisioningClaimedAt`. `provisionForSession`
+now performs one atomic conditional `updateMany` — `NOT_REQUIRED`/`FAILED`,
+or a `PENDING` claim older than a 120-second stale window, matched and
+flipped to `PENDING` with a fresh `claimedAt` in the same statement. Exactly
+one concurrent caller's `updateMany` matches; every other simultaneous
+caller matches zero rows and returns without ever calling Zoom.
+`PROVISIONED` still short-circuits permanently; `FAILED` remains freely
+retryable; a Zoom outage still cannot block Session creation (the whole
+method remains non-throwing).
+
+Documented precisely, per the review's explicit instruction not to overstate
+the guarantee: a crash exactly between winning the claim and Zoom
+responding leaves the session non-retryable for up to the 120-second stale
+window — not a race two live callers can both win, but a single-caller
+crash window inherent to any claim-then-act design without a two-phase
+commit against Zoom itself (which Zoom's API does not offer). After the
+window elapses, the very next automatic or manual retry reclaims it.
+
+Test added (`meeting-provisioning.service.spec.ts`, rewritten with a real
+in-memory Session store so the conditional `updateMany` is evaluated the
+way Postgres would): a dedicated concurrency test runs two
+`provisionForSession` calls in parallel against a Zoom mock with artificial
+latency and proves `createMeeting` is called exactly once; plus new tests
+for the stale-PENDING reclaim and for a fresh (not-yet-stale) PENDING claim
+being left alone. 11 tests total (was 8).
+
+--- Correction 4: notification / session-reminder crash and multi-instance safety ---
+
+4A — Session reminder claiming. Finding: `reminderSentAt` was claimed, then
+the `NotificationOutboxItem` rows were created in a separate write; a crash
+between them permanently lost the reminder (the claim survives, so no
+future tick ever retries a session that never actually got a notification).
+Fix: `NotificationsService.enqueue`/`enqueueForEntitledLearners`/
+`enqueueForAssignedTeachers` now accept an optional `db` parameter (a
+Prisma transaction client, defaulting to the ordinary client — the same
+`Db` pattern `SubscriptionAccessService` already used). `SessionReminder
+Scheduler.sendDueReminders` wraps the conditional claim (`updateMany`) and
+both enqueue calls in one `prisma.$transaction`; a claim that matches zero
+rows returns early as a no-op, and if anything inside the transaction
+throws, the whole thing — claim included — rolls back, so the next tick's
+`reminderSentAt: null` query still finds the session.
+
+4B — Notification dispatch. Finding: `dispatchPending` selected PENDING
+items via `findMany`, then sent and updated each — nothing stopped two
+Railway instances from both selecting and sending the same item.
+Fix: `NotificationOutboxItem` gained `claimedAt`; `NotificationStatus`
+gained `SENDING`. Each candidate item is claimed with its own atomic
+conditional `updateMany` (`PENDING`, or a `SENDING` claim older than a
+60-second stale window) immediately before this instance calls the email
+provider; a claim matching zero rows means another instance already won
+the item, and this instance skips it entirely. On failure the item reverts
+to `PENDING` (not left `SENDING`) so the very next tick can retry
+immediately.
+
+Tests added: `session-reminder.scheduler.spec.ts` gained a crash-safety
+test (an exception during enqueue propagates so the — real — transaction
+would roll back, and the claim's own `updateMany` call count is asserted)
+and a concurrent-scheduler-ticks test (two overlapping `sendDueReminders()`
+calls enqueue the reminder exactly once). `notification-dispatch.scheduler.
+spec.ts` was rewritten with a real in-memory outbox store for two new
+concurrency tests: two concurrent `dispatchPending()` calls send the same
+PENDING item only once, and a stale `SENDING` claim is reclaimed after its
+window (a fresh one is left alone). 9 tests total (was 5); 5 tests total for
+the reminder scheduler (was 3).
+
+--- Correction 5: recorded-attendance player telemetry — remove the seek heuristic ---
+
+Finding: the player treated any `currentTime` jump greater than 2 seconds
+between `timeupdate` events as a seek — fragile, since legitimate
+continuous playback can produce sparsely-spaced `timeupdate` events under
+background-tab throttling, device load, or a fast playback rate, either
+false-flagging real playback as a seek (discarding genuinely-watched time)
+or missing a real short seek.
+
+Fix: `RecordingPlayer` no longer infers anything from elapsed time between
+events. It listens for the browser's real `seeking` event — fired only when
+the browser is actually about to jump `currentTime` to a new position, per
+the HTML Media spec — and closes the in-progress segment there, using the
+last position `timeupdate` actually observed (not the new post-seek
+`currentTime`, which `seeking` already reflects by spec). The next
+`timeupdate` after the seek resolves establishes a fresh segment at the new
+position. `pause`/`ended` and the periodic 15-second flush behave exactly
+as before. `100%` qualification remains entirely backend-authoritative
+(`WatchedIntervalService` merges and recomputes coverage from every
+reported range on every write) — this player only needed to stop
+mis-reporting the ranges it fed that engine.
+
+Tests rewritten (`recording-player.test.tsx`, 6 tests, all using the
+browser's real `seeking` event rather than a synthetic time-gap):
+continuous playback with deliberately sparse `timeupdate` events (a 39-
+second jump with no `seeking` fired) is reported as one unbroken segment;
+a forward seek closes the prior segment at the last genuinely-played
+position and opens a fresh one at the seek target; a backward seek
+(rewatch) reports the actually-rewatched range (dedup is the backend's
+job, verified as already true); pause flushes and resume continues
+contiguously; end-of-video flushes; back-to-back seeks with nothing played
+between them report nothing (no zero-length segment).
+
+--- Corrected totals ---
+
+  Test additions from this correction round:
+    backend:  +21 tests (5 rewritten/expanded spec files, 1 file's tests
+              adjusted for the new mock shape: zoom-webhooks.controller,
+              payments-webhooks.controller, webhook-idempotency,
+              payments.service, subscription-access.service,
+              meeting-provisioning.service, session-reminder.scheduler,
+              notification-dispatch.scheduler)
+    frontend: +3 tests (recording-player.test.tsx rewritten, 6 tests
+              covering the five explicitly-requested scenarios plus a
+              zero-length-segment edge case)
+
+  Final totals (this document's section V has the complete verification
+  run): backend 391/391 (44 suites), frontend 63/63 (15 files).
+
+  One new migration:
+    apps/api/prisma/migrations/20260828134044_phase4_correction_crash_safety
+    — additive only (new enum, new columns, one enum value added to an
+    existing enum). No historical migration touched.
+
+
+--------------------------------------------------------------------------------
+AB. SECOND EXTERNAL REVIEW PASS — TEN FURTHER FINDINGS, ALL ADDRESSED
+--------------------------------------------------------------------------------
+
+An independent read-only adversarial review of the actual Phase 4
+implementation (including the AA corrections above) found ten further
+issues, all addressed in this pass. As with AA, none of the frozen rules
+listed in that review's boundary were touched — every fix below hardens
+crash-safety/concurrency/correctness in the mechanics around those rules.
+
+--- Finding 1 (CRITICAL): live attendance could be lost during participant-left processing ---
+
+Finding: `ZoomLiveAttendanceIngestionService.handleParticipantLeft` deleted
+the open `LiveParticipantSession` row BEFORE calling
+`LiveAttendanceIntervalService.ingest`. A crash or failure between the
+delete and the ingest call permanently lost that interval: a retry would
+find no open join, log "duplicate leave or missed join," and return
+success.
+
+Fix: the order is reversed — `ingest` is called first, and the row is only
+deleted (consumed) after `ingest` succeeds. This is safe specifically
+because `LiveAttendanceIntervalService.ingest` (frozen, untouched) is
+naturally idempotent for an identical `[joinedAt, leftAt]` pair: coverage
+is always recomputed from the full merged interval set, so a duplicate
+identical row contributes no extra coverage. A crash between the two steps
+is now recoverable: the retry re-ingests (harmless no-op) and then
+successfully consumes the still-open row. Consuming the row itself
+tolerates a `P2025` (already deleted by a concurrent/retried delivery) as
+a safe no-op, while any other database error propagates.
+
+Tests added (`zoom-live-attendance-ingestion.service.spec.ts`): ingest is
+proven to run before delete (via `invocationCallOrder`); an adversarial
+test simulates ingest failing, asserts the open join was never consumed,
+then retries and confirms it completes; a P2025-on-delete race is
+tolerated; a genuine database error on delete still propagates.
+
+--- Finding 2 (HIGH): webhook claims needed fencing ---
+
+Finding: the stale-claim reclaim window (Correction 1) let a second worker
+reclaim a `PROCESSING` event after the window elapsed even if the first
+worker was merely slow, not dead. Neither `markProcessed` nor `markFailed`
+verified the caller still owned the active claim, so a late-finishing
+stale worker could clobber a newer worker's state.
+
+Fix: `ProviderWebhookEvent` gained `claimToken` — a fresh random value
+written on every successful claim. `claim()` now returns
+`{ outcome: 'PROCEED', token }`; `markProcessed`/`markFailed` take that
+token and only write when it still matches the row's current token
+(an atomic conditional `updateMany`). A worker that lost its claim gets a
+logged no-op, never an overwrite. Applied identically to Zoom and payment
+webhook processing (both controllers pass their claim's token through).
+
+Tests added (`webhook-idempotency.service.spec.ts`, new `describe`
+block): a stale worker's `markProcessed` cannot affect an event a newer
+worker has since reclaimed; a stale worker's `markFailed` cannot revert a
+newer worker's completed `PROCESSED` state back to `RECEIVED`; both
+`markProcessed`/`markFailed` with a wrong token log and no-op rather than
+throwing.
+
+--- Finding 3 (HIGH): Zoom meeting provisioning needed fencing + a cancellation-race fix ---
+
+Finding: the stale-PENDING reclaim window (Correction 3) could let a
+second caller reclaim and also call Zoom while the first caller's Zoom
+request was merely slow. Also: if a session was canceled while
+provisioning was in flight, `releaseForCanceledSession` found no
+`providerMeetingId` yet (nothing to delete), and the in-flight provisioner
+could later write a live meeting onto the now-canceled session.
+
+Fix: `Session` gained `meetingProvisioningClaimToken`. The claim
+(`updateMany`) now writes a fresh token; persisting the final
+PROVISIONED/FAILED outcome is a second conditional `updateMany` requiring
+BOTH that the token still matches AND that the session's status is still
+not CANCELED. If either has changed, the caller lost the race — if it had
+already created a Zoom meeting, that orphaned meeting is deleted
+best-effort (logged) rather than ever finalized onto the session.
+
+Honestly documented limit (explicitly required by this finding, not
+glossed over): this does NOT claim exactly-once Zoom meeting creation. If
+a caller's Zoom request is genuinely still in flight when another caller
+reclaims and also calls Zoom, both may successfully create a meeting with
+Zoom — Zoom's API offers no cross-caller reservation primitive. Fencing
+guarantees only that at most one of those two outcomes is ever persisted
+onto the Session; the loser's orphaned meeting is cleaned up best-effort,
+never left silently attached anywhere. If that cleanup call itself fails,
+an inert orphaned Zoom-side meeting can remain with no TUBI Session
+pointing at it — a Zoom-side cleanup gap, not a TUBI data-integrity issue.
+
+Tests added (`meeting-provisioning.service.spec.ts`, two new `describe`
+blocks, 14 tests total, was 8): a slow-but-alive worker's Zoom meeting is
+deleted rather than finalized once its claim has been reclaimed; a session
+canceled while provisioning is in flight never receives a live
+`providerMeetingId`, and the meeting created after cancellation is cleaned
+up; a FAILED outcome is likewise never finalized onto a canceled session.
+
+--- Finding 4 (HIGH): notification dispatch claims needed fencing ---
+
+Finding: the 60-second `SENDING` lease (Correction 4B) is insufficient if
+SMTP genuinely takes longer than the lease — a second dispatcher could
+reclaim and a late-finishing first dispatcher could then overwrite its
+outcome.
+
+Fix: `NotificationOutboxItem` gained `claimToken`, written fresh on every
+successful claim; the final SENT/PENDING/FAILED write
+(`finalize`) is a conditional `updateMany` requiring that token to still
+match. A dispatcher that lost its claim logs a warning and discards its
+own write rather than overwriting the reclaiming instance's outcome.
+
+Honestly documented limit (explicitly required by this finding): if SMTP
+accepts the message and the process then dies before the SENT write
+commits, the item reverts to retryable (via the stale-window reclaim) and
+a retry sends the email again. There is no way to ask a plain-SMTP
+provider "did you already send this" — no delivery idempotency key exists
+to check. This design is **at-least-once delivery with duplicate
+minimization** (fencing prevents the far more common "two live instances
+both send it" case), never claimed anywhere as mathematically
+duplicate-free delivery.
+
+Tests added (`notification-dispatch.scheduler.spec.ts`, new `describe`
+block): a slow send that completes after the item was reclaimed by
+another instance does not clobber that instance's SENT outcome.
+
+--- Finding 5 (HIGH): payment success and failure needed the same terminal-state serialization ---
+
+Finding: `confirmPayment` took the `payment-order:{reference}` advisory
+lock; `failPayment` did not — a concurrent `charge.success` and
+`charge.failed` for the same order were not deterministically ordered
+against each other.
+
+Fix: `failPayment` now takes the identical advisory lock and runs inside
+the identical transaction policy as `confirmPayment`. Deterministic rule,
+enforced by both methods: whichever terminal event (PAID or FAILED)
+acquires the lock first decides the order's one and only terminal state; a
+later-arriving contradictory event is a safe, logged no-op — `failPayment`
+never downgrades an already-PAID order, and `confirmPayment` never grants
+access to an order already FAILED/CANCELED/REFUNDED. Provider event
+*arrival order* determines which state wins, never an undefined or mixed
+state (e.g. FAILED with a `subscriptionAccessId` attached is now provably
+impossible).
+
+Tests added (`payments.service.spec.ts`, new `describe` block): success
+followed by a late failure never downgrades the grant; failure followed by
+a late success never grants access; a genuinely concurrent success/failure
+pair (serialized through the same lock-emulation queue as the Correction 2
+concurrency test) always resolves to exactly one consistent terminal
+state, verified by checking `subscriptionAccessId` presence matches the
+resolved status exactly.
+
+--- Finding 6 (HIGH): the recording player needed to retry failed watched-interval sends ---
+
+Finding: `RecordingPlayer.flush()` cleared the pending interval before its
+API write succeeded — a transient network/API failure silently and
+permanently lost that genuinely-watched coverage.
+
+Fix: captured segments are pushed onto a retry queue (`pendingRangesRef`)
+rather than reported-then-discarded. Each queued range is sent
+independently; a range whose send fails is put back on the queue by the
+`.catch()` handler and is retried on the next flush trigger (the
+15-second interval, or the next pause/seek/end) — never dropped. A
+successful send removes the range from the queue permanently. Sending the
+same range twice (e.g. a legitimate retry) remains harmless because
+`WatchedIntervalService` merges every reported range and recomputes total
+unique coverage from scratch — exactly the same backend-authoritative
+guarantee Correction 5 already relied on. Forward seeking still never
+manufactures coverage (unchanged `seeking`-based segment boundaries).
+
+Tests added (`recording-player.test.tsx`, +2, 8 total): a transient send
+failure keeps the interval queued and a later flush retries it
+successfully; a successfully-sent interval is never sent again on a
+subsequent flush.
+
+--- Finding 7 (MEDIUM): participant-joined handling swallowed arbitrary database errors ---
+
+Finding: `handleParticipantJoined`'s `catch` block treated ANY error from
+the `LiveParticipantSession` insert as a safe duplicate-join no-op —
+including connection errors and unrelated constraint failures, which
+should instead propagate so the webhook is marked failed and retried.
+
+Fix: the catch block now checks specifically for a `P2002` unique-
+constraint violation (the actual expected duplicate-join case) and
+re-throws everything else.
+
+Tests added (`zoom-live-attendance-ingestion.service.spec.ts`): a genuine
+`P2002` is still swallowed; a generic database error (e.g. "connection
+reset") now propagates instead of being silently absorbed.
+
+--- Finding 8 (MEDIUM): notification enqueue did not match its own documented best-effort semantics ---
+
+Finding: several call sites' comments explicitly say "best-effort — never
+blocks the primary operation," but the actual code awaited the enqueue
+call with no `try`/`catch` — an enqueue failure would propagate and cause
+the caller to see the *primary* mutation (registration, session
+cancellation, session replacement, recording publication) reported as
+failed, despite it having already committed successfully.
+
+Fix: every best-effort enqueue call site now catches and logs rather than
+propagating: `AuthService.register` (ACCOUNT_REGISTERED),
+`SessionsService.create`'s replacement notification
+(SESSION_REPLACEMENT), `SessionsService.cancel` (SESSION_CANCELED, both
+learner and teacher notifications), and
+`ZoomRecordingIngestionService.ingest` (RECORDING_AVAILABLE — chosen
+best-effort here too, so a mere outbox-write hiccup never causes Zoom to
+see the whole webhook as failed and retry it purely over an unrelated
+notification). `SessionReminderScheduler`'s enqueue calls were
+deliberately left as-is: that flow's whole point (Correction 4A) is that
+the reminder claim and the notification rows are atomic within one
+transaction, so an enqueue failure there is *supposed* to roll back the
+claim, not be swallowed.
+
+No test additions were needed beyond what AA's existing test suites
+already exercise for the successful paths — this fix only removes an
+incorrect failure-propagation path; the corrected behavior is implicitly
+covered by every existing test that asserts these methods resolve
+successfully once their primary mutation completes.
+
+--- Finding 9 (MEDIUM): recording publication/notification idempotency ---
+
+Finding: `RecordingService.publishFromProvider` returned the recording
+row on both a genuine new creation and a duplicate-webhook no-op
+identically, so `ZoomRecordingIngestionService` could not tell them apart
+and would enqueue a second `RECORDING_AVAILABLE` notification for a
+redelivered webhook. Separately, a `providerRecordingId` uniqueness
+violation belonging to a DIFFERENT session was being treated identically
+to "this session already published" — silently swallowed as if this
+session's publication had succeeded.
+
+Fix: `publishFromProvider` now returns `{ recording, created } | null`.
+On a unique-constraint conflict, it looks up the recording by `sessionId`:
+if found, this session genuinely already has one — `created: false`,
+idempotent no-op. If NOT found (sessionId was free), the conflict must
+have been on `providerRecordingId` belonging to a different session — a
+genuine data inconsistency, now re-thrown rather than silently absorbed.
+`ZoomRecordingIngestionService` only enqueues `RECORDING_AVAILABLE` when
+`created` is `true`.
+
+Tests added (`recording.service.spec.ts`, new `describe` block): a fresh
+publish reports `created: true`; a same-session duplicate reports
+`created: false` with the existing row; a `providerRecordingId` conflict
+with no existing row for this session re-throws rather than succeeding.
+`zoom-recording-ingestion.service.spec.ts` gained tests confirming no
+second notification is sent for `created: false`, and that a genuine
+`publishFromProvider` failure propagates so the webhook is marked failed.
+
+--- Finding 10: Zoom recorded-attendance product-capability gap ---
+
+Investigated as requested: does the existing Zoom integration/account
+model provide a technically reliable path to TUBI-authoritative recorded-
+watch telemetry for Zoom cloud recordings?
+
+Zoom's Cloud Recording API does expose a `download_url` (in addition to
+the `share_url`/`play_url` this milestone already uses) that can be
+fetched with either a short-lived per-recording download token or an
+OAuth Bearer credential, and normal Server-to-Server OAuth scopes
+(`recording:read`) can authorize it. So, technically: yes, TUBI could
+download the actual recording file.
+
+But a downloaded file is not, by itself, a playable resource for
+`RecordingPlayer` — it would need to be re-hosted somewhere TUBI's
+`<video>` element can stream it from (object storage with either public
+or short-lived-signed URLs; realistic options are S3/S3-compatible, a
+Vercel-adjacent blob store, or similar). That is a genuine new
+infrastructure decision: a storage vendor, an ongoing storage/egress
+cost, a retention policy (how long recordings are kept, who deletes them
+and when), and a download/rehost pipeline (webhook-triggered download job,
+error handling for large files, disk/memory limits on Railway's ephemeral
+containers). This is precisely the "selecting/financing new storage/video
+infrastructure" case this milestone's own instructions call out as a
+stop-and-ask condition, not a "smallest robust route" the accelerated-
+execution rule was meant to authorize on its own.
+
+Recommendation (no code changed for this finding — documentation only,
+per the instructions): leave Zoom-ingested recordings non-qualifying for
+RECORDED attendance for this launch. The frozen 100% genuine unique
+timeline coverage rule is not weakened and no attendance is fabricated —
+a learner who only watches a Zoom-hosted recording externally simply does
+not accrue RECORDED completion for that session; if invited, the founder
+can either (a) approve a rehosting pipeline (a follow-up, scoped
+milestone, once a storage vendor/budget is chosen), or (b) treat any
+class needing reliable RECORDED-completion tracking as one that should
+also record a directly-hosted file (the existing manual ADMIN publish
+path already gives `RecordingPlayer`'s full telemetry for that case
+today). This is a launch-readiness limitation, not a defect — it was
+already disclosed in section X of the original review and remains
+accurately disclosed here.
+
+
+--------------------------------------------------------------------------------
+AC. UPDATED FINAL VERIFICATION (after both correction passes)
+--------------------------------------------------------------------------------
+
+  backend tests:        412/412 passing (44 suites)
+                         [286/286 pre-Phase-4 -> 370/370 first pass ->
+                          391/391 after AA -> 412/412 after AB]
+  frontend tests:         65/65 passing (15 files)
+                         [46/46 pre-Phase-4 -> 60/60 first pass ->
+                          63/63 after AA -> 65/65 after AB]
+  root typecheck:        clean
+  frontend typecheck:    clean
+  backend typecheck:     clean
+  backend ESLint:        clean (zero eslint-disable in any Phase 4 file)
+  frontend ESLint:       clean (zero eslint-disable in any Phase 4 file)
+  API production build:  clean (`nest build`)
+  web production build:  clean — 21 routes (18 static, 3 dynamic), unchanged
+                          by this correction pass (internal hardening only)
+  Prisma format:          clean
+  Prisma validate:        clean
+  Prisma generate:        clean
+  Migration verification: `prisma migrate status` reports "Database schema
+                          is up to date!" against the shared dev database
+                          after applying all four migrations via
+                          `prisma migrate deploy`
+  repository format check: clean (`prettier --check .`)
+
+Schema/migration changes in this pass: one new migration,
+apps/api/prisma/migrations/20260828221907_phase4_correction_claim_fencing
+— additive only (`claimToken` columns on `ProviderWebhookEvent`,
+`Session` (`meetingProvisioningClaimToken`), and
+`NotificationOutboxItem`). No historical migration touched.
+
+Overstated-guarantee corrections to this document itself: section I's
+idempotency description and section AA's Correction 1/3/4 text originally
+implied the stale-window reclaim alone was a complete solution; this pass
+adds the fencing layer on top and the honest at-least-once/no-stronger-
+than-Zoom-can-guarantee language is now stated explicitly in each
+corrected section above rather than implied.
+
+
+--------------------------------------------------------------------------------
+AD. THIRD EXTERNAL REVIEW PASS — TWO POST-OP CORRECTIONS
+--------------------------------------------------------------------------------
+
+A final independent code review of the AB-corrected implementation found
+the ten AB findings substantially fixed, but identified one further High
+defect and one further Medium playback edge case. Both are fixed below;
+nothing else was touched.
+
+--- H1: a Zoom meeting could be created successfully but then silently lost if its own persistence write failed ---
+
+Finding: `provisionForSession` wrapped `zoom.createMeeting()` AND the
+success-path `finalize()` persistence call in the SAME try/catch. If Zoom
+genuinely created a meeting but the subsequent database write threw (a
+real error — a connection failure, not `finalize`'s own internal "lost
+the claim" `count === 0` no-op, which does not throw), the single catch
+block treated this identically to "the provider call itself failed": it
+discarded `meeting.providerMeetingId` entirely and marked the session
+FAILED — which is retryable. The next retry would then create a SECOND,
+genuinely new Zoom meeting, while the first sat completely untracked by
+TUBI (no Session row references it, so nothing would ever clean it up).
+
+Fix: provider-call failure and post-provider persistence failure are now
+two separate try/catch blocks around two separate steps:
+  1. `zoom.createMeeting()` alone. If this throws, no external meeting
+     was ever created — there is nothing to track or clean up; the
+     session is marked FAILED exactly as before.
+  2. Once Zoom has returned a real meeting, `finalize(...)` runs in its
+     own try/catch. If IT throws (the persistence write itself failed,
+     not merely lost the claim), the handler:
+       - Logs the orphaned meeting id explicitly (never silently
+         discarded).
+       - Attempts to delete that Zoom meeting (best-effort — the smallest
+         robust way to prevent a needless duplicate on the next retry).
+       - Records FAILED via a new `markFailed` helper that is itself
+         wrapped so a failure in this final best-effort write (e.g. the
+         database is still down) is logged and swallowed rather than
+         thrown — `provisionForSession`'s non-throwing contract holds
+         even when both the persistence write and the cleanup attempt
+         fail.
+     If the cleanup deletion itself also fails, the FAILED error message
+     explicitly names the orphaned meeting id for manual reconciliation,
+     rather than pretending cleanup succeeded.
+
+This does not create a new exactly-once claim beyond what Correction 3
+already disclosed: if Zoom creation succeeds and persistence then fails
+and cleanup ALSO fails, an orphaned Zoom-side meeting can remain with no
+TUBI Session pointing at it — inert, not a data-integrity issue, and
+already the same category of honestly-disclosed gap Correction 3
+documented. What H1 fixes is specifically that the `providerMeetingId`
+is no longer silently forgotten the moment persistence fails — it is
+always either recorded, or its cleanup is attempted and the attempt (and
+its outcome, success or failure) is logged.
+
+Tests added (`meeting-provisioning.service.spec.ts`, +2, 16 total): a
+successful Zoom creation followed by a persistence-write failure (a
+genuine thrown error on the finalize `updateMany`, not a `count: 0`)
+proves the orphaned meeting is deleted and the session never ends up
+claiming a PROVISIONED meeting it never actually persisted; a second test
+proves the method still resolves without throwing, and still records
+FAILED with a message naming the un-cleanable meeting, when the cleanup
+deletion itself also fails.
+
+--- M1: the final watched range could be lost on navigation/unmount ---
+
+Finding: the retry queue introduced for Correction 6 relies on the
+component staying mounted long enough for a later flush to retry a failed
+send. On unmount, the existing cleanup called the ordinary `flush()` —
+but a plain in-flight `fetch` is commonly aborted by the browser the
+moment the page that started it is torn down (navigation, tab close), so
+even that final call was not reliable, and there is no later flush to
+retry into once the component is gone. The last genuinely-watched range
+could therefore exist only in an in-memory ref that disappears with the
+component.
+
+Fix: `RecordingPlayer` now has a dedicated `finalFlush()` used in two
+places — the component's unmount cleanup, AND a new `pagehide` window
+event listener (fired reliably on navigation and tab close, including
+back-forward-cache eviction, unlike the increasingly-unreliable
+`beforeunload`). `finalFlush()` captures the in-progress segment and
+sends every currently-queued range (including anything still queued from
+an earlier failed send) with `{ keepalive: true }` passed through to
+`fetch` — a real, standard browser mechanism (not a new architecture)
+that asks the browser to keep trying to deliver the request even after
+the document that started it is gone. `api-client.ts`'s `apiRequest`
+gained a `keepalive` option (passed straight to `fetch`) to support this;
+`learnerPortalApi.reportWatchedInterval` gained an optional `options`
+parameter to carry it through. No offline-sync/queue-persistence
+architecture was introduced — the existing in-memory retry queue is
+simply also drained, once, with `keepalive: true`, at the two points a
+page/component teardown can plausibly be detected.
+
+Honestly documented boundary (explicit in the component's own doc
+comment now, not merely implied): this is still not a delivery
+guarantee. A hard OS/browser kill or crashed tab can still drop the
+final request before the browser has a chance to send it — `keepalive`
+asks the browser to try harder, it does not make delivery certain across
+an arbitrary process kill. If the final range never reaches the backend,
+it simply never contributes to coverage: genuinely-watched time is at
+risk of under-counting on a hard close, never over-counting, and nothing
+is fabricated either way. Duplicate delivery (the interval timer and
+`pagehide` both firing for an overlapping range, or a `pagehide` firing
+before an unmount that also runs) is harmless and expected, since
+`WatchedIntervalService` merges every reported range and recomputes total
+unique coverage from scratch — 100% qualification remains entirely
+backend-authoritative, exactly as every earlier correction round already
+established.
+
+Tests added (`recording-player.test.tsx`, +3, 11 total): unmount sends
+the final buffered range with `{ keepalive: true }`; the browser
+`pagehide` event does the same without requiring unmount; and a range
+that had previously failed to send (and was sitting in the retry queue)
+is included in the final keepalive delivery rather than being left
+behind. `api-client.test.ts` continues to pass unchanged — `keepalive`
+defaults to `false` and every existing call site is unaffected.
+
+
+--------------------------------------------------------------------------------
+AE. FINAL VERIFICATION (after all three review passes)
+--------------------------------------------------------------------------------
+
+  backend tests:        414/414 passing (44 suites)
+                         [286/286 pre-Phase-4 -> 370/370 first pass ->
+                          391/391 after AA -> 412/412 after AB ->
+                          414/414 after AD]
+  frontend tests:         68/68 passing (15 files)
+                         [46/46 pre-Phase-4 -> 60/60 first pass ->
+                          63/63 after AA -> 65/65 after AB ->
+                          68/68 after AD]
+  root typecheck:        clean
+  frontend typecheck:    clean
+  backend typecheck:     clean
+  backend ESLint:        clean (zero eslint-disable in any Phase 4 file)
+  frontend ESLint:       clean (zero eslint-disable in any Phase 4 file)
+  API production build:  clean (`nest build`)
+  web production build:  clean — 21 routes (18 static, 3 dynamic), unchanged
+                          by this correction pass
+  Prisma format:          clean
+  Prisma validate:        clean
+  Prisma generate:        clean
+  Migration verification: `prisma migrate status` reports "Database schema
+                          is up to date!" — no schema change in this pass
+                          (H1 and M1 are both application-code fixes; the
+                          four existing migrations are unchanged)
+  repository format check: clean (`prettier --check .`)
+
+No schema/migration changes in this pass.
+
+Remaining unavoidable external-provider/browser-lifecycle boundaries,
+stated once more precisely and in full: webhook processing has a
+~120-second window where a genuine mid-processing crash appears "claimed
+by another worker" until reclaimed; Zoom meeting provisioning cannot
+guarantee exactly-once external creation if a merely-slow (not dead)
+request races a reclaim, though at most one outcome is ever finalized
+onto the Session and the other is best-effort cleaned up (H1 additionally
+ensures a persistence failure after a successful creation is never
+confused with a provider failure); notification dispatch is at-least-once
+with duplicate minimization, since no plain-SMTP provider offers a
+delivery idempotency key; and the recording player's final watched-range
+delivery on navigation/unmount is a robust best-effort attempt via
+`keepalive`, not a guarantee against a hard OS/browser kill.
+
+
+================================================================================
+END OF PHASE 4 REVIEW DOCUMENT — awaiting external review before commit/tag/push.
+================================================================================

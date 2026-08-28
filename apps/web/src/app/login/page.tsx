@@ -4,6 +4,8 @@ import { useRouter } from 'next/navigation';
 import { useState } from 'react';
 import type { FormEvent } from 'react';
 
+import Link from 'next/link';
+
 import { useAuth } from '@/context/auth-context';
 import { homeRouteForRole } from '@/components/shell/nav-config';
 import { Field, TextInput } from '@/components/ui/form';
@@ -75,6 +77,13 @@ export default function LoginPage() {
             {isSubmitting ? 'Signing in…' : 'Sign in'}
           </Button>
         </form>
+
+        <p className="text-muted-foreground mt-4 text-center text-sm">
+          New to TUBI?{' '}
+          <Link href="/register" className="text-foreground font-medium underline">
+            Create a learner account
+          </Link>
+        </p>
       </div>
     </main>
   );

@@ -12,6 +12,7 @@ import type {
   LearnerVisibleSession,
   LearnerWithUser,
   Offering,
+  PaymentOrder,
   SanitizedUser,
   SessionRecording,
   SessionWithRelations,
@@ -113,7 +114,10 @@ export const sessionsApi = {
     sessionDate: string;
     startTime: string;
     endTime: string;
-    liveMeetingUrl: string;
+    /** Optional as of Phase 4 — leave unset to let MeetingProvisioningService
+     * create the Zoom meeting automatically. Only supply this as a manual
+     * fallback. */
+    liveMeetingUrl?: string;
     replacementForSessionId?: string;
     assistantTeacherIds?: string[];
     substituteTeacherIds?: string[];
@@ -146,6 +150,10 @@ export const sessionsApi = {
       incomingTeacherId,
       outgoingTeacherAction,
     }),
+  /** Manual retry for a session whose automatic Zoom provisioning failed
+   * (section E — launch-console reconciliation action). */
+  provisionMeeting: (id: string) =>
+    api.post<SessionWithRelations>(`/admin/sessions/${id}/provision-meeting`),
 };
 
 // ---------------------------------------------------------------------------
@@ -243,9 +251,28 @@ export const learnerPortalApi = {
   getSession: (id: string) => api.get<LearnerVisibleSession>(`/learner/sessions/${id}`),
   getAttendance: (id: string) =>
     api.get<AttendanceRecord & CoverageSummary>(`/learner/sessions/${id}/attendance`),
-  reportWatchedInterval: (sessionId: string, startSecond: number, endSecond: number) =>
-    api.post<void>(`/learner/sessions/${sessionId}/recording/watched-intervals`, {
-      startSecond,
-      endSecond,
-    }),
+  reportWatchedInterval: (
+    sessionId: string,
+    startSecond: number,
+    endSecond: number,
+    options?: { keepalive?: boolean },
+  ) =>
+    api.post<void>(
+      `/learner/sessions/${sessionId}/recording/watched-intervals`,
+      { startSecond, endSecond },
+      options,
+    ),
+};
+
+// ---------------------------------------------------------------------------
+// Commercial layer (apps/api/src/payments) — Phase 4
+// ---------------------------------------------------------------------------
+
+export const paymentsApi = {
+  /** Learner-facing commercial discovery — what's available to subscribe
+   * to, before any SubscriptionAccess exists. */
+  listOfferings: () => api.get<Offering[]>('/learner/offerings'),
+  checkout: (offeringId: string) =>
+    api.post<{ checkoutUrl: string }>('/learner/payments/checkout', { offeringId }),
+  listAll: () => api.get<PaymentOrder[]>('/admin/payments'),
 };

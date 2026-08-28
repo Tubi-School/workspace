@@ -108,6 +108,8 @@ export interface SessionTeacherEntry {
  * Deliberately has no `recording` relation (the backend include for this
  * surface does not join it — see section R of the Phase 3 review for what
  * that means for this UI). */
+export type MeetingProvisioningStatus = 'NOT_REQUIRED' | 'PENDING' | 'PROVISIONED' | 'FAILED';
+
 export interface SessionWithRelations {
   id: string;
   courseId: string;
@@ -119,6 +121,9 @@ export interface SessionWithRelations {
   status: SessionStatus;
   canceledAt: string | null;
   replacementForSessionId: string | null;
+  meetingProvider: string | null;
+  meetingProvisioningStatus: MeetingProvisioningStatus;
+  meetingProvisioningError: string | null;
   course: {
     id: string;
     title: string;
@@ -132,6 +137,10 @@ export interface SessionRecording {
   recordingUrl: string;
   availableFrom: string;
   totalSeconds: number;
+  /** Set when a provider (Zoom) ingested this recording automatically.
+   * `null` for a manually-published recording. See the learner session
+   * page for why this changes how playback is offered. */
+  provider: string | null;
 }
 
 /** The learner-facing session shape — GET /learner/sessions and /learner/sessions/:id.
@@ -188,6 +197,20 @@ export interface SubscriptionAccess {
   status: SubscriptionStatus;
   currentPeriodStart: string;
   currentPeriodEnd: string;
+}
+
+export type PaymentStatus = 'PENDING' | 'PAID' | 'FAILED' | 'CANCELED' | 'REFUNDED';
+
+export interface PaymentOrder {
+  id: string;
+  learnerId: string;
+  offeringId: string;
+  provider: string;
+  providerReference: string | null;
+  amountMinor: number;
+  currency: string;
+  status: PaymentStatus;
+  createdAt: string;
 }
 
 export interface AttendanceWindowException {

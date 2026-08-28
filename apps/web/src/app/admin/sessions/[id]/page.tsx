@@ -29,6 +29,11 @@ export default function AdminSessionDetailPage() {
     session.refetch();
   });
 
+  const provisionAction = useAsyncAction(async () => {
+    await sessionsApi.provisionMeeting(sessionId);
+    session.refetch();
+  });
+
   const [teacherId, setTeacherId] = useState('');
   const [role, setRole] = useState<TeacherRole>('ASSISTANT');
   const assignAction = useAsyncAction(async () => {
@@ -114,6 +119,55 @@ export default function AdminSessionDetailPage() {
         )}
         {lifecycleAction.error && (
           <p className="text-danger mt-2 text-sm">{lifecycleAction.error}</p>
+        )}
+      </Card>
+
+      <Card className="mb-6">
+        <h2 className="mb-3 text-sm font-semibold">Live classroom</h2>
+        <div className="flex flex-wrap items-center gap-3">
+          <Badge
+            tone={
+              s.meetingProvisioningStatus === 'PROVISIONED'
+                ? 'success'
+                : s.meetingProvisioningStatus === 'FAILED'
+                  ? 'danger'
+                  : s.meetingProvisioningStatus === 'PENDING'
+                    ? 'warning'
+                    : 'neutral'
+            }
+          >
+            {s.meetingProvisioningStatus}
+          </Badge>
+          {s.meetingProvider && (
+            <span className="text-muted-foreground text-sm">via {s.meetingProvider}</span>
+          )}
+          {s.liveMeetingUrl && (
+            <a
+              href={s.liveMeetingUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-foreground text-sm underline"
+            >
+              Open meeting
+            </a>
+          )}
+          {s.meetingProvisioningStatus !== 'PROVISIONED' &&
+            (s.status === 'SCHEDULED' || s.status === 'LIVE') && (
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={provisionAction.isSubmitting}
+                onClick={() => void provisionAction.run()}
+              >
+                {provisionAction.isSubmitting ? 'Provisioning…' : 'Retry provisioning'}
+              </Button>
+            )}
+        </div>
+        {s.meetingProvisioningError && (
+          <p className="text-danger mt-2 text-sm">{s.meetingProvisioningError}</p>
+        )}
+        {provisionAction.error && (
+          <p className="text-danger mt-2 text-sm">{provisionAction.error}</p>
         )}
       </Card>
 

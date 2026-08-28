@@ -19,6 +19,11 @@ import { WindowExceptionService } from './window-exception.service.js';
     WindowExceptionService,
     AttendanceFinalizerScheduler,
   ],
-  exports: [AttendanceService, WatchedIntervalService, RecordingService],
+  exports: [
+    AttendanceService,
+    LiveAttendanceIntervalService,
+    WatchedIntervalService,
+    RecordingService,
+  ],
 })
 export class AttendanceModule {}

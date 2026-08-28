@@ -189,11 +189,25 @@ describe('Teachers + Sessions RBAC', () => {
 
     const fakeConfigService = {
       getOrThrow: (key: string) => (key === 'JWT_SECRET' ? TEST_JWT_SECRET : '1h'),
+      // ZoomProviderService (imported transitively via SessionsModule)
+      // reads config through `.get`, not `.getOrThrow` — returning
+      // undefined for everything here keeps it in its unconfigured,
+      // local-dev-fake-allowed state, exactly as an environment with no
+      // ZOOM_* credentials would.
+      get: () => undefined,
     };
+
+    @Global()
+    @Module({
+      providers: [{ provide: ConfigService, useValue: fakeConfigService }],
+      exports: [ConfigService],
+    })
+    class FakeConfigModule {}
 
     const moduleRef = await Test.createTestingModule({
       imports: [
         FakePrismaModule,
+        FakeConfigModule,
         JwtModule.register({
           secret: TEST_JWT_SECRET,
           signOptions: { algorithm: JWT_ALGORITHM, expiresIn: '1h' },
@@ -201,7 +215,7 @@ describe('Teachers + Sessions RBAC', () => {
         TeachersModule,
         SessionsModule,
       ],
-      providers: [JwtStrategy, { provide: ConfigService, useValue: fakeConfigService }],
+      providers: [JwtStrategy],
     }).compile();
 
     app = moduleRef.createNestApplication();

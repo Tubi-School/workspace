@@ -80,6 +80,16 @@ interface RequestOptions {
   /** Omit the Authorization header even if a token is stored — only used
    * for the login/register endpoints, which authenticate the caller. */
   skipAuth?: boolean;
+  /** Passed straight through to `fetch`. Lets a request outlive page
+   * teardown (navigation/tab close) — the browser is asked to keep trying
+   * to send it even after the page that started it is gone, rather than
+   * aborting it outright the way an ordinary in-flight fetch is. Used only
+   * for a final best-effort delivery attempt (e.g. RecordingPlayer's
+   * pagehide/unmount flush) — never a guarantee, since a hard browser
+   * kill (crash, forced process termination) can still drop it before the
+   * OS/browser has a chance to send anything. See RecordingPlayer's own
+   * doc comment for the honestly-bounded limit this accepts. */
+  keepalive?: boolean;
 }
 
 function extractMessage(payload: unknown, fallback: string): string {
@@ -99,7 +109,7 @@ function extractMessage(payload: unknown, fallback: string): string {
  * or mis-handle an error, and it is this one.
  */
 export async function apiRequest<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { method = 'GET', body, skipAuth = false } = options;
+  const { method = 'GET', body, skipAuth = false, keepalive = false } = options;
 
   const headers: Record<string, string> = { Accept: 'application/json' };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -115,6 +125,7 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
       method,
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
+      keepalive,
     });
   } catch {
     // Network failure (API unreachable, CORS, offline) — never surface the
@@ -150,8 +161,11 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
 
 export const api = {
   get: <T>(path: string) => apiRequest<T>(path),
-  post: <T>(path: string, body?: unknown, options?: Pick<RequestOptions, 'skipAuth'>) =>
-    apiRequest<T>(path, { method: 'POST', body, ...options }),
+  post: <T>(
+    path: string,
+    body?: unknown,
+    options?: Pick<RequestOptions, 'skipAuth' | 'keepalive'>,
+  ) => apiRequest<T>(path, { method: 'POST', body, ...options }),
   patch: <T>(path: string, body?: unknown) => apiRequest<T>(path, { method: 'PATCH', body }),
   delete: <T>(path: string) => apiRequest<T>(path, { method: 'DELETE' }),
 };

@@ -2,6 +2,7 @@
 
 import { useParams } from 'next/navigation';
 
+import { Button } from '@tubi/ui';
 import { AttendanceStatusBadge } from '@/components/attendance-status-badge';
 import { SessionStatusBadge } from '@/components/session-status-badge';
 import { Badge } from '@/components/ui/badge';
@@ -44,6 +45,26 @@ export default function TeacherSessionDetailPage() {
         description={new Date(s.startTime).toLocaleString()}
         actions={<SessionStatusBadge status={s.status} />}
       />
+
+      <Card className="mb-6">
+        <h2 className="mb-3 text-sm font-semibold">Live classroom</h2>
+        {s.liveMeetingUrl ? (
+          <a
+            href={s.liveMeetingUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-block"
+          >
+            <Button size="sm">{s.status === 'LIVE' ? 'Join class' : 'Start class'}</Button>
+          </a>
+        ) : (
+          <p className="text-muted-foreground text-sm">
+            {s.meetingProvisioningStatus === 'FAILED'
+              ? 'Meeting setup failed — contact an administrator.'
+              : 'Meeting is still being set up.'}
+          </p>
+        )}
+      </Card>
 
       <Card className="mb-6">
         <h2 className="mb-3 text-sm font-semibold">Teaching team</h2>

@@ -3,6 +3,7 @@ import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcryptjs';
 
 import { Prisma, RoleName, type User } from '../generated/prisma/client.js';
+import type { NotificationsService } from '../notifications/notifications.service.js';
 import type { PrismaService } from '../prisma/prisma.service.js';
 import { AuthService } from './auth.service.js';
 
@@ -53,7 +54,12 @@ describe('AuthService', () => {
     );
 
     const jwtService = new JwtService({ secret: 'test-secret' });
-    service = new AuthService(prisma as unknown as PrismaService, jwtService);
+    const notifications = { enqueue: jest.fn().mockResolvedValue(undefined) };
+    service = new AuthService(
+      prisma as unknown as PrismaService,
+      jwtService,
+      notifications as unknown as NotificationsService,
+    );
   });
 
   describe('register', () => {

@@ -91,4 +91,66 @@ describe('RecordingService', () => {
     // test documents that fact rather than exercising a mock.
     expect(Object.keys(prisma)).not.toContain('attendanceRecord');
   });
+
+  describe('publishFromProvider (Phase 4 external review Correction 9)', () => {
+    const providerData = {
+      recordingUrl: 'https://zoom.us/rec/share/rec-1',
+      totalSeconds: 1800,
+      availableFrom: new Date(),
+      provider: 'ZOOM',
+      providerRecordingId: 'rec-1',
+    };
+
+    it('reports created: true for a genuinely new publication', async () => {
+      prisma.session.findUnique.mockResolvedValue({ id: SESSION_ID, status: SessionStatus.ENDED });
+      prisma.sessionRecording.create.mockResolvedValue({
+        id: 'recording-1',
+        sessionId: SESSION_ID,
+      });
+
+      const result = await service.publishFromProvider(SESSION_ID, providerData);
+
+      expect(result).toEqual({
+        recording: { id: 'recording-1', sessionId: SESSION_ID },
+        created: true,
+      });
+    });
+
+    it('reports created: false (idempotent no-op) when this session already has a recording', async () => {
+      prisma.session.findUnique.mockResolvedValue({ id: SESSION_ID, status: SessionStatus.ENDED });
+      prisma.sessionRecording.create.mockRejectedValue(
+        new Prisma.PrismaClientKnownRequestError('duplicate', {
+          code: 'P2002',
+          clientVersion: 'test',
+        }),
+      );
+      const existing = { id: 'recording-1', sessionId: SESSION_ID, providerRecordingId: 'rec-1' };
+      prisma.sessionRecording.findUnique.mockResolvedValue(existing);
+
+      const result = await service.publishFromProvider(SESSION_ID, providerData);
+
+      expect(result).toEqual({ recording: existing, created: false });
+    });
+
+    it('never treats a providerRecordingId conflict belonging to a DIFFERENT session as successful publication of this session', async () => {
+      prisma.session.findUnique.mockResolvedValue({ id: SESSION_ID, status: SessionStatus.ENDED });
+      const conflict = new Prisma.PrismaClientKnownRequestError(
+        'Unique constraint failed on the fields: (`providerRecordingId`)',
+        { code: 'P2002', clientVersion: 'test' },
+      );
+      prisma.sessionRecording.create.mockRejectedValue(conflict);
+      // This session itself has no recording — the conflict was really
+      // about providerRecordingId belonging to some other session.
+      prisma.sessionRecording.findUnique.mockResolvedValue(null);
+
+      await expect(service.publishFromProvider(SESSION_ID, providerData)).rejects.toThrow(conflict);
+    });
+
+    it('returns null for a session that has not ended, never publishing', async () => {
+      prisma.session.findUnique.mockResolvedValue({ id: SESSION_ID, status: SessionStatus.LIVE });
+
+      await expect(service.publishFromProvider(SESSION_ID, providerData)).resolves.toBeNull();
+      expect(prisma.sessionRecording.create).not.toHaveBeenCalled();
+    });
+  });
 });

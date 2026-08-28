@@ -8,6 +8,7 @@ import * as bcrypt from 'bcryptjs';
 import request from 'supertest';
 
 import { RoleName, type User } from '../generated/prisma/client.js';
+import { NotificationsService } from '../notifications/notifications.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { AuthController } from './auth.controller.js';
 import { AuthService } from './auth.service.js';
@@ -82,6 +83,9 @@ describe('Auth HTTP surface', () => {
       learnerProfile: {
         create: jest.fn(() => Promise.resolve({ id: 'learner-profile-1' })),
       },
+      notificationOutboxItem: {
+        create: jest.fn(() => Promise.resolve({})),
+      },
     };
     const fakePrismaWithTransaction = Object.assign(fakePrisma, {
       $transaction: jest.fn((fn: (tx: typeof fakePrisma) => Promise<unknown>) => fn(fakePrisma)),
@@ -104,6 +108,10 @@ describe('Auth HTTP surface', () => {
         JwtStrategy,
         { provide: PrismaService, useValue: fakePrismaWithTransaction },
         { provide: ConfigService, useValue: fakeConfigService },
+        {
+          provide: NotificationsService,
+          useValue: { enqueue: jest.fn().mockResolvedValue(undefined) },
+        },
       ],
     }).compile();
 

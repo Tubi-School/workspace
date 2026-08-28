@@ -1,16 +1,13 @@
 'use client';
 
 import { useParams } from 'next/navigation';
-import { useState } from 'react';
-import type { FormEvent } from 'react';
 
 import { Button } from '@tubi/ui';
 import { AttendanceStatusBadge } from '@/components/attendance-status-badge';
+import { RecordingPlayer } from '@/components/recording-player';
 import { SessionStatusBadge } from '@/components/session-status-badge';
 import { Card, PageHeader } from '@/components/ui/card';
-import { Field, TextInput } from '@/components/ui/form';
 import { ErrorState, LoadingState } from '@/components/ui/states';
-import { useAsyncAction } from '@/hooks/use-async-action';
 import { useFetch } from '@/hooks/use-fetch';
 import { learnerPortalApi } from '@/lib/endpoints';
 
@@ -34,27 +31,18 @@ export default function LearnerSessionDetailPage() {
   const session = useFetch(() => learnerPortalApi.getSession(sessionId), [sessionId]);
   const attendance = useFetch(() => learnerPortalApi.getAttendance(sessionId), [sessionId]);
 
-  const [startSecond, setStartSecond] = useState('');
-  const [endSecond, setEndSecond] = useState('');
-  const reportAction = useAsyncAction(async () => {
-    await learnerPortalApi.reportWatchedInterval(sessionId, Number(startSecond), Number(endSecond));
-    setStartSecond('');
-    setEndSecond('');
-    attendance.refetch();
-  });
-
   if (session.isLoading) return <LoadingState />;
   if (session.error) return <ErrorState message={session.error} />;
   if (!session.data) return null;
 
   const s = session.data;
   const hasLiveAccess = s.liveMeetingUrl.length > 0;
-
-  function handleReport(event: FormEvent) {
-    event.preventDefault();
-    if (startSecond === '' || endSecond === '') return;
-    void reportAction.run();
-  }
+  // A Zoom-ingested recording's `recordingUrl` is Zoom's own hosted
+  // playback page — it cannot report progress back into TUBI, so it is
+  // opened externally rather than embedded. A recording with no
+  // `provider` was manually published as a direct, playable file, and
+  // gets the real player with automatic watched-interval reporting.
+  const canEmbedPlayer = s.recording !== null && s.recording.provider === null;
 
   return (
     <div>
@@ -95,16 +83,20 @@ export default function LearnerSessionDetailPage() {
               <p className="text-muted-foreground mb-3 text-sm">
                 Available since {new Date(s.recording.availableFrom).toLocaleString()}.
               </p>
-              <a
-                href={s.recording.recordingUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-block"
-              >
-                <Button size="sm" variant="secondary">
-                  Open recording
-                </Button>
-              </a>
+              {canEmbedPlayer ? (
+                <p className="text-muted-foreground text-sm">Watch below.</p>
+              ) : (
+                <a
+                  href={s.recording.recordingUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-block"
+                >
+                  <Button size="sm" variant="secondary">
+                    Open recording
+                  </Button>
+                </a>
+              )}
             </>
           ) : (
             <p className="text-muted-foreground text-sm">
@@ -114,40 +106,14 @@ export default function LearnerSessionDetailPage() {
         </Card>
       </div>
 
-      {s.recording && (
+      {s.recording && canEmbedPlayer && (
         <Card className="mb-6">
-          <h2 className="mb-1 text-sm font-semibold">Report viewing progress</h2>
-          <p className="text-muted-foreground mb-3 text-sm">
-            Playback tracking is not yet built into a video player — this reports the range you
-            watched directly to the same coverage engine a future player will call automatically.
-            Total length: {Math.round(s.recording.totalSeconds / 60)} minutes.
-          </p>
-          <form onSubmit={handleReport} className="flex flex-wrap items-end gap-3">
-            <Field label="From (seconds)">
-              <TextInput
-                type="number"
-                min={0}
-                value={startSecond}
-                onChange={(e) => setStartSecond(e.target.value)}
-                disabled={reportAction.isSubmitting}
-                className="w-32"
-              />
-            </Field>
-            <Field label="To (seconds)">
-              <TextInput
-                type="number"
-                min={0}
-                value={endSecond}
-                onChange={(e) => setEndSecond(e.target.value)}
-                disabled={reportAction.isSubmitting}
-                className="w-32"
-              />
-            </Field>
-            <Button type="submit" size="sm" disabled={reportAction.isSubmitting}>
-              {reportAction.isSubmitting ? 'Reporting…' : 'Report'}
-            </Button>
-          </form>
-          {reportAction.error && <p className="text-danger mt-2 text-sm">{reportAction.error}</p>}
+          <h2 className="mb-3 text-sm font-semibold">Watch recording</h2>
+          <RecordingPlayer
+            sessionId={sessionId}
+            recordingUrl={s.recording.recordingUrl}
+            onProgressReported={attendance.refetch}
+          />
         </Card>
       )}
 

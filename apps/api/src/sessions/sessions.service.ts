@@ -2,10 +2,12 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 
 import { EntitlementService } from '../entitlements/entitlement.service.js';
+import { NotificationsService } from '../notifications/notifications.service.js';
 import { Prisma, RoleName, SessionStatus, TeacherRole } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { computeAttendanceCutoffAtUtc, toAcademicDateString } from './academic-timezone.util.js';
@@ -17,6 +19,7 @@ import {
 } from './dto/reassign-primary-teacher.dto.js';
 import type { UpdateSessionDto } from './dto/update-session.dto.js';
 import type { UpdateSessionTeacherDto } from './dto/update-session-teacher.dto.js';
+import { MeetingProvisioningService } from './meeting-provisioning.service.js';
 
 const PRISMA_UNIQUE_CONSTRAINT_ERROR_CODE = 'P2002';
 
@@ -46,10 +49,28 @@ interface TeacherAssignmentPlan {
 
 @Injectable()
 export class SessionsService {
+  private readonly logger = new Logger(SessionsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly entitlementService: EntitlementService,
+    private readonly meetingProvisioningService: MeetingProvisioningService,
+    private readonly notifications: NotificationsService,
   ) {}
+
+  /** Runs a best-effort notification enqueue, logging (never throwing) on
+   * failure — the primary mutation this is called after has already
+   * committed, and must never be reported as failed merely because
+   * enqueueing its notification did not succeed (Phase 4 external review
+   * Correction 8). */
+  private async notifySafely(fn: () => Promise<void>): Promise<void> {
+    try {
+      await fn();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      this.logger.warn(`Failed to enqueue a notification: ${message}`);
+    }
+  }
 
   async create(dto: CreateSessionDto): Promise<SessionWithRelations> {
     const course = await this.prisma.course.findUnique({
@@ -88,7 +109,7 @@ export class SessionsService {
           sessionDate,
           startTime,
           endTime,
-          liveMeetingUrl: dto.liveMeetingUrl,
+          liveMeetingUrl: dto.liveMeetingUrl ?? '',
           attendanceCutoffAt,
           ...(dto.replacementForSessionId !== undefined
             ? { replacementForSessionId: dto.replacementForSessionId }
@@ -115,6 +136,29 @@ export class SessionsService {
           dto.replacementForSessionId,
           created.id,
         );
+
+        // Best-effort — never blocks session creation (section N/O; Phase
+        // 4 external review Correction 8 — the session itself has already
+        // been created above, so a notification failure here must never
+        // surface as a create() failure).
+        await this.notifySafely(() =>
+          this.notifications.enqueueForEntitledLearners(
+            dto.replacementForSessionId!,
+            'SESSION_REPLACEMENT',
+            { courseTitle: created.course.title, startTime: created.startTime.toISOString() },
+          ),
+        );
+      }
+
+      // Best-effort, never blocks session creation on a Zoom outage
+      // (section E/D) — failures are recorded on the session for ADMIN to
+      // see and retry via `provisionMeeting`. Skipped when an ADMIN
+      // explicitly supplied a liveMeetingUrl — that is a deliberate manual
+      // override (e.g. no Zoom account configured yet) that automatic
+      // provisioning must not silently clobber.
+      if (dto.liveMeetingUrl === undefined) {
+        await this.meetingProvisioningService.provisionForSession(created.id);
+        return this.findOne(created.id);
       }
 
       return created;
@@ -253,11 +297,41 @@ export class SessionsService {
 
     await this.entitlementService.evaluateForSession(id, entitlementPoint);
 
-    return this.prisma.session.update({
+    const canceled = await this.prisma.session.update({
       where: { id },
       data: { status: SessionStatus.CANCELED, canceledAt: new Date() },
       include: sessionInclude,
     });
+
+    // Best-effort — a Zoom cleanup failure never blocks or reverses the
+    // cancellation itself (section J: TUBI's state machine is
+    // authoritative regardless of provider outcome).
+    await this.meetingProvisioningService.releaseForCanceledSession(id);
+
+    // Best-effort — the session is already CANCELED above; a notification
+    // failure must never be reported back to the caller as a cancel()
+    // failure (Phase 4 external review Correction 8).
+    const payload = {
+      courseTitle: canceled.course.title,
+      startTime: canceled.startTime.toISOString(),
+    };
+    await this.notifySafely(() =>
+      this.notifications.enqueueForEntitledLearners(id, 'SESSION_CANCELED', payload),
+    );
+    await this.notifySafely(() =>
+      this.notifications.enqueueForAssignedTeachers(id, 'SESSION_CANCELED', payload),
+    );
+
+    return canceled;
+  }
+
+  /** Explicit ADMIN-triggered retry for a session whose automatic
+   * provisioning failed (e.g. a transient Zoom outage). Idempotent — a
+   * no-op if the session is already provisioned or canceled. */
+  async provisionMeeting(id: string): Promise<SessionWithRelations> {
+    await this.findOne(id);
+    await this.meetingProvisioningService.provisionForSession(id);
+    return this.findOne(id);
   }
 
   // ---------------------------------------------------------------------

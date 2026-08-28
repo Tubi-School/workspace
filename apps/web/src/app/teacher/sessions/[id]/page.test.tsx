@@ -27,6 +27,9 @@ function buildSession(overrides: Partial<SessionWithRelations> = {}): SessionWit
     status: 'LIVE',
     canceledAt: null,
     replacementForSessionId: null,
+    meetingProvider: null,
+    meetingProvisioningStatus: 'NOT_REQUIRED',
+    meetingProvisioningError: null,
     course: { id: 'course-1', title: 'Algebra I' },
     teachers: [
       {
@@ -53,6 +56,53 @@ function buildSession(overrides: Partial<SessionWithRelations> = {}): SessionWit
     ...overrides,
   };
 }
+
+describe('TeacherSessionDetailPage — live classroom join', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('offers "Join class" for a LIVE session with a provisioned meeting', async () => {
+    getSessionMock.mockResolvedValue(
+      buildSession({ status: 'LIVE', liveMeetingUrl: 'https://zoom.example.invalid/j/1' }),
+    );
+    getAttendanceMock.mockResolvedValue([]);
+
+    render(<TeacherSessionDetailPage />);
+
+    expect(await screen.findByRole('link', { name: /join class/i })).toHaveAttribute(
+      'href',
+      'https://zoom.example.invalid/j/1',
+    );
+  });
+
+  it('offers "Start class" (not "Join") for a SCHEDULED session with a provisioned meeting', async () => {
+    getSessionMock.mockResolvedValue(
+      buildSession({ status: 'SCHEDULED', liveMeetingUrl: 'https://zoom.example.invalid/j/1' }),
+    );
+    getAttendanceMock.mockResolvedValue([]);
+
+    render(<TeacherSessionDetailPage />);
+
+    expect(await screen.findByRole('link', { name: /start class/i })).toBeInTheDocument();
+  });
+
+  it('never fabricates a join link when the meeting has not been provisioned yet', async () => {
+    getSessionMock.mockResolvedValue(
+      buildSession({
+        liveMeetingUrl: '',
+        meetingProvisioningStatus: 'FAILED',
+      }),
+    );
+    getAttendanceMock.mockResolvedValue([]);
+
+    render(<TeacherSessionDetailPage />);
+
+    await screen.findByText('Algebra I');
+    expect(screen.queryByRole('link', { name: /join class|start class/i })).not.toBeInTheDocument();
+    expect(screen.getByText(/contact an administrator/i)).toBeInTheDocument();
+  });
+});
 
 describe('TeacherSessionDetailPage — authorization-sensitive UI (Phase 3 external review, documentation correction)', () => {
   afterEach(() => {

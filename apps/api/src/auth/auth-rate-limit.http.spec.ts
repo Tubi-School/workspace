@@ -10,6 +10,7 @@ import * as bcrypt from 'bcryptjs';
 import request from 'supertest';
 
 import { RoleName, type User } from '../generated/prisma/client.js';
+import { NotificationsService } from '../notifications/notifications.service.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { AuthController } from './auth.controller.js';
 import { AuthService } from './auth.service.js';
@@ -75,6 +76,10 @@ describe('Auth login rate limiting', () => {
         { provide: PrismaService, useValue: fakePrisma },
         { provide: ConfigService, useValue: fakeConfigService },
         { provide: APP_GUARD, useClass: ThrottlerGuard },
+        {
+          provide: NotificationsService,
+          useValue: { enqueue: jest.fn().mockResolvedValue(undefined) },
+        },
       ],
     }).compile();
 

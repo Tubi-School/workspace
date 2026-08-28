@@ -4,12 +4,30 @@ import { Logger, ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import type { NestExpressApplication } from '@nestjs/platform-express';
+import { json } from 'express';
 import helmet from 'helmet';
 
 import { AppModule } from './app.module.js';
 
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create<NestExpressApplication>(AppModule, { bufferLogs: true });
+  // Body parsing is disabled here and re-applied explicitly below with a
+  // `verify` hook that stashes the exact raw bytes on the request. Zoom and
+  // payment-provider webhook signatures are computed over the raw request
+  // body — re-serializing the parsed JSON is not guaranteed byte-identical
+  // and would make signature verification unreliable (see
+  // webhooks/*.controller.ts).
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    bufferLogs: true,
+    bodyParser: false,
+  });
+  app.use(
+    json({
+      limit: '2mb',
+      verify: (req, _res, buf) => {
+        (req as unknown as { rawBody: Buffer }).rawBody = buf;
+      },
+    }),
+  );
   const config = app.get(ConfigService);
   const logger = new Logger('Bootstrap');
 

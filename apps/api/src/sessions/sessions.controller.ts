@@ -73,6 +73,15 @@ export class SessionsController {
     return this.sessionsService.cancel(id);
   }
 
+  /** Manual retry for a session whose automatic Zoom provisioning failed
+   * or has not yet run (section E/X — the launch console's reconciliation
+   * action for this integration). */
+  @Post(':id/provision-meeting')
+  @Roles('ADMIN')
+  provisionMeeting(@Param('id', ParseUUIDPipe) id: string): Promise<SessionWithRelations> {
+    return this.sessionsService.provisionMeeting(id);
+  }
+
   @Get(':id/teachers')
   @Roles('ADMIN')
   listTeachers(@Param('id', ParseUUIDPipe) id: string): Promise<SessionWithRelations['teachers']> {

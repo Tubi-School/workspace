@@ -77,6 +77,47 @@ enum ExceptionReason {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4 — School Launch Core (docs/phase-4-school-launch-core-review.txt)
+// ---------------------------------------------------------------------------
+
+enum MeetingProvisioningStatus {
+  NOT_REQUIRED
+  PENDING
+  PROVISIONED
+  FAILED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  CANCELED
+  REFUNDED
+}
+
+enum NotificationStatus {
+  PENDING
+  // Claimed by one dispatcher instance and currently being sent — the CAS
+  // state that stops two Railway instances from sending the same item
+  // twice (Phase 4 external review Correction 4B).
+  SENDING
+  SENT
+  FAILED
+}
+
+// Phase 4 external review Correction 1: distinguishes an event TUBI has
+// received from one it has actually finished applying, so a crash between
+// the two can never leave the event permanently unprocessable nor cause a
+// provider retry to silently skip work that never happened.
+enum WebhookEventStatus {
+  RECEIVED
+  // Claimed by one in-flight processing attempt — see
+  // WebhookIdempotencyService for the stale-reclaim window this unblocks.
+  PROCESSING
+  PROCESSED
+}
+
+// ---------------------------------------------------------------------------
 // Identity (section B)
 // ---------------------------------------------------------------------------
 
@@ -108,6 +149,8 @@ model LearnerProfile {
   subscriptionAccess      SubscriptionAccess[]
   entitlementSnapshots    SessionEntitlementSnapshot[]
   windowExceptions        AttendanceWindowException[]
+  liveParticipantSessions LiveParticipantSession[]
+  paymentOrders           PaymentOrder[]
 }
 
 model TeacherProfile {
@@ -176,6 +219,7 @@ model Offering {
 
   courses       OfferingCourse[]
   subscriptions SubscriptionAccess[]
+  paymentOrders PaymentOrder[]
 }
 
 model OfferingCourse {
@@ -207,6 +251,30 @@ model Session {
   // ruling / correction 2, section I.
   canceledAt         DateTime?
 
+  // Phase 4 — automated live-classroom provisioning (section E). Populated
+  // by MeetingProvisioningService, never typed in by an ADMIN in normal
+  // production operation. `liveMeetingUrl` above continues to be the single
+  // field every existing read path (learner/teacher portals) already
+  // redacts/exposes; provisioning only ever writes into it.
+  meetingProvider               String?
+  providerMeetingId             String?                   @unique
+  meetingProvisioningStatus     MeetingProvisioningStatus @default(NOT_REQUIRED)
+  meetingProvisioningError      String?
+  // Set the moment a caller atomically claims the right to provision (the
+  // conditional-update CAS in MeetingProvisioningService) — lets a later
+  // caller distinguish "someone is actively provisioning this right now"
+  // from "a provisioning attempt crashed and this claim is stale" (Phase 4
+  // external review Correction 3).
+  meetingProvisioningClaimedAt  DateTime?
+  // A fresh random value generated on every successful provisioning claim
+  // (Phase 4 external review Correction 3 — fencing). Persisting a final
+  // PROVISIONED/FAILED result is itself conditional on this token still
+  // matching — a caller that lost its claim (reclaimed after the stale
+  // window, or the session was canceled) can never finalize a meeting
+  // onto this session; see MeetingProvisioningService.
+  meetingProvisioningClaimToken String?
+  reminderSentAt                DateTime?
+
   // A canceled session has at most one replacement (founder ruling 4,
   // section J). The replacement chain is unbounded via repeated
   // cancel-and-replace, but each individual session has exactly one
@@ -221,6 +289,7 @@ model Session {
   windowExceptions        AttendanceWindowException[]
   entitlementSnapshots    SessionEntitlementSnapshot[]
   liveAttendanceIntervals LiveAttendanceInterval[]
+  liveParticipantSessions LiveParticipantSession[]
 
   @@index([courseId, sessionDate])
 }
@@ -242,12 +311,19 @@ model SessionTeacher {
 // ---------------------------------------------------------------------------
 
 model SessionRecording {
-  id            String   @id @default(uuid())
-  sessionId     String   @unique
-  session       Session  @relation(fields: [sessionId], references: [id])
-  recordingUrl  String
-  availableFrom DateTime
-  totalSeconds  Int
+  id                  String   @id @default(uuid())
+  sessionId           String   @unique
+  session             Session  @relation(fields: [sessionId], references: [id])
+  // A provider playback URL (e.g. Zoom's `share_url`) when ingested
+  // automatically — never a raw provider download URL carrying an
+  // embedded access token (section M). Manually published recordings
+  // (no configured provider) continue to store whatever URL an ADMIN
+  // supplies, unchanged from Phase 2F/2G.
+  recordingUrl        String
+  availableFrom       DateTime
+  totalSeconds        Int
+  provider            String?
+  providerRecordingId String?  @unique
 
   watchedIntervals WatchedInterval[]
 }
@@ -389,6 +465,137 @@ model SubscriptionAccess {
   currentPeriodEnd   DateTime
 
   entitlementSnapshots SessionEntitlementSnapshot[]
+  paymentOrder         PaymentOrder?
 
   @@index([learnerId, offeringId])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — live classroom provider integration (section D/H)
+// ---------------------------------------------------------------------------
+
+/**
+ * Tracks an in-progress (not-yet-departed) provider participant connection
+ * between a `participant_joined` and `participant_left` webhook event.
+ * Deliberately NOT the attendance record itself — LiveAttendanceInterval
+ * (frozen Phase 2F model, unchanged) remains the only source of qualifying
+ * coverage; a row here is consumed and deleted the moment the matching
+ * `participant_left` event ingests a completed interval, so it can never
+ * accumulate unbounded history.
+ */
+model LiveParticipantSession {
+  id                    String         @id @default(uuid())
+  sessionId             String
+  session               Session        @relation(fields: [sessionId], references: [id])
+  learnerId             String
+  learner               LearnerProfile @relation(fields: [learnerId], references: [id])
+  providerParticipantId String
+  joinedAt              DateTime
+
+  // A duplicate/replayed `participant_joined` event for the same provider
+  // participant connection must not open a second concurrent "in progress"
+  // row (section I — duplicate/replayed provider events must not double
+  // count).
+  @@unique([sessionId, providerParticipantId])
+}
+
+/**
+ * Webhook idempotency/audit ledger shared by every provider this school
+ * integrates with (Zoom today; a payment provider below). One row per
+ * externally-delivered event — never per retry — so a redelivered webhook
+ * is recognised and safely no-op'd rather than re-applied.
+ */
+model ProviderWebhookEvent {
+  id              String             @id @default(uuid())
+  provider        String
+  externalEventId String
+  eventType       String
+  status          WebhookEventStatus @default(RECEIVED)
+  receivedAt      DateTime           @default(now())
+  // Set (and refreshed) whenever a caller wins the PROCESSING claim.
+  // WebhookIdempotencyService reclaims a PROCESSING row whose claimedAt is
+  // older than its stale-processing window — the honest, bounded crash
+  // recovery this design offers (see the service's doc comment for the
+  // exact window and what it means in practice).
+  claimedAt       DateTime?
+  // A fresh random value generated on every successful claim (Phase 4
+  // external review Correction 2 — fencing). `markProcessed`/`markFailed`
+  // only take effect when the caller supplies the token it was actually
+  // handed by `claim()`; a stale worker whose claim was reclaimed by
+  // another worker after the stale window supplies a now-stale token and
+  // is a safe no-op, never able to overwrite the newer worker's state.
+  claimToken      String?
+  processedAt     DateTime?
+
+  @@unique([provider, externalEventId])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — commercial/payment layer (section K). Deliberately upstream of
+// SubscriptionAccess: a PaymentOrder never becomes a payment ledger and
+// SubscriptionAccess is never contaminated with payment internals — the two
+// meet only at the single point where a confirmed PaymentOrder is allowed
+// to create exactly one SubscriptionAccess grant (section L).
+// ---------------------------------------------------------------------------
+
+model PaymentOrder {
+  id                String         @id @default(uuid())
+  learnerId         String
+  learner           LearnerProfile @relation(fields: [learnerId], references: [id])
+  offeringId        String
+  offering          Offering       @relation(fields: [offeringId], references: [id])
+  provider          String
+  // Null until the provider assigns one at checkout initialization.
+  providerReference String?        @unique
+  // Integer minor units (cents) — never a floating-point amount (section
+  // O). ZAR is the only currency this launch supports.
+  amountMinor       Int
+  currency          String         @default("ZAR")
+  status            PaymentStatus  @default(PENDING)
+
+  // Set exactly once, only by the verified-webhook path, only when status
+  // transitions to PAID (section L). The unique constraint is the
+  // database-level guarantee that a PaymentOrder can never be the origin
+  // of more than one SubscriptionAccess grant, however many times its
+  // webhook is redelivered.
+  subscriptionAccessId String?             @unique
+  subscriptionAccess   SubscriptionAccess? @relation(fields: [subscriptionAccessId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([learnerId])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — essential notifications (section N). A lightweight durable
+// outbox, not an event-sourcing platform: one row per notification to send,
+// picked up and retried by NotificationDispatchService until SENT or
+// permanently FAILED.
+// ---------------------------------------------------------------------------
+
+model NotificationOutboxItem {
+  id              String             @id @default(uuid())
+  type            String
+  recipientUserId String
+  payload         Json
+  status          NotificationStatus @default(PENDING)
+  attempts        Int                @default(0)
+  createdAt       DateTime           @default(now())
+  // Set (and refreshed) whenever a dispatcher instance wins the SENDING
+  // claim — lets a stale claim (the instance that took it crashed before
+  // marking SENT/PENDING again) be safely reclaimed by another tick after
+  // NotificationDispatchScheduler's stale-processing window (Phase 4
+  // external review Correction 4B).
+  claimedAt       DateTime?
+  // A fresh random value generated on every successful SENDING claim
+  // (Phase 4 external review Correction 4 — fencing). The final
+  // SENT/PENDING/FAILED write is conditional on this token still
+  // matching — a dispatcher whose lease was reclaimed by another instance
+  // after the stale window can never overwrite that instance's outcome.
+  claimToken      String?
+  sentAt          DateTime?
+  lastError       String?
+
+  @@index([status])
 }
