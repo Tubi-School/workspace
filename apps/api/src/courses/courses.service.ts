@@ -8,7 +8,7 @@ import type { UpdateCourseDto } from './dto/update-course.dto.js';
 /** Only the fields safe to expose about the primary teacher — deliberately
  * excludes the `user` relation entirely, so `passwordHash` can never reach
  * a Course response regardless of what `User` gains in the future. */
-const courseInclude = {
+export const courseInclude = {
   subject: true,
   gradeLevel: true,
   academicTerm: true,

@@ -33,13 +33,13 @@ export class GradeLevelsController {
   }
 
   @Get()
-  @Roles('ADMIN', 'TEACHER')
+  @Roles('ADMIN')
   findAll(): Promise<GradeLevel[]> {
     return this.gradeLevelsService.findAll();
   }
 
   @Get(':id')
-  @Roles('ADMIN', 'TEACHER')
+  @Roles('ADMIN')
   findOne(@Param('id', ParseUUIDPipe) id: string): Promise<GradeLevel> {
     return this.gradeLevelsService.findOne(id);
   }

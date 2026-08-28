@@ -26,7 +26,7 @@ function isUniqueConstraintViolation(error: unknown): boolean {
 
 /** Only the fields safe to expose about the underlying User — deliberately
  * excludes passwordHash, exactly like AuthService's sanitizeUser. */
-const teacherInclude = {
+export const teacherInclude = {
   user: {
     select: {
       id: true,

@@ -31,13 +31,13 @@ export class TeachersController {
   }
 
   @Get()
-  @Roles('ADMIN', 'TEACHER')
+  @Roles('ADMIN')
   findAll(): Promise<TeacherWithUser[]> {
     return this.teachersService.findAll();
   }
 
   @Get(':id')
-  @Roles('ADMIN', 'TEACHER')
+  @Roles('ADMIN')
   findOne(@Param('id', ParseUUIDPipe) id: string): Promise<TeacherWithUser> {
     return this.teachersService.findOne(id);
   }

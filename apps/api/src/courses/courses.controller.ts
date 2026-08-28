@@ -33,13 +33,13 @@ export class CoursesController {
   }
 
   @Get()
-  @Roles('ADMIN', 'TEACHER')
+  @Roles('ADMIN')
   findAll(): Promise<CourseWithRelations[]> {
     return this.coursesService.findAll();
   }
 
   @Get(':id')
-  @Roles('ADMIN', 'TEACHER')
+  @Roles('ADMIN')
   findOne(@Param('id', ParseUUIDPipe) id: string): Promise<CourseWithRelations> {
     return this.coursesService.findOne(id);
   }

@@ -269,13 +269,13 @@ describe('Admin academic-structure RBAC', () => {
       expect(response.status).toBe(403);
     });
 
-    it('is allowed to read GradeLevels', async () => {
+    it('cannot read GradeLevels either — /admin/* resource routes are ADMIN-only', async () => {
       const token = await tokenFor(teacher);
       const response = await request(server())
         .get('/admin/grade-levels')
         .set('Authorization', `Bearer ${token}`);
 
-      expect(response.status).toBe(200);
+      expect(response.status).toBe(403);
     });
   });
 

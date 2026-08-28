@@ -35,13 +35,13 @@ export class SessionsController {
   }
 
   @Get()
-  @Roles('ADMIN', 'TEACHER')
+  @Roles('ADMIN')
   findAll(): Promise<SessionWithRelations[]> {
     return this.sessionsService.findAll();
   }
 
   @Get(':id')
-  @Roles('ADMIN', 'TEACHER')
+  @Roles('ADMIN')
   findOne(@Param('id', ParseUUIDPipe) id: string): Promise<SessionWithRelations> {
     return this.sessionsService.findOne(id);
   }
@@ -74,7 +74,7 @@ export class SessionsController {
   }
 
   @Get(':id/teachers')
-  @Roles('ADMIN', 'TEACHER')
+  @Roles('ADMIN')
   listTeachers(@Param('id', ParseUUIDPipe) id: string): Promise<SessionWithRelations['teachers']> {
     return this.sessionsService.listTeachers(id);
   }

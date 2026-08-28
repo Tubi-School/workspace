@@ -20,7 +20,7 @@ import type { UpdateSessionTeacherDto } from './dto/update-session-teacher.dto.j
 
 const PRISMA_UNIQUE_CONSTRAINT_ERROR_CODE = 'P2002';
 
-const sessionInclude = {
+export const sessionInclude = {
   course: true,
   teachers: {
     include: {

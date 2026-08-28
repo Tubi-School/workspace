@@ -14,10 +14,12 @@ import { GradeLevelsModule } from './grade-levels/grade-levels.module.js';
 import { HealthModule } from './health/health.module.js';
 import { LearnerPortalModule } from './learner-portal/learner-portal.module.js';
 import { LearnersModule } from './learners/learners.module.js';
+import { OfferingsModule } from './offerings/offerings.module.js';
 import { PrismaModule } from './prisma/prisma.module.js';
 import { SessionsModule } from './sessions/sessions.module.js';
 import { SubjectsModule } from './subjects/subjects.module.js';
 import { SubscriptionAccessModule } from './subscription-access/subscription-access.module.js';
+import { TeacherPortalModule } from './teacher-portal/teacher-portal.module.js';
 import { TeachersModule } from './teachers/teachers.module.js';
 
 /**
@@ -59,6 +61,8 @@ import { TeachersModule } from './teachers/teachers.module.js';
     EntitlementModule,
     AttendanceModule,
     LearnerPortalModule,
+    TeacherPortalModule,
+    OfferingsModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })

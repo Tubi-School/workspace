@@ -284,13 +284,13 @@ describe('Teachers + Sessions RBAC', () => {
       expect(response.status).toBe(403);
     });
 
-    it('TEACHER can read the teacher list', async () => {
+    it('TEACHER cannot read the broad ADMIN teacher list — /admin/* resource routes are ADMIN-only; teacher reads go through /teacher/*', async () => {
       const token = await tokenFor(teacherCaller);
       const response = await request(server())
         .get('/admin/teachers')
         .set('Authorization', `Bearer ${token}`);
 
-      expect(response.status).toBe(200);
+      expect(response.status).toBe(403);
     });
   });
 
@@ -381,13 +381,13 @@ describe('Teachers + Sessions RBAC', () => {
       expect(response.status).toBe(404);
     });
 
-    it('TEACHER can read the session list', async () => {
+    it('TEACHER cannot read the broad ADMIN session list — /admin/* resource routes are ADMIN-only; teacher reads go through /teacher/sessions', async () => {
       const token = await tokenFor(teacherCaller);
       const response = await request(server())
         .get('/admin/sessions')
         .set('Authorization', `Bearer ${token}`);
 
-      expect(response.status).toBe(200);
+      expect(response.status).toBe(403);
     });
 
     it('LEARNER cannot read the session list', async () => {

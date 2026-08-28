@@ -33,13 +33,13 @@ export class SubjectsController {
   }
 
   @Get()
-  @Roles('ADMIN', 'TEACHER')
+  @Roles('ADMIN')
   findAll(): Promise<Subject[]> {
     return this.subjectsService.findAll();
   }
 
   @Get(':id')
-  @Roles('ADMIN', 'TEACHER')
+  @Roles('ADMIN')
   findOne(@Param('id', ParseUUIDPipe) id: string): Promise<Subject> {
     return this.subjectsService.findOne(id);
   }

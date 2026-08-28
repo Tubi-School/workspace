@@ -33,13 +33,13 @@ export class AcademicTermsController {
   }
 
   @Get()
-  @Roles('ADMIN', 'TEACHER')
+  @Roles('ADMIN')
   findAll(): Promise<AcademicTerm[]> {
     return this.academicTermsService.findAll();
   }
 
   @Get(':id')
-  @Roles('ADMIN', 'TEACHER')
+  @Roles('ADMIN')
   findOne(@Param('id', ParseUUIDPipe) id: string): Promise<AcademicTerm> {
     return this.academicTermsService.findOne(id);
   }
