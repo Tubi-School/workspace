@@ -5,7 +5,8 @@
     "buildCommand": "pnpm install --frozen-lockfile && pnpm turbo run build --filter=@tubi/api..."
   },
   "deploy": {
-    "startCommand": "pnpm --filter @tubi/api run start:prod",
+    "preDeployCommand": "pnpm --filter @tubi/api run db:deploy",
+    "startCommand": "pnpm --filter @tubi/api run start",
     "healthcheckPath": "/health",
     "healthcheckTimeout": 30,
     "restartPolicyType": "ON_FAILURE",

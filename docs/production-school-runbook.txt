@@ -42,6 +42,31 @@ confirm the revision, inspect logs for startup/migration errors, and smoke-test
 authenticated ADMIN routes. Do not run destructive database resets in
 production.
 
+Two database connection variables exist, and they are not interchangeable:
+DATABASE_URL is Neon's POOLED connection string — the running API's normal
+runtime traffic uses this, and only this. DIRECT_DATABASE_URL is Neon's
+DIRECT (non-pooler) connection string — the Prisma migration CLI uses this,
+and only this. Never set either to the other's value; never place a real
+connection string anywhere in this document, a support ticket, or Git
+history.
+
+Railway's deploy runs two separate steps, declared in railway.json at the
+repository root: a pre-deploy step that runs "prisma migrate deploy" against
+DIRECT_DATABASE_URL, completing before the new container receives any
+traffic; and a start step that runs NestJS only (node dist/main.js) and
+performs no migration at all. This separation exists because an earlier
+revision ran migration and startup as one combined step, which could leave
+the process unable to bind to PORT and answer /health within Railway's
+healthcheck window if migration was slow, and — because that earlier
+revision migrated through the pooled connection — a migration could hang
+indefinitely with no visible error rather than fail. If DIRECT_DATABASE_URL
+is missing when Railway's pre-deploy step runs in production, the migration
+command fails immediately and clearly, before attempting any connection,
+rather than silently falling back to the pooled connection. Non-migration
+Prisma build operations (generate, format, validate) do not require or use
+DIRECT_DATABASE_URL at all, even when it is set — the Railway BUILD step is
+unaffected by whether this variable is present.
+
 3. ADMIN SCHOOL SETUP
 
 Sign in with an existing ADMIN account. In the admin UI create, in dependency
