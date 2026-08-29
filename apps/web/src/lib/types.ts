@@ -190,6 +190,10 @@ export interface Offering {
   monthlyPrice: string;
 }
 
+export interface OfferingWithCourses extends Offering {
+  courses: Array<{ courseId: string; course: { id: string; title: string } }>;
+}
+
 export interface SubscriptionAccess {
   id: string;
   learnerId: string;
@@ -211,6 +215,39 @@ export interface PaymentOrder {
   currency: string;
   status: PaymentStatus;
   createdAt: string;
+}
+
+export type NotificationOutboxStatus = 'PENDING' | 'SENDING' | 'SENT' | 'FAILED';
+
+export interface NotificationOutboxItem {
+  id: string;
+  type: string;
+  recipientUserId: string;
+  status: NotificationOutboxStatus;
+  attempts: number;
+  createdAt: string;
+  sentAt: string | null;
+  lastError: string | null;
+  recipient: { id: string; email: string; fullName: string } | null;
+}
+
+export type ProviderConfigStatus = 'CONFIGURED' | 'NOT_CONFIGURED';
+
+/** `null` means "not queryable right now" (the database is down) — never
+ * render this as `0`. */
+export type OperationalCount = number | null;
+
+export interface LaunchOperationsReport {
+  database: 'ok' | 'down';
+  providers: {
+    zoom: ProviderConfigStatus;
+    payments: ProviderConfigStatus;
+    email: ProviderConfigStatus;
+  };
+  stuckMeetingsCount: OperationalCount;
+  permanentlyFailedNotificationsCount: OperationalCount;
+  paymentsAwaitingResolutionCount: OperationalCount;
+  upcomingSessionsCount: OperationalCount;
 }
 
 export interface AttendanceWindowException {

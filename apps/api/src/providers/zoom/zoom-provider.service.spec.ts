@@ -25,6 +25,27 @@ describe('ZoomProviderService', () => {
     });
   });
 
+  describe('isOperationallyConfigured', () => {
+    it('is false when meeting credentials exist but webhook verification is missing', () => {
+      const service = new ZoomProviderService(
+        buildConfig({ ZOOM_ACCOUNT_ID: 'a', ZOOM_CLIENT_ID: 'b', ZOOM_CLIENT_SECRET: 'c' }),
+      );
+      expect(service.isOperationallyConfigured()).toBe(false);
+    });
+
+    it('is true when meeting and webhook configuration are complete', () => {
+      const service = new ZoomProviderService(
+        buildConfig({
+          ZOOM_ACCOUNT_ID: 'a',
+          ZOOM_CLIENT_ID: 'b',
+          ZOOM_CLIENT_SECRET: 'c',
+          ZOOM_WEBHOOK_SECRET_TOKEN: 'd',
+        }),
+      );
+      expect(service.isOperationallyConfigured()).toBe(true);
+    });
+  });
+
   describe('createMeeting — local dev fake gating', () => {
     it('returns a deterministic local fake meeting outside production when unconfigured', async () => {
       const service = new ZoomProviderService(buildConfig({ NODE_ENV: 'development' }));

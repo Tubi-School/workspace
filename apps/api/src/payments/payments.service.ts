@@ -37,6 +37,12 @@ export class PaymentsService {
     @Inject(PAYMENT_PROVIDER) private readonly provider: PaymentProvider,
   ) {}
 
+  isConfigured(): boolean {
+    return Boolean(
+      this.provider.isConfigured() && this.config.get('PAYMENTS_CALLBACK_URL', { infer: true }),
+    );
+  }
+
   /**
    * A client redirect claiming success is never sufficient (section L) —
    * this method exists only to hand the learner a real provider checkout
@@ -44,7 +50,7 @@ export class PaymentsService {
    * only a verified provider webhook ever calls.
    */
   async initiateCheckout(learnerId: string, offeringId: string): Promise<{ checkoutUrl: string }> {
-    if (!this.provider.isConfigured()) {
+    if (!this.isConfigured()) {
       throw new ConflictException(
         `Payments are not configured yet (${this.provider.name} credentials missing) — checkout is unavailable`,
       );
@@ -78,9 +84,7 @@ export class PaymentsService {
       },
     });
 
-    const callbackUrl =
-      this.config.get('PAYMENTS_CALLBACK_URL', { infer: true }) ??
-      'https://tubi-workspace.vercel.app/learner/subscription';
+    const callbackUrl = this.config.get('PAYMENTS_CALLBACK_URL', { infer: true })!;
 
     try {
       const result = await this.provider.initializeCheckout({

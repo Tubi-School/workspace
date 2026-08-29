@@ -23,6 +23,7 @@ import { SubscriptionAccessModule } from './subscription-access/subscription-acc
 import { TeacherPortalModule } from './teacher-portal/teacher-portal.module.js';
 import { TeachersModule } from './teachers/teachers.module.js';
 import { NotificationsModule } from './notifications/notifications.module.js';
+import { OperationsModule } from './operations/operations.module.js';
 import { WebhooksModule } from './webhooks/webhooks.module.js';
 
 /**
@@ -69,6 +70,7 @@ import { WebhooksModule } from './webhooks/webhooks.module.js';
     WebhooksModule,
     PaymentsModule,
     NotificationsModule,
+    OperationsModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })

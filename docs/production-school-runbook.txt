@@ -1,0 +1,144 @@
+================================================================================
+TUBI WORKSPACE - PRODUCTION SCHOOL RUNBOOK
+CURRENT STATE: 2026-08-29
+================================================================================
+
+TRUTHFUL PRODUCTION STATE
+
+Web: https://tubi-workspace.vercel.app
+API: https://cooperative-unity-production-916a.up.railway.app
+
+The Vercel web application and Railway API currently answer requests, but the
+Railway backend is serving a pre-Phase-4 build. The Phase 4/5 provider routes
+and operational functionality described below cannot be exercised in
+production until an operator redeploys the reviewed Phase 4/5 code. This is a
+deployment blocker, not evidence that Zoom, Paystack, SMTP, or the Phase 5
+admin surfaces have passed production verification.
+
+Never place secrets, tokens, passwords, or connection strings in this runbook,
+support tickets, screenshots, or Git history.
+
+1. HEALTH AND READINESS
+
+Check GET <API>/health for process liveness and GET <API>/health/ready for
+database readiness. A 200 response from both is necessary but does not prove
+that the deployed commit is current or that providers work. After redeploy,
+confirm a Phase 4/5 route exists and verify the deployed revision in Railway.
+As ADMIN, use /admin/operations only after the current build is deployed. It
+shows database state, provider readiness, and compact stuck-work counts; it
+does not perform provider network probes and does not expose credentials.
+If the database itself is unreachable, every count on this page reads
+"Unavailable" rather than "0" — a "0" on this page always means genuinely
+zero, never "the query could not run."
+
+2. DEPLOYMENT OVERVIEW
+
+The web app is deployed by Vercel and the API/database workload by Railway.
+Before deploying, review the intended Git revision, run the repository's full
+verification matrix, and confirm required environment variable names are set
+in the platform UI. Redeploy the Railway backend before attempting any Phase
+4/5 provider verification. After deployment, repeat health/readiness checks,
+confirm the revision, inspect logs for startup/migration errors, and smoke-test
+authenticated ADMIN routes. Do not run destructive database resets in
+production.
+
+3. ADMIN SCHOOL SETUP
+
+Sign in with an existing ADMIN account. In the admin UI create, in dependency
+order, grade levels, subjects, academic terms, courses, teacher profiles and
+commercial offerings. Use /admin/offerings to set the offering name, delivery
+mode, monthly ZAR price, and included courses. Use genuine school data only.
+Do not change historical meaning by repurposing an offering; create a new one
+when its delivery mode was entered incorrectly.
+
+4. TEACHER ASSIGNMENT
+
+Create or select the teacher profile, assign the teacher to the relevant
+course, and verify the assignment before scheduling sessions. Confirm the
+teacher can see only authorized sessions. Replacement teachers must be
+assigned through the supported admin workflow; do not edit production rows
+directly.
+
+5. SESSION SCHEDULING AND ZOOM PROVISIONING
+
+Schedule a session against the intended course with correct start/end times
+and assigned teacher. For a live session, the backend should create a Zoom
+meeting asynchronously and persist its provider meeting id/join URL. Expected
+progress is provisioning status PENDING to PROVISIONED. Configuration readiness
+requires the complete Zoom meeting credentials plus webhook secret, but
+CONFIGURED is not proof of a successful real Zoom call.
+
+If provisioning reaches FAILED, inspect the safe application error/log context
+and /admin/operations stuck-meeting count, correct provider configuration or a
+transient outage, then use the existing ADMIN retry action. Retrying must not
+create duplicate active meetings. Never fabricate a provider id or mark the
+session provisioned by direct database edits.
+
+6. LEARNER ACCESS AND PAYMENT
+
+The learner registers and signs in, selects an offering, and starts hosted
+Paystack checkout. Checkout readiness requires both the Paystack secret and
+the application's explicit payment callback URL. A browser redirect claiming
+success never grants access. Access is granted only after a verified provider
+webhook confirms the matching reference, amount, and currency; the payment
+transition and subscription grant are atomic and idempotent.
+
+Inspect payment orders at /admin/payments. PENDING means awaiting verified
+resolution, PAID means verified and access granted, and FAILED/CANCELED/
+REFUNDED are terminal states according to the implemented flow. Investigate
+long-lived PENDING orders using provider records and safe logs. Do not convert
+an order to PAID manually and do not replay forged or edited webhooks.
+
+7. NOTIFICATIONS
+
+SMTP readiness requires host, port, user, password, and from-address settings.
+School-domain work writes to the durable outbox; email dispatch is retried by
+the scheduler and is at-least-once, not exactly-once. At /admin/notifications,
+filter and inspect FAILED rows and their non-secret error. Only FAILED rows
+offer Retry. Correct SMTP configuration or outage first, then retry; the row
+returns to PENDING for the existing dispatcher. Do not retry SENT, SENDING, or
+PENDING rows and do not claim real delivery until a recipient receives it.
+
+8. ATTENDANCE SEMANTICS
+
+LIVE attendance requires at least 50 percent of the scheduled live session
+window according to verified attendance events. RECORDED attendance requires
+100 percent of the tracked recording duration. Opening a Zoom-hosted share URL
+does not provide TUBI playback telemetry and cannot legitimately award recorded
+attendance. Never weaken thresholds or manually award attendance merely to
+make a pilot pass.
+
+9. CANCELLATION AND REPLACEMENT
+
+Cancel through the supported ADMIN session workflow so status, meeting release,
+entitlements, and notifications remain consistent. Confirm affected users are
+notified and inspect failed notifications. For a replacement, create/schedule
+the replacement session and assign the correct teacher through the application;
+do not overwrite historical attendance or entitlement snapshots.
+
+10. PROVIDER RECOVERY, RECONCILIATION, AND ROLLBACK
+
+First distinguish incomplete configuration, provider outage, stale deployment,
+and database failure. Use health/readiness, /admin/operations, provider consoles,
+and redacted logs. Restore configuration in the hosting platform, redeploy when
+needed, and use only supported retry endpoints. Reconcile by stable provider
+references and application records; preserve idempotency and terminal payment
+states. Never paste credentials into logs or invoke external calls merely to
+render operational status.
+
+For a bad application deployment, roll back to the last known-good immutable
+revision in the hosting platform, then re-run health/readiness and smoke checks.
+Do not roll back the database independently unless a reviewed migration-specific
+recovery plan requires it. Prefer forward fixes for schema changes. Before any
+data repair, take/verify a recoverable backup, define exact affected records,
+use a transaction where supported, and retain an audit trail. Never use reset,
+truncate, broad delete, or hand-written status changes as reconciliation.
+
+11. OPERATOR-BLOCKED ACCEPTANCE WORK
+
+Until operators act, these remain BLOCKED: redeploying the stale Railway
+backend; real Zoom verification; Paystack sandbox then production verification;
+real SMTP delivery; real browser/mobile QA where unavailable; and a genuine
+production pilot with ADMIN, TEACHER, and multiple LEARNER accounts. Mocks and
+configuration booleans do not satisfy these acceptance checks.
+================================================================================

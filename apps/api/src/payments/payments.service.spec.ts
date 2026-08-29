@@ -51,7 +51,12 @@ describe('PaymentsService', () => {
     prisma.$transaction.mockImplementation((fn: (tx: typeof prisma) => Promise<unknown>) =>
       fn(prisma),
     );
-    config = { get: () => undefined } as unknown as ConfigService<AppConfig, true>;
+    config = {
+      get: (key: string) =>
+        key === 'PAYMENTS_CALLBACK_URL'
+          ? 'https://app.example.com/learner/subscription'
+          : undefined,
+    } as unknown as ConfigService<AppConfig, true>;
     subscriptionAccessService = { createWithinExistingLock: jest.fn() };
     provider = {
       name: 'PAYSTACK',
@@ -66,6 +71,26 @@ describe('PaymentsService', () => {
       subscriptionAccessService as unknown as SubscriptionAccessService,
       provider,
     );
+  });
+
+  describe('isConfigured', () => {
+    it('is false when provider credentials exist but the callback URL is missing', () => {
+      config = { get: () => undefined } as unknown as ConfigService<AppConfig, true>;
+      service = new PaymentsService(
+        prisma as unknown as PrismaService,
+        config,
+        subscriptionAccessService as unknown as SubscriptionAccessService,
+        provider,
+      );
+
+      expect(service.isConfigured()).toBe(false);
+    });
+
+    it('is true only when provider credentials and the callback URL are present', () => {
+      expect(service.isConfigured()).toBe(true);
+      provider.isConfigured.mockReturnValue(false);
+      expect(service.isConfigured()).toBe(false);
+    });
   });
 
   describe('initiateCheckout', () => {

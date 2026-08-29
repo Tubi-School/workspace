@@ -11,6 +11,9 @@ describe('NAV_BY_ROLE (RBAC navigation)', () => {
     expect(hrefs).toContain('/admin/teachers');
     expect(hrefs).toContain('/admin/learners');
     expect(hrefs).toContain('/admin/subscription-access');
+    expect(hrefs).toContain('/admin/offerings');
+    expect(hrefs).toContain('/admin/notifications');
+    expect(hrefs).toContain('/admin/operations');
   });
 
   it('gives TEACHER only teaching-operations navigation, never admin governance routes', () => {

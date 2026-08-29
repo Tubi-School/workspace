@@ -11,7 +11,12 @@ import type {
   GradeLevel,
   LearnerVisibleSession,
   LearnerWithUser,
+  DeliveryMode,
+  LaunchOperationsReport,
+  NotificationOutboxItem,
+  NotificationOutboxStatus,
   Offering,
+  OfferingWithCourses,
   PaymentOrder,
   SanitizedUser,
   SessionRecording,
@@ -178,6 +183,19 @@ export const teacherPortalApi = {
 
 export const offeringsApi = {
   list: () => api.get<Offering[]>('/admin/offerings'),
+  get: (id: string) => api.get<OfferingWithCourses>(`/admin/offerings/${id}`),
+  create: (dto: {
+    name: string;
+    deliveryMode: DeliveryMode;
+    monthlyPrice: number;
+    courseIds: string[];
+  }) => api.post<OfferingWithCourses>('/admin/offerings', dto),
+  update: (id: string, dto: Partial<{ name: string; monthlyPrice: number }>) =>
+    api.patch<Offering>(`/admin/offerings/${id}`, dto),
+  addCourse: (id: string, courseId: string) =>
+    api.post<OfferingWithCourses>(`/admin/offerings/${id}/courses`, { courseId }),
+  removeCourse: (id: string, courseId: string) =>
+    api.delete<OfferingWithCourses>(`/admin/offerings/${id}/courses/${courseId}`),
 };
 
 // ---------------------------------------------------------------------------
@@ -275,4 +293,27 @@ export const paymentsApi = {
   checkout: (offeringId: string) =>
     api.post<{ checkoutUrl: string }>('/learner/payments/checkout', { offeringId }),
   listAll: () => api.get<PaymentOrder[]>('/admin/payments'),
+};
+
+// ---------------------------------------------------------------------------
+// Notification operations (apps/api/src/notifications) — Phase 5 section 15:
+// minimum ADMIN visibility into the outbox plus a narrowly-scoped retry for
+// permanently-failed items. Never a campaign/template editor.
+// ---------------------------------------------------------------------------
+
+export const notificationsApi = {
+  list: (status?: NotificationOutboxStatus) =>
+    api.get<NotificationOutboxItem[]>(
+      status ? `/admin/notifications?status=${status}` : '/admin/notifications',
+    ),
+  retry: (id: string) => api.post<NotificationOutboxItem>(`/admin/notifications/${id}/retry`),
+};
+
+// ---------------------------------------------------------------------------
+// Launch operations dashboard (apps/api/src/operations) — Phase 5 section
+// 17: the single compact ADMIN view of "is the school operable right now."
+// ---------------------------------------------------------------------------
+
+export const operationsApi = {
+  getReport: () => api.get<LaunchOperationsReport>('/admin/operations'),
 };

@@ -1,0 +1,1476 @@
+================================================================================
+TUBI WORKSPACE — PHASE 5 EXTERNAL REVIEW DOCUMENT
+Production Launch, School Operations & Real-World Validation
+================================================================================
+
+Purpose of this document: this is the complete, self-contained handoff for an
+independent external reviewer. It does not assume the reviewer has access to
+terminal history, chat history, or this session. Every claim below is
+classified as one of:
+
+  PASS                          — verified against real production/provider
+                                   behavior.
+  FAIL                          — attempted and found broken.
+  BLOCKED — OPERATOR ACTION REQUIRED
+                                 — cannot be executed without founder/operator
+                                   action (credentials, dashboard config, or a
+                                   redeploy trigger) that this environment has
+                                   no access to.
+  AUTOMATED-TEST VERIFIED ONLY  — covered by unit/integration tests against
+                                   fakes or mocks, not real production or a
+                                   real provider. Never described as
+                                   "production-tested."
+
+No provider credential value, password, JWT secret, database connection
+string, or environment-variable secret appears anywhere in this document.
+
+================================================================================
+A. PHASE 4 BASELINE / FREEZE VERIFICATION
+================================================================================
+
+Status: PASS
+
+  - `git log --oneline -5` on `main`:
+      3159b58 feat: complete Phase 4 school launch core   <- HEAD at freeze
+      6842400 feat: complete Phase 3 production school frontend
+      80deeb3 feat: complete Phase 2G production backend readiness
+      71ac007 feat: implement Phase 2F learner access and attendance engine
+      f4fadda chore: apply repository formatting
+
+  - `git ls-remote --heads origin main` = 3159b5807c79a49837d9308f90e5398be3da4d5c
+    — matches HEAD exactly. origin/main contains the Phase 4 commit.
+
+  - `git tag -l` includes `v0.4.0-phase4-school-launch-core`.
+
+  - `git ls-remote --tags origin | grep phase4`:
+      refs/tags/v0.4.0-phase4-school-launch-core        -> 5f7be865...
+      refs/tags/v0.4.0-phase4-school-launch-core^{}     -> 3159b5807c79a49837d9308f90e5398be3da4d5c
+    The annotated tag object dereferences to the same commit as HEAD/origin.
+
+  - Working tree at the start of Phase 5 was clean (no pending Phase 4
+    changes). All Phase 5 work described below is additive, uncommitted, and
+    layered on top of this exact frozen commit.
+
+Conclusion: Phase 4 is genuinely committed, pushed, and tagged. The gap
+described in section E is a deployment-pipeline issue, not a freeze integrity
+issue.
+
+================================================================================
+B. SCOPE COMPLETED THIS PHASE
+================================================================================
+
+Implemented and verified (backend + frontend, tests, typecheck, lint, build):
+
+  1. Offering administration (the one genuine ADMIN school-setup gap found).
+     Phase 3 left Offering deliberately read-only. Phase 5 adds:
+       - Create an Offering (name, deliveryMode, monthlyPrice, initial course
+         list).
+       - Update an Offering's name/monthlyPrice only (deliveryMode is
+         intentionally NOT mutable post-creation — see section Y).
+       - Attach a course to an Offering.
+       - Detach a course from an Offering.
+       - No delete capability (intentionally withheld — see section Y).
+     Frontend: `/admin/offerings` page (create form + course checklist +
+     existing-offerings list).
+
+  2. Notification operations (ADMIN visibility + narrowly-scoped retry).
+       - `GET /admin/notifications?status=` — lists outbox items (PENDING /
+         SENDING / SENT / FAILED), most recent 200, joined with recipient
+         email/name, including attempts and last error.
+       - `POST /admin/notifications/:id/retry` — resets ONE FAILED item back
+         to PENDING, clearing the existing claim-token/claimedAt fencing
+         columns and the attempt counter, so the existing fenced dispatch
+         scheduler can safely reclaim it. Rejects (409) anything not
+         currently FAILED, including a race where another actor changed its
+         state between the read and the write (compound conditional
+         `updateMany` with a re-check, not a blind write).
+     Frontend: `/admin/notifications` page (status filter + retry button on
+     FAILED rows only).
+
+  3. Launch operations dashboard.
+       - `GET /admin/operations` — a single compact report: database
+         reachability, Zoom/Paystack/SMTP "configured" booleans (never a
+         credential value), count of sessions stuck in FAILED meeting
+         provisioning, count of permanently-FAILED notifications, count of
+         PENDING payments, count of upcoming SCHEDULED sessions.
+     Frontend: `/admin/operations` page.
+
+  4. ADMIN school-setup audit (no new code required).
+     Confirmed GradeLevel, AcademicTerm, Subject, Course, Teacher, and
+     Session already have full create/read/update(/delete where applicable)
+     ADMIN API + frontend paths from Phases 2D/2E/3/4 — no direct database
+     access is required to run the school. Offering was the only genuine
+     gap, now closed (item 1 above).
+
+  5. Production-verification pass (read-only; no code changes) — see
+     sections E, F, G, H.
+
+  6. Codex correction pass (four findings from the first-review inspection
+     of items 1–3 above, all now fixed and covered by new automated tests):
+       a. Operations database-down handling. `OperationsService.getReport()`
+          now probes the database FIRST; if it is down, all four operational
+          counts are returned as `null` ("unavailable") WITHOUT ever issuing
+          the count queries, rather than either attempting them against an
+          unreachable database or silently reporting a misleading `0`. The
+          `/admin/operations` page renders a `null` count as "Unavailable".
+          See sections Q, S, Z.
+       b. Offering course concurrency. `addCourse`/`removeCourse` still keep
+          their fast-path `findUnique` pre-check, but now also catch the
+          Prisma constraint error a genuine race can produce past that
+          check: a concurrent duplicate `create` raises `P2002`, caught and
+          turned into the same 409 `ConflictException` a sequential
+          duplicate gets; a concurrent/already-absent `delete` raises
+          `P2025`, caught and turned into the same 404 `NotFoundException`
+          a sequential double-removal gets. Any other error still
+          propagates unchanged. See sections B, Z, AC.
+       c. Notification response minimization. `NotificationsService.listAll`
+          and `retryFailed` now both select/project an explicit minimized
+          shape (id, type, recipientUserId, status, attempts, createdAt,
+          sentAt, lastError, recipient) — `claimToken`, `claimedAt` (internal
+          dispatcher-fencing state), and `payload` are never selected from
+          the database and never reach the controller or the browser. See
+          section Q.
+       d. Offering-name whitespace validation. Both `CreateOfferingDto` and
+          `UpdateOfferingDto` now `@Transform` the `name` field (trim) before
+          `@MinLength(1)` validates it, so a whitespace-only value (e.g.
+          three spaces) collapses to an empty string and is rejected with a
+          400, rather than being accepted as a "real" Offering name. A name
+          with incidental leading/trailing whitespace is silently trimmed
+          rather than rejected. See section AC.
+
+Explicitly NOT done this session (see sections X and Y for why):
+  - Real Zoom/Paystack/SMTP provider verification (no credentials available
+    in this environment — BLOCKED).
+  - Learner/teacher end-to-end journey hardening beyond what Phase 3/4
+    already built and tested (sections M, N describe what exists and what
+    is unverified in a live browser).
+  - Deployment or provider activation. The operational runbook now exists
+    and explicitly documents the stale Railway deployment and blocked work.
+  - A dedicated new production-security code change — the Phase 4 security
+    posture (fencing, RBAC, IDOR guards, webhook signature verification) was
+    audited, not modified, because no new gap was found in it.
+  - A literal mobile-device/browser QA pass — no browser is available in
+    this execution environment (see section V).
+
+================================================================================
+C. FILES CREATED / MODIFIED
+================================================================================
+
+Modified:
+  apps/api/src/app.module.ts                          (register OperationsModule)
+  apps/api/src/notifications/notifications.module.ts   (register NotificationsController)
+  apps/api/src/notifications/notifications.service.ts  (listAll, retryFailed; Codex
+                                    finding 3 correction: both now project a
+                                    minimized shape — see Section Q)
+  apps/api/src/notifications/notifications.service.spec.ts (adds the field-
+                                    minimization assertion for Codex finding 3)
+  apps/api/src/notifications/email-provider.service.ts        (Phase 5
+                                    readiness-seam correction: add isConfigured()
+                                    — SMTP_HOST, SMTP_PORT, SMTP_USER,
+                                    SMTP_PASSWORD, SMTP_FROM_ADDRESS all required)
+  apps/api/src/notifications/email-provider.service.spec.ts
+  apps/api/src/offerings/offerings.controller.ts        (create/update/addCourse/removeCourse)
+  apps/api/src/offerings/offerings.service.ts            (same; Codex finding 2
+                                    correction: addCourse/removeCourse now catch
+                                    the Prisma P2002/P2025 races — see Section B)
+  apps/api/src/offerings/offerings.service.spec.ts       (adds the four
+                                    concurrency-race tests for Codex finding 2)
+  apps/api/src/payments/payments.service.ts             (Phase 5 readiness-seam
+                                    correction: add isConfigured() — provider
+                                    configured AND PAYMENTS_CALLBACK_URL set)
+  apps/api/src/payments/payments.service.spec.ts
+  apps/api/src/providers/zoom/zoom-provider.service.ts  (Phase 5 readiness-seam
+                                    correction: add isOperationallyConfigured()
+                                    — base config AND ZOOM_WEBHOOK_SECRET_TOKEN set)
+  apps/api/src/providers/zoom/zoom-provider.service.spec.ts
+  apps/web/src/components/shell/nav-config.ts           (Offerings, Notifications, Operations)
+  apps/web/src/components/shell/nav-config.test.ts
+  apps/web/src/lib/endpoints.ts   (offeringsApi extended, notificationsApi, operationsApi added)
+  apps/web/src/lib/types.ts       (OfferingWithCourses, NotificationOutboxItem,
+                                    NotificationOutboxStatus, LaunchOperationsReport,
+                                    ProviderConfigStatus; Codex finding 1
+                                    correction: adds `OperationalCount = number |
+                                    null` and applies it to all four counts on
+                                    `LaunchOperationsReport`)
+
+Created:
+  apps/api/src/offerings/dto/create-offering.dto.ts      (Codex finding 4
+                                    correction: `@Transform` trims `name` before
+                                    `@MinLength(1)` runs, so whitespace-only is
+                                    rejected — see Section B)
+  apps/api/src/offerings/dto/create-offering.dto.spec.ts (NEW this pass — the
+                                    whitespace-rejection/trim/accept tests for
+                                    Codex finding 4, covering both DTOs)
+  apps/api/src/offerings/dto/update-offering.dto.ts      (same trim/whitespace
+                                    correction as create-offering.dto.ts)
+  apps/api/src/offerings/dto/add-offering-course.dto.ts
+  apps/api/src/notifications/dto/list-notifications.dto.ts
+  apps/api/src/notifications/notifications.controller.ts
+  apps/api/src/notifications/notifications.controller.spec.ts
+  apps/api/src/operations/operations.module.ts
+  apps/api/src/operations/operations.service.ts          (Phase 5 readiness-seam
+                                    correction: reads provider readiness via the
+                                    three services above rather than reading env
+                                    vars itself; Codex finding 1 correction:
+                                    probes the database FIRST and, if down,
+                                    returns `null` for all four counts without
+                                    ever issuing the count queries — see Section
+                                    Q/S)
+  apps/api/src/operations/operations.controller.ts
+  apps/api/src/operations/operations.service.spec.ts     (adds the DB-down/
+                                    counts-unavailable test for Codex finding 1)
+  apps/api/src/operations/operations.controller.spec.ts
+  apps/web/src/app/admin/offerings/page.tsx
+  apps/web/src/app/admin/offerings/page.test.tsx
+  apps/web/src/app/admin/notifications/page.tsx
+  apps/web/src/app/admin/notifications/page.test.tsx
+  apps/web/src/app/admin/operations/page.tsx             (Codex finding 1
+                                    correction: renders a `null` count as
+                                    "Unavailable", never as "0")
+  apps/web/src/app/admin/operations/page.test.tsx        (adds the "Unavailable"-
+                                    rendering test for Codex finding 1)
+  docs/phase-5-production-launch-review.txt              (this document)
+  docs/production-school-runbook.txt
+
+This inventory has been reconciled directly against `git status --short` after
+the Codex-finding correction pass (see section AB for the exact, current
+output) — every modified and untracked path under `apps/`, plus both new
+`docs/` files, is accounted for above. The pre-existing, untouched `.claude/`
+and `AI/.claude/` paths are configuration scaffolding from earlier phases, not
+Phase 5 implementation files, and are intentionally excluded from this
+inventory.
+
+No `.env` files, credentials, build output, or unrelated files are present in
+the working tree (see section AB for exact `git status`).
+
+================================================================================
+D. SCHEMA / MIGRATIONS
+================================================================================
+
+Status: NONE.
+
+No `schema.prisma` change and no new migration was required for any Phase 5
+item implemented this pass. Every new admin operation (Offering CRUD,
+notification listing/retry, operations report) reads and writes columns that
+already existed on `Offering`, `OfferingCourse`, `NotificationOutboxItem`,
+`Session`, and `PaymentOrder` from Phases 2–4. This is consistent with the
+brief's instruction to implement only missing operations, not new domain
+concepts.
+
+================================================================================
+E. PRODUCTION DEPLOYMENT STATUS
+================================================================================
+
+Status: FAIL — Railway is serving an OLDER commit than the frozen Phase 4
+commit that is on `origin/main`.
+
+This is the most important finding in this document. It was discovered by
+probing the live Railway API directly, not assumed from git state.
+
+Evidence (see section F for the exact commands/results):
+  - `/health` and `/health/ready` respond 200 — the deployed process is
+    alive and DB-connected.
+  - `POST /api/v1/auth/register` responds 400 (validation error) — this
+    route existed before Phase 4, so its presence proves nothing about
+    Phase 4 deployment, only that SOME backend build is live.
+  - `GET /api/v1/admin/offerings` (unauthenticated) responds 401 — this
+    route existed as a READ-ONLY controller since Phase 3, so this also
+    only proves Phase 3 (or later) is live, not Phase 4.
+  - `GET /api/v1/learner/offerings` (a route that exists ONLY from Phase 4
+    onward) responds 404.
+  - `POST /api/v1/webhooks/zoom` (a route that exists ONLY from Phase 4
+    onward) responds 404.
+
+Conclusion: the live Railway deployment is running a pre-Phase-4 build
+(consistent with the Phase 3 commit, `6842400`), despite the Phase 4 commit
+being present and verified on `origin/main` and tagged. Something in the
+Railway deploy pipeline (a stalled/failed build, a manual deploy pause, or a
+misconfigured deploy trigger) has not picked up the push.
+
+This blocks real verification of: Zoom integration (I), payment integration
+(J), live attendance validation against production (O), recording workflow
+validation against production (P), and the production pilot (W). Every one
+of those sections below is marked BLOCKED for that reason, not because the
+underlying code is unverified by automated tests — see each section for the
+automated-test-only verification that IS available.
+
+================================================================================
+F. RAILWAY VERIFICATION
+================================================================================
+
+Method: direct `curl` against the public Railway URL from this execution
+environment (confirmed to have real outbound network access).
+
+Base URL: https://cooperative-unity-production-916a.up.railway.app
+
+  GET  /health                          -> 200  PASS (process alive)
+  GET  /health/ready                    -> 200  PASS (DB reachable — see H)
+  POST /api/v1/auth/register            -> 400  (pre-Phase-4 route; exists)
+  GET  /api/v1/admin/offerings          -> 401  (pre-Phase-4 read-only route; exists)
+  GET  /api/v1/learner/offerings        -> 404  FAIL (Phase-4-only route; missing)
+  POST /api/v1/webhooks/zoom            -> 404  FAIL (Phase-4-only route; missing)
+
+Railway project configuration was NOT changed by this session (repo
+`Tubi-School/workspace`, branch `main`, Root Directory `/`, builder Railpack
+— all as specified in the brief, none touched).
+
+No Railway CLI or API token is available in this environment, so the deploy
+itself cannot be triggered, inspected, or diagnosed further from here.
+
+Classification: BLOCKED — OPERATOR ACTION REQUIRED. The operator must open
+the Railway dashboard for this service, confirm whether the most recent
+deploy attempt for commit `3159b58` succeeded, failed, or was never
+triggered, and manually trigger/redeploy if necessary.
+
+================================================================================
+G. VERCEL VERIFICATION
+================================================================================
+
+Method: direct `curl` against the public Vercel URL.
+
+  GET  https://tubi-workspace.vercel.app   -> 200  PASS
+
+The frontend root loads. This session cannot confirm from the command line
+alone whether the deployed frontend build corresponds to the Phase 3 or a
+later commit, nor whether `NEXT_PUBLIC_API_URL` in the deployed build points
+at the Railway URL above (that value is baked into the client bundle at
+build time and not introspectable via a bare HTTP probe without a browser).
+No secret is at risk either way — `NEXT_PUBLIC_API_URL` is a public value by
+Next.js convention, not a credential.
+
+Classification: PASS for "site is up and serving traffic." UNVERIFIED (not
+FAIL) for "frontend build is current" — no browser is available in this
+environment to load the app and inspect actual outbound request targets
+(see section V for the same limitation applied to mobile-width QA).
+
+================================================================================
+H. NEON / MIGRATION VERIFICATION
+================================================================================
+
+Status: PASS (for what could be verified) / BLOCKED for the rest.
+
+  - `GET /health/ready` on the live Railway deployment returned 200 with a
+    `postgresql` dependency reporting `status: "ok"` and a measured latency
+    — the production Neon database is reachable from the currently-deployed
+    backend process.
+  - This session has no direct Neon dashboard or connection-string access
+    (by design — production credentials are never to be pasted into this
+    environment), so migration-application history cannot be independently
+    queried beyond what the running application's own readiness probe
+    already confirms.
+  - No `prisma migrate dev`, destructive seed, or manual schema edit was run
+    against any database this session. No schema change was required (see
+    section D).
+
+Classification: PASS for "the currently-deployed backend can reach its
+database." BLOCKED — OPERATOR ACTION REQUIRED for "Phase 4's migrations have
+been applied to production" — that cannot be confirmed until section E's
+deployment gap is resolved, because the currently-deployed backend predates
+the migrations in question.
+
+================================================================================
+I. ZOOM INTEGRATION STATUS
+================================================================================
+
+Status: BLOCKED — OPERATOR ACTION REQUIRED.
+
+Required operator actions, none of which this environment can perform:
+  1. Set `ZOOM_ACCOUNT_ID`, `ZOOM_CLIENT_ID`, `ZOOM_CLIENT_SECRET`,
+     `ZOOM_WEBHOOK_SECRET_TOKEN` in the Railway environment.
+  2. Configure the Zoom Server-to-Server OAuth app's webhook URL to point at
+     the production `/api/v1/webhooks/zoom` endpoint.
+  3. Resolve the deployment gap in section E first — the webhook route does
+     not exist on the currently-deployed backend at all.
+
+What IS verified, and how:
+  - AUTOMATED-TEST VERIFIED ONLY: webhook signature verification (HMAC-SHA256
+    + timingSafeEqual), URL-validation challenge-response, claim-token
+    fencing against duplicate/concurrent webhook delivery, meeting
+    provisioning idempotency (including the persistence-failure-after-
+    successful-creation case fixed in the Phase 4 H1 correction), and
+    participant join/leave interval ingestion — all covered by the Phase 4
+    test suite (`apps/api/src/providers/zoom/**`, `apps/api/src/webhooks/**`,
+    `apps/api/src/sessions/meeting-provisioning.service.spec.ts`), still
+    passing (see section Z for exact counts). None of this has been
+    exercised against the real Zoom API or a real webhook delivery.
+  - The `getProviderConfiguration()` check in the new `/admin/operations`
+    endpoint (section S) will correctly report Zoom as NOT_CONFIGURED until
+    all four environment variables above are present — this was verified
+    with unit tests exercising each variable individually.
+
+Known product limitation preserved from Phase 4 (see section Y): Zoom
+Cloud Recording's `share_url` playback provides no TUBI-controlled telemetry,
+so RECORDED attendance cannot legitimately be granted for a learner who only
+opens a Zoom-hosted recording page. This remains a documented
+product/infrastructure limitation, not something Phase 5 attempted to solve.
+
+================================================================================
+J. PAYMENT INTEGRATION STATUS
+================================================================================
+
+Status: BLOCKED — OPERATOR ACTION REQUIRED.
+
+Required operator actions:
+  1. Set `PAYSTACK_SECRET_KEY` and `PAYMENTS_CALLBACK_URL` in Railway.
+  2. Verify via Paystack SANDBOX before any live-money test — this was
+     explicitly instructed and has NOT been done (no sandbox credentials
+     available here).
+  3. Resolve the deployment gap in section E — `/api/v1/webhooks/payments`
+     and `/api/v1/learner/payments/checkout` are Phase-4-only routes and
+     currently return 404 in production for the same reason as section I.
+
+What IS verified, and how:
+  - AUTOMATED-TEST VERIFIED ONLY: checkout initialization against the
+    `PaymentProvider` abstraction, webhook signature/claim fencing,
+    PaymentOrder status-transition serialization under the shared
+    terminal-state lock (payment success/failure race — Phase 4 review
+    finding 5), amount/currency validation, and SubscriptionAccess grant
+    atomicity via the Postgres advisory lock — all covered by
+    `apps/api/src/payments/**` tests, still passing.
+  - The `/admin/operations` report's `paymentsAwaitingResolutionCount`
+    (count of PENDING PaymentOrder rows) was verified with unit tests.
+  - No live or sandbox Paystack transaction has been initiated. No ZAR
+    amount has been charged, real or test-mode, by this session.
+
+Correctly absent by design: there is still no "mark PAID manually" ADMIN
+action anywhere in the codebase — provider-confirmed webhook truth remains
+the only path to PAID, per the frozen constraint.
+
+================================================================================
+K. SMTP / NOTIFICATION STATUS
+================================================================================
+
+Status: BLOCKED — OPERATOR ACTION REQUIRED (for real delivery) /
+PASS (for the operations layer built this phase).
+
+Required operator action: set `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`,
+`SMTP_PASSWORD`, `SMTP_FROM_ADDRESS` in Railway. No SMTP credentials are
+available in this environment, so no real email (registration, payment,
+reminder, cancellation, replacement, or recording-available) has been sent
+or received this session.
+
+What IS verified this phase (new work), by automated test:
+  - `NotificationsService.listAll` correctly joins outbox rows to recipient
+    identity and supports status filtering (9 unit tests).
+  - `NotificationsService.retryFailed` only ever transitions a FAILED row to
+    PENDING, clears the claim-token/claimedAt fencing fields and the
+    attempt counter, rejects a non-FAILED item with 409, and rejects a
+    concurrent-claim race via a re-checked `updateMany` (not a blind write)
+    — 4 dedicated unit tests plus 2 controller-delegation tests.
+  - `/admin/operations`'s email-configured boolean delegates to
+    `EmailProviderService.isConfigured()`, which requires `SMTP_HOST`,
+    `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, and `SMTP_FROM_ADDRESS` all
+    present before reporting CONFIGURED (verified by test, not by an actual
+    send).
+
+What is carried over unmodified from Phase 4, still passing: at-least-once
+delivery semantics, never-exactly-once documentation, enqueue-never-throws
+isolation from the triggering domain operation, and the dispatch scheduler's
+own claim-token fencing.
+
+================================================================================
+L. ADMIN SCHOOL-SETUP WORKFLOW
+================================================================================
+
+Status: PASS (API/route existence and automated-test coverage) /
+UNVERIFIED IN A LIVE BROWSER (no browser available in this environment).
+
+Confirmed present and reachable through the API without any direct database
+access, Prisma Studio, SQL, or manual UUID entry:
+  - GradeLevel:     full CRUD  (apps/api/src/grade-levels)
+  - Subject:        full CRUD  (apps/api/src/subjects)
+  - AcademicTerm:   full CRUD  (apps/api/src/academic-terms)
+  - Course:         full CRUD  (apps/api/src/courses)
+  - Teacher:        create/read/update (no delete — correct, teachers are
+                     deactivated via `isActive`, never deleted)
+  - Teacher assignment to a Session (PRIMARY/ASSISTANT/SUBSTITUTE), including
+    primary-teacher reassignment with an explicit outgoing-teacher action —
+    `apps/api/src/sessions`
+  - Session: full create/update/lifecycle (mark-live, mark-ended, cancel,
+    provision-meeting retry) — `apps/api/src/sessions`
+  - Offering (NEW this phase): create, name/price update, course
+    attach/detach — see section B item 1.
+
+All of the above have corresponding frontend admin pages under
+`apps/web/src/app/admin/**` built in Phases 2D/2E/3/4/5 that use searchable
+selects rather than raw ID entry, consistent with the brief's instruction.
+
+This session did not open a browser against either the local dev server or
+the (currently pre-Phase-4) production frontend, so "an ADMIN can actually
+click through this in a live browser today" is UNVERIFIED, not FAIL — the
+API-level and automated-test-level evidence is solid, but the brief's
+explicit instruction ("start the dev server and use the feature in a
+browser") was not literally executable in this non-interactive environment.
+
+================================================================================
+M. LEARNER END-TO-END WORKFLOW
+================================================================================
+
+Status: AUTOMATED-TEST VERIFIED ONLY. Not verified in production or a live
+browser this phase.
+
+The registration -> login -> workspace -> offering discovery -> checkout ->
+provider confirmation -> access -> entitled session flow was built and
+tested extensively in Phase 3 (frontend) and Phase 4 (payment/webhook
+backend); no code in this flow was modified in Phase 5 except the Offering
+catalog it reads from (which now supports genuine ADMIN-created offerings
+instead of being empty in a fresh production database).
+
+Specific items from the Phase 5 checklist and their status:
+  - Validation errors, duplicate email on registration:      AUTOMATED-TEST
+    VERIFIED ONLY (Phase 2C/3 backend + frontend tests, unmodified,
+    still passing).
+  - Auth expiry handling:                                    AUTOMATED-TEST
+    VERIFIED ONLY (JwtAuthGuard tests, unmodified).
+  - Failed checkout / payment pending / delayed webhook:      AUTOMATED-TEST
+    VERIFIED ONLY (Phase 4 payment race/idempotency tests, unmodified).
+  - Refresh/reload mid-flow:                                  NOT RE-VERIFIED
+    this phase (no browser).
+  - Mobile-width usability:                                   see section V.
+  - Empty states, unauthorized access:                        AUTOMATED-TEST
+    VERIFIED ONLY (existing `EmptyState`/RBAC guard tests, unmodified).
+
+No new learner-journey code was written this phase because no new gap was
+found in it — the only genuine end-to-end blocker for this flow is that a
+learner cannot discover a REAL offering in a fresh production database until
+an ADMIN creates one, which section B item 1 now makes possible. That
+creation action itself has not yet been performed against production (see
+section W — deliberately not seeding fake data).
+
+================================================================================
+N. TEACHER END-TO-END WORKFLOW
+================================================================================
+
+Status: AUTOMATED-TEST VERIFIED ONLY. Not modified or newly verified this
+phase.
+
+Login -> workspace -> assigned courses/sessions -> session detail -> Start/
+Join was built in Phases 2E/3 and covered by the teacher-portal scoping
+tests (server-authoritative — a teacher's JWT identity, never a client-
+supplied teacherId, determines what is visible; verified by existing tests
+asserting a teacher cannot fetch another teacher's session by ID
+manipulation). PRIMARY/ASSISTANT/SUBSTITUTE role semantics and the
+teacher-mutation-authority boundary (a teacher cannot escalate their own
+role or add themselves to unrelated sessions) are covered by
+`apps/api/src/sessions/*.spec.ts` and `apps/api/src/teacher-portal/*.spec.ts`,
+unmodified and still passing this phase.
+
+No new teacher-journey gap was found, so no new code was written here.
+
+================================================================================
+O. LIVE ATTENDANCE VALIDATION
+================================================================================
+
+Status: BLOCKED — OPERATOR ACTION REQUIRED (for real Zoom validation) /
+AUTOMATED-TEST VERIFIED ONLY (for the calculation engine itself).
+
+The cumulative-overlap >=50% LIVE threshold, DeliveryMode-gated join
+authorization, duplicate-event handling, reconnect handling, and interval
+clipping-to-scheduled-window logic are unmodified this phase and remain
+covered by the Phase 2F/4 attendance engine test suite (still passing — see
+section Z). No manual attendance edit was made or is available to fabricate
+a passing result, consistent with the constraint.
+
+A real Zoom-driven end-to-end validation (schedule a session, provision via
+real Zoom, have a real teacher and real learners join, receive real
+participant webhooks, observe the calculated PRESENT/ABSENT outcome) is
+BLOCKED on sections E and I — there is no live Zoom integration in
+production to test against yet.
+
+================================================================================
+P. RECORDING / RECORDED-ATTENDANCE VALIDATION
+================================================================================
+
+Status: BLOCKED — OPERATOR ACTION REQUIRED (for a real Zoom-hosted
+recording) / AUTOMATED-TEST VERIFIED ONLY (for the coverage-calculation
+engine and the TUBI-hosted player path).
+
+Unmodified this phase, still covered by tests: watched-interval reporting
+with retry-on-failure (Phase 4 review finding 6), final-interval delivery on
+unmount/navigation via `keepalive`+`pagehide` (Phase 4 M1 correction),
+merge-without-double-count logic, and the frozen 100%-unique-coverage rule
+for RECORDED attendance.
+
+The known, permanent product limitation is restated here explicitly per the
+brief's instruction not to weaken the frozen rule around it: Zoom Cloud
+Recording's `share_url` playback gives TUBI no telemetry, so a learner
+opening or even fully watching a Zoom-hosted recording page can NEVER be
+awarded RECORDED attendance under the current architecture — only a
+directly-hosted recording played through TUBI's own HTML5 player (which
+does report genuine watched intervals) can satisfy the 100% coverage rule.
+This is a documented infrastructure limitation, not a Phase 5 defect, and
+this phase did not implement expensive rehosting (no founder approval was
+sought or given for that).
+
+================================================================================
+Q. NOTIFICATION OPERATIONS
+================================================================================
+
+Status: PASS (new feature, fully implemented and tested this phase) — see
+section B item 2, section K, and section Z for exact test counts.
+
+  - ADMIN can see PENDING/SENDING/SENT/FAILED counts and individual rows via
+    `GET /admin/notifications`, with last error and attempt count exposed
+    for FAILED rows.
+  - ADMIN can retry an individual permanently-FAILED item; the retry action
+    is narrowly scoped (FAILED-only, fencing-preserving, race-safe) — see
+    the source excerpt in section AC.
+  - At-least-once semantics and the "never exactly-once" framing are
+    preserved unchanged; no code path in this phase claims guaranteed
+    single delivery.
+  - Response minimization (Codex finding 3, corrected this pass): both
+    `listAll` and `retryFailed` now explicitly select/project only
+    `id, type, recipientUserId, status, attempts, createdAt, sentAt,
+    lastError, recipient` from the database. `claimToken` and `claimedAt` —
+    the internal dispatcher-fencing state used by
+    `NotificationDispatchScheduler` to prevent double-send — are never
+    selected from the database and never appear in an HTTP response, and
+    the full `payload` (which may contain more than an ADMIN needs to see)
+    is likewise excluded. This is enforced by a dedicated unit test
+    asserting both the Prisma `select` clause and the returned object
+    shape omit all three fields (section Z), and by reading the current
+    source directly (excerpt in section AC).
+
+This was verified by automated test only (real SMTP is not configured — see
+section K); the retry mechanism's correctness under the existing claim-token
+fencing design, and the response-minimization behavior above, are the
+properties under test — not actual email delivery.
+
+================================================================================
+R. PAYMENT OPERATIONS
+================================================================================
+
+Status: PASS (audit of existing Phase 4 surface; no changes required).
+
+The existing `/admin/payments` endpoint and page (Phase 4) already display
+learner, offering, amount, currency, provider, provider reference, and
+status (PENDING/PAID/FAILED/CANCELED/REFUNDED) for every PaymentOrder. There
+is still no ADMIN action to manually mark a payment PAID — provider-
+confirmed webhook truth remains the sole path to that transition, which is
+correct per the frozen constraint and was reconfirmed by reading the current
+`PaymentsController`/`PaymentsService` source this phase (excerpt in section
+AC references the unchanged terminal-state guard, not new code).
+
+No accounting, invoicing, refund automation, or payroll capability exists or
+was added — correct per the explicit DO NOT BUILD list.
+
+================================================================================
+S. LAUNCH OPERATIONS / STATUS VIEW
+================================================================================
+
+Status: PASS (new feature, fully implemented and tested this phase) — see
+section B item 3 and section Z.
+
+`GET /admin/operations` answers exactly the questions the brief specified:
+API/DB operational (via a live `ping()` against Postgres, never leaking the
+connection string on failure — the endpoint returns only `'ok' | 'down'`),
+whether Zoom/payments/email are configured (boolean-only, no values), count
+of sessions stuck in FAILED meeting provisioning, count of permanently-
+FAILED notifications, count of PENDING payments, and count of upcoming
+SCHEDULED sessions. This is deliberately not a general analytics platform —
+seven fixed fields, no historical charting, no free-form querying.
+
+Database-down handling (Codex finding 1, corrected this pass): the four
+operational counts are `number | null`, not plain `number`.
+`OperationsService.getReport()` probes the database FIRST; only if that
+probe succeeds does it issue the four `count()` queries. If the database is
+down, every count is returned as `null` and none of the count queries is
+ever attempted — an ADMIN viewing this page during an outage sees
+"Unavailable" on every count (the frontend renders `null` this way,
+never as "0"), so a `0` on this page can always be trusted to mean "zero,"
+never "the query never ran." This is enforced by a unit test asserting
+`prisma.session.count`/`notificationOutboxItem.count`/`paymentOrder.count`
+are not called when the database probe fails (section Z), and by a frontend
+test asserting the literal string "Unavailable" renders (and "0" does not)
+when the API returns all four counts as `null`.
+
+================================================================================
+T. SECURITY REVIEW
+================================================================================
+
+Status: AUDITED; ONE GAP FOUND AND FIXED this phase (Codex finding 3 —
+internal notification-fencing state was reaching the response body).
+
+Every new Phase 5 endpoint (`/admin/offerings/*` mutations,
+`/admin/notifications*`, `/admin/operations`) is behind the same
+`JwtAuthGuard` + `RolesGuard` + `@Roles('ADMIN')` stack used by every other
+admin controller in this codebase — verified by reading each controller's
+decorators (excerpts in section AC) and by the fact that the production
+`admin/offerings` GET route already correctly returns 401 unauthenticated
+(section F).
+
+Found and corrected this phase:
+  - `GET /admin/notifications` and `POST /admin/notifications/:id/retry`
+    originally returned the full `NotificationOutboxItem` row, including
+    `claimToken` and `claimedAt` — internal dispatcher-fencing state with no
+    ADMIN-facing purpose — and the full `payload` JSON, which may contain
+    more than an ADMIN needs to see. This was not an authentication or
+    authorization bypass (both endpoints were already correctly ADMIN-only),
+    but it was an unnecessary internal-state exposure to the browser. Fixed
+    by having `NotificationsService` explicitly select/project only the
+    fields an ADMIN needs (see section Q); verified by a unit test asserting
+    the absence of all three fields from both the Prisma query and the
+    returned shape.
+
+Specifically re-checked this phase and found unchanged/still correct:
+  - Webhook signature verification and replay/idempotency fencing (Zoom and
+    payment webhooks) — unmodified.
+  - No new IDOR surface: every new admin endpoint acts on identifiers
+    already scoped to the ADMIN role globally (there is no "your own"
+    resource concept for these admin-only resources, unlike teacher/learner
+    scoping which was also re-checked and found unmodified).
+  - No secret is exposed to the browser: `/admin/operations` returns only
+    booleans for provider configuration, never a value; verified by reading
+    `OperationsService.getProviderConfiguration()` (full source in section
+    AC) and by unit test asserting the boolean-only shape.
+  - CORS configuration, JWT handling, and log-redaction behavior (the
+    `GENERIC_DATABASE_ERROR` pattern from `HealthService`, reused
+    conceptually in `OperationsService.probeDatabase()`) are unmodified.
+  - Input validation: Offering name whitespace-only rejection (Codex
+    finding 4) is a data-integrity correction, not a security
+    vulnerability fix — a whitespace-only name could not be used to bypass
+    any authorization or injection boundary; it is documented in section
+    AC for completeness.
+
+No destructive-action gap or authorization-bypass was found this phase. The
+one genuine finding (internal-state exposure via an over-broad ADMIN
+response, not a bypass of who can call the endpoint) has been fixed and
+verified. This remains an audit-plus-targeted-fix result, not evidence that
+a fresh independent security review is unnecessary.
+
+================================================================================
+U. FAILURE-MODE EXERCISES
+================================================================================
+
+Status: AUTOMATED-TEST VERIFIED ONLY (existing coverage from Phase 4, plus
+targeted new coverage from the Phase 5 readiness-seam correction) for the
+provider-failure scenarios.
+
+Precise scope of what the Phase 5 readiness-seam correction touched, and
+what it did not (not to be confused with the separate, original Phase 4 H1
+correction to `MeetingProvisioningService` referenced elsewhere in this
+document, e.g. section I):
+  - External provider transaction/webhook behavior was NOT changed — the
+    Zoom meeting-provisioning flow, the Paystack checkout/webhook flow, and
+    the SMTP send path are byte-for-byte the same request/response handling
+    as Phase 4.
+  - Only local configuration-readiness seams were added: `ZoomProviderService
+    .isOperationallyConfigured()`, `PaymentsService.isConfigured()`, and
+    `EmailProviderService.isConfigured()` are new pure functions that read
+    already-validated environment configuration and return a boolean —
+    they make no network call and do not alter provider behavior.
+  - Those readiness seams are covered by focused automated unit tests
+    (see section Z) asserting each returns NOT_CONFIGURED when any required
+    variable is absent and CONFIGURED only once every required variable is
+    present.
+  - Real provider fault injection (an actual Zoom/Paystack/SMTP outage, a
+    real malformed webhook, a real network timeout) remains unexecuted —
+    this phase must not be read as having exercised real Zoom, Paystack, or
+    SMTP behavior in any capacity.
+
+Zoom-unavailable-during-creation, Zoom-success-then-persistence-failure
+(the original Phase 4 H1 correction to `MeetingProvisioningService`),
+duplicate webhooks, provider retries, payment amount mismatch, payment
+success/failure race, SMTP unavailable, and failed-notification retry (this
+phase's own `retryFailed`, freshly tested — 4 dedicated tests, section Z)
+are all covered by fakes/mocks, never by deliberately damaging production
+data, consistent with the constraint.
+
+Two further failure modes were found and fixed during the Codex correction
+pass, both covered by new fakes/mocks, never against real infrastructure:
+  - Database unavailable while generating the launch operations report
+    (Codex finding 1) — `OperationsService.getReport()` probing failure is
+    exercised with a rejected `ping()` mock, asserting the count queries are
+    never attempted and every count comes back `null` rather than `0` or an
+    uncaught rejection.
+  - Concurrent duplicate Offering-course attach / concurrent-or-already-
+    absent detach (Codex finding 2) — exercised by mocking Prisma's
+    `offeringCourse.create`/`.delete` to reject with the same
+    `PrismaClientKnownRequestError` (P2002/P2025) a real simultaneous
+    request would produce past the pre-check, asserting the resulting HTTP
+    semantics (409/404) match the sequential case, and that any other
+    error still propagates unchanged rather than being silently swallowed.
+
+Browser-refresh-mid-session and cross-learner/cross-session/cross-teacher
+access-attempt scenarios are covered by existing RBAC/IDOR test suites from
+Phases 2–4, unmodified and still passing.
+
+No live/production fault injection was performed this phase.
+
+================================================================================
+V. MOBILE-WIDTH QA
+================================================================================
+
+Status: NOT EXECUTED — DISCLOSED LIMITATION, not silently skipped.
+
+This execution environment has no browser and cannot render or screenshot a
+page at any viewport width. A literal "resize to a representative phone
+width and interact" pass, as the brief requests, was not possible here.
+
+What was done instead: a static review of the Tailwind responsive utility
+classes on every newly-added page (`admin/offerings`, `admin/notifications`,
+`admin/operations`) confirms each uses the same responsive grid/flex
+patterns (`sm:grid-cols-2`, stacking flex columns below the `sm` breakpoint)
+already used by every other admin page in this codebase, and each was
+included without incident in the successful `next build` (section AA). This
+is a code-pattern consistency check, not a rendered-viewport verification,
+and must not be reported as equivalent to one.
+
+================================================================================
+W. PILOT ACCEPTANCE-TEST RESULTS
+================================================================================
+
+Status: BLOCKED — OPERATOR ACTION REQUIRED. NOT EXECUTED.
+
+A real pilot (1 ADMIN, 1 TEACHER, 2+ LEARNERS, through registration, payment,
+live attendance including at least one learner below the 50% threshold, and
+recording access) requires:
+  1. The deployment gap in section E resolved.
+  2. Real Zoom credentials configured (section I).
+  3. Real Paystack sandbox-or-live credentials configured (section J).
+  4. Real SMTP credentials configured (section K).
+  5. Founder/operator-performed ADMIN actions to create the first genuine
+     academic term/grade/subject/course/offering/teacher-assignment/session
+     — deliberately NOT done by this session, since seeding "genuine
+     production school setup" is described as a founder/ADMIN action, and
+     no fake demo business data may be inserted into production.
+
+None of the above is available in this execution environment. This section
+is explicitly marked BLOCKED rather than PASS, per the brief's explicit
+instruction not to falsify provider events or claim pilot success without
+having actually run it.
+
+================================================================================
+X. OPERATOR ACTIONS STILL REQUIRED
+================================================================================
+
+In priority order:
+
+  1. Diagnose and fix the Railway deployment gap (section E). Confirm
+     whether commit `3159b58` (Phase 4) has ever successfully built and
+     deployed; if not, trigger a fresh deploy from `origin/main` at that
+     commit (or later, once Phase 5 is reviewed and merged).
+  2. Set the four `ZOOM_*` environment variables in Railway and configure
+     the Zoom webhook URL against the production endpoint.
+  3. Set `PAYSTACK_SECRET_KEY` and `PAYMENTS_CALLBACK_URL` in Railway;
+     verify one sandbox transaction end-to-end before any live-money test.
+  4. Set the five `SMTP_*` environment variables in Railway; verify at least
+     one real email is received (e.g. a registration email to a real test
+     inbox).
+  5. Once 1–4 are done, an ADMIN (the founder or a designated operator) uses
+     the `/admin/offerings`, `/admin/sessions`, `/admin/teachers`, etc. UI
+     already built to create the first genuine academic term, grade level,
+     subject, course, offering, teacher assignment, and scheduled session —
+     this session deliberately did not do this on production's behalf.
+  6. After 1–5, re-run the pilot acceptance test (section W) for real.
+  7. Follow `docs/production-school-runbook.txt`, which now records the stale
+     Railway deployment explicitly, when completing the operator work above.
+
+No provider credential value is included anywhere in this document or was
+requested from the founder in chat, per the explicit security rule.
+
+================================================================================
+Y. KNOWN LIMITATIONS
+================================================================================
+
+  1. Zoom Cloud Recording `share_url` playback provides no TUBI telemetry —
+     RECORDED attendance can never be legitimately awarded for a Zoom-hosted
+     recording page open/complete event. This is permanent unless the
+     founder explicitly approves rehosting recordings through TUBI's own
+     infrastructure (expensive; not implemented, not requested).
+  2. `Offering.deliveryMode` is intentionally NOT editable after creation in
+     the new admin UI — SubscriptionAccess and historical entitlement
+     calculations reference an offering's deliveryMode at the time it
+     mattered; allowing it to change post-hoc would silently reinterpret
+     history. An ADMIN who set the wrong delivery mode must create a new
+     Offering rather than edit the existing one.
+  3. Offering has no delete capability, by design — a real payment or
+     subscription may already reference it; only a narrow name/price edit
+     and course attach/detach are exposed.
+  4. `docs/production-school-runbook.txt` truthfully records that Railway is
+     still on a pre-Phase-4 build; its Phase 4/5 procedures remain unusable
+     in production until the operator redeploys the reviewed code.
+  5. This execution environment has no browser (section V) and no
+     Railway/Vercel/Zoom/Paystack/SMTP credentials or CLI access — every
+     "PASS" in this document that touches production is limited to what a
+     bare `curl`/`git`/test-runner probe from this environment can observe.
+
+================================================================================
+Z. TESTS AND EXACT TOTALS
+================================================================================
+
+Backend (`apps/api`, Jest):
+  Test Suites: 48 passed, 48 total
+  Tests:       455 passed, 455 total
+  (Command: `npx jest` from `apps/api`, run immediately before writing this
+  final version of this document — see section AA.)
+
+  Of these, tests newly added or modified across the full Phase 5 pass
+  (initial implementation + the Phase 5 readiness-seam correction + this
+  Codex-finding correction pass):
+    - offerings.service.spec.ts:              16 tests (was 3 pre-Phase-5;
+      12 from initial implementation, +4 this pass for the P2002/P2025
+      concurrency races — Codex finding 2)
+    - offerings/dto/create-offering.dto.spec.ts: 5 tests (NEW this pass —
+      whitespace-rejection/trim/accept coverage for both DTOs — Codex
+      finding 4)
+    - notifications.service.spec.ts:          10 tests (was 3 pre-Phase-5;
+      9 from initial implementation, +1 this pass for the field-
+      minimization assertion — Codex finding 3)
+    - notifications.controller.spec.ts:        2 tests (new file, initial
+      implementation)
+    - operations.service.spec.ts:              9 tests (8 from initial
+      implementation, +1 this pass for the database-down/counts-null
+      behavior — Codex finding 1)
+    - operations.controller.spec.ts:           1 test  (new file, initial
+      implementation)
+    - provider readiness corrections (email-provider/payments/zoom-provider
+      spec files): 5 focused tests added in the earlier readiness-seam pass
+
+Frontend (`apps/web`, Vitest):
+  Test Files: 18 passed (18)
+  Tests:      72 passed (72)
+  (Command: `npx vitest run` from `apps/web`, run immediately before writing
+  this final version of this document.)
+  Three focused page test files cover offerings create/course payload,
+  FAILED-only notification retry and endpoint selection (including the
+  field-minimized shape), and operations API provider/database rendering —
+  the last of these gained one test this pass asserting `null` counts
+  render as "Unavailable," never "0" (Codex finding 1).
+
+Phase 4 final baseline: backend 414 tests / 44 suites; frontend 68 tests /
+15 files. Phase 5 current totals (after the Codex-finding correction pass):
+backend 455 tests / 48 suites; frontend 72 tests / 18 files. Net tests added
+during all of Phase 5: 41 backend and 4 frontend (45 total). These are
+test-case deltas, not claims that the current suite totals are all
+"additional assertions."
+
+Every pre-existing assertion in both suites is unmodified; nothing was
+weakened to make a suite pass.
+
+================================================================================
+AA. COMPLETE VERIFICATION RESULTS
+================================================================================
+
+This section records the FINAL verification-matrix closure pass, run after
+the Codex-finding corrections and immediately before the targeted Codex
+re-review — every command below was executed fresh in this pass, not
+carried over from an earlier draft.
+
+Root (established root command):
+  pnpm run typecheck  -> PASS; 8/8 tasks successful (turbo run typecheck
+                          across @tubi/api, @tubi/config, @tubi/types,
+                          @tubi/ui, @tubi/utils, @tubi/web)
+
+Backend (apps/api):
+  npx tsc --noEmit                -> PASS, clean
+  npx eslint src --max-warnings=0 -> PASS, clean
+  npx nest build                  -> PASS (Nest production build)
+  npx jest                        -> PASS; 48 suites / 455 tests passed
+
+Frontend (apps/web):
+  npx tsc --noEmit                -> PASS; route types generated, tsc clean
+  npx eslint src --max-warnings=0 -> PASS, clean
+  npx next build                  -> PASS; all 24 routes (including the 3
+                                     new admin pages) compiled and either
+                                     statically prerendered or correctly
+                                     marked dynamic, consistent with existing
+                                     pages of the same shape.
+  npx vitest run                  -> PASS; 18 files / 72 tests passed
+
+Prisma (apps/api) — no `migrate dev`, `reset`, `seed`, or any destructive
+command was run:
+  npx prisma format         -> PASS; ran with no reported changes. The
+                                schema file's SHA-256 hash and `git status`
+                                were captured immediately before and after
+                                the command — both were identical, and
+                                `git diff` on the schema file was empty.
+                                EXPLICITLY: prisma format made NO change to
+                                the schema, substantive or cosmetic — the
+                                file was already in canonical format.
+  npx prisma validate       -> PASS; "The schema ... is valid"
+  npx prisma generate       -> PASS; Prisma Client 7.9.1 regenerated with no
+                                errors (a regeneration of derived client
+                                code, not a schema or database change)
+  npx prisma migrate status -> PASS; 4 migrations found, database up to date
+
+Repository Prettier (established repository command):
+  pnpm run format:check -> Initial run FAILED: one file,
+                            apps/web/src/app/admin/operations/page.tsx,
+                            had a code-style issue (a `CountBadge` prop
+                            destructuring that Prettier wraps across lines
+                            differently than it was written). This is a
+                            pure formatting difference — no logic, prop, or
+                            behavior change. Corrected with
+                            `npx prettier --write` on that one file only;
+                            re-running `pnpm run format:check` afterward
+                            passed clean ("All matched files use Prettier
+                            code style!"). Because this touched a source
+                            file, the frontend ESLint and Vitest suites were
+                            re-run after the formatting fix and both still
+                            passed (72/72 tests, zero lint warnings) —
+                            confirming the fix was formatting-only.
+
+Production (re-verified immediately before finalizing this document, to
+confirm no drift since the last check):
+  GET  /health                      -> 200
+  GET  /api/v1/learner/offerings    -> 404 (Phase-4-only route; still missing)
+  POST /api/v1/webhooks/zoom        -> 404 (Phase-4-only route; still missing)
+  Conclusion unchanged from section E: Railway is still serving a
+  pre-Phase-4 build.
+
+Every command above was executed fresh in this final verification-closure
+pass — the totals in this section and section Z reflect the final, current
+source, including the one formatting-only correction described above.
+
+================================================================================
+AB. EXACT GIT STATUS
+================================================================================
+
+Branch: main
+HEAD: 3159b58 (Phase 4 — unchanged; nothing has been committed this phase)
+
+This is the output of `git status --short` from a normal repository
+environment, captured immediately before finalizing this document — after
+all four Codex-finding corrections above were applied and verified, AND
+after this final verification-matrix closure pass (section AA), including
+the one Prettier formatting-only correction to
+`apps/web/src/app/admin/operations/page.tsx`. That file is already listed
+below only as part of the untracked `apps/web/src/app/admin/operations/`
+directory (it is a new file, never before committed) — the formatting fix
+did not change which paths appear in this listing, only the internal
+formatting of that one file's content:
+
+  $ git status --short
+   M apps/api/src/app.module.ts
+   M apps/api/src/notifications/email-provider.service.spec.ts
+   M apps/api/src/notifications/email-provider.service.ts
+   M apps/api/src/notifications/notifications.module.ts
+   M apps/api/src/notifications/notifications.service.spec.ts
+   M apps/api/src/notifications/notifications.service.ts
+   M apps/api/src/offerings/offerings.controller.ts
+   M apps/api/src/offerings/offerings.service.spec.ts
+   M apps/api/src/offerings/offerings.service.ts
+   M apps/api/src/payments/payments.service.spec.ts
+   M apps/api/src/payments/payments.service.ts
+   M apps/api/src/providers/zoom/zoom-provider.service.spec.ts
+   M apps/api/src/providers/zoom/zoom-provider.service.ts
+   M apps/web/src/components/shell/nav-config.test.ts
+   M apps/web/src/components/shell/nav-config.ts
+   M apps/web/src/lib/endpoints.ts
+   M apps/web/src/lib/types.ts
+  ?? apps/api/src/notifications/dto/
+  ?? apps/api/src/notifications/notifications.controller.spec.ts
+  ?? apps/api/src/notifications/notifications.controller.ts
+  ?? apps/api/src/offerings/dto/
+  ?? apps/api/src/operations/
+  ?? apps/web/src/app/admin/notifications/
+  ?? apps/web/src/app/admin/offerings/
+  ?? apps/web/src/app/admin/operations/
+  ?? docs/phase-5-production-launch-review.txt
+  ?? docs/production-school-runbook.txt
+
+No `.env` file, credential file, build artifact, or `node_modules` path
+appears in this listing. (An earlier draft of this section listed two
+`.claude/` paths as untracked; those do not appear in this environment's
+current `git status --short` output and have been removed from this
+section as stale — this listing is reconciled directly against the command
+above, not carried over from a prior draft.) Nothing has been staged,
+committed, tagged, or pushed this phase, per the explicit instruction. Both
+Phase 5 text documents are new and untracked, awaiting the same independent
+review gate as the code.
+
+================================================================================
+AC. CRITICAL SOURCE EXCERPTS FOR INDEPENDENT REVIEW
+================================================================================
+
+These are the CURRENT, post-correction implementations of every Phase-5
+security/authorization/provider-status/retry/reconciliation mechanism.
+
+--- apps/api/src/notifications/notifications.service.ts (retryFailed, and
+    the minimized shape/projection it and listAll now share — Codex
+    finding 3, corrected this pass) --------------------------------------
+  export interface NotificationOutboxItemWithRecipient {
+    id: string;
+    type: string;
+    recipientUserId: string;
+    status: NotificationStatus;
+    attempts: number;
+    createdAt: Date;
+    sentAt: Date | null;
+    lastError: string | null;
+    recipient: { id: string; email: string; fullName: string } | null;
+  }
+  // NOTE: no `claimToken`, `claimedAt`, or `payload` field exists on this
+  // interface at all — not merely unpopulated. The dispatcher-fencing
+  // columns and the raw notification payload never leave the database
+  // layer for this ADMIN-facing shape.
+
+  async retryFailed(id: string): Promise<NotificationOutboxItemWithRecipient> {
+    const item = await this.prisma.notificationOutboxItem.findUnique({ where: { id } });
+    if (!item) {
+      throw new NotFoundException(`Notification ${id} not found`);
+    }
+    if (item.status !== NotificationStatus.FAILED) {
+      throw new ConflictException(
+        `Notification ${id} is ${item.status}, not FAILED — only permanently-failed notifications can be retried`,
+      );
+    }
+
+    const { count } = await this.prisma.notificationOutboxItem.updateMany({
+      where: { id, status: NotificationStatus.FAILED },
+      data: {
+        status: NotificationStatus.PENDING,
+        claimToken: null,
+        claimedAt: null,
+        attempts: 0,
+        lastError: null,
+      },
+    });
+    if (count === 0) {
+      throw new ConflictException(
+        `Notification ${id} is no longer FAILED — it may already be retrying`,
+      );
+    }
+
+    const [refreshed] = await this.listAllByIds([id]);
+    if (!refreshed) {
+      throw new NotFoundException(`Notification ${id} not found after retry`);
+    }
+    return refreshed;
+  }
+
+  private async listAllByIds(ids: string[]): Promise<NotificationOutboxItemWithRecipient[]> {
+    const items = await this.prisma.notificationOutboxItem.findMany({
+      where: { id: { in: ids } },
+      select: {
+        id: true, type: true, recipientUserId: true, status: true,
+        attempts: true, createdAt: true, sentAt: true, lastError: true,
+        // claimToken, claimedAt, payload deliberately NOT selected.
+      },
+    });
+    /* ...joins recipient identity, same as listAll (see section Q)... */
+  }
+------------------------------------------------------------------------------
+Why this matters: the `updateMany` re-checks `status: FAILED` in its WHERE
+clause rather than trusting the earlier `findUnique` read — a
+time-of-check/time-of-use race where the dispatcher independently claims the
+item between the read and the write is caught (`count === 0`) rather than
+silently overwriting an in-flight dispatch attempt. Separately (Codex
+finding 3), `retryFailed`'s response now goes through the same minimized
+`select` as `listAll` — the mutation endpoint returns exactly what the
+listing endpoint returns, and neither ever includes the two internal
+fencing columns this method itself just wrote to.
+
+--- apps/api/src/notifications/notifications.controller.ts (guard stack) ----
+  @Controller('admin/notifications')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('ADMIN')
+  export class NotificationsController {
+    ...
+    @Post(':id/retry')
+    @HttpCode(HttpStatus.OK)
+    retry(@Param('id', ParseUUIDPipe) id: string): Promise<NotificationOutboxItemWithRecipient> {
+      return this.notificationsService.retryFailed(id);
+    }
+  }
+------------------------------------------------------------------------------
+
+--- provider-owned readiness seams ------------------------------------------
+  PaymentsService.isConfigured(): boolean {
+    return Boolean(
+      this.provider.isConfigured() &&
+        this.config.get('PAYMENTS_CALLBACK_URL', { infer: true }),
+    );
+  }
+
+  EmailProviderService.isConfigured(): boolean {
+    return Boolean(
+      this.config.get('SMTP_HOST', { infer: true }) &&
+        this.config.get('SMTP_PORT', { infer: true }) &&
+        this.config.get('SMTP_USER', { infer: true }) &&
+        this.config.get('SMTP_PASSWORD', { infer: true }) &&
+        this.config.get('SMTP_FROM_ADDRESS', { infer: true }),
+    );
+  }
+
+  ZoomProviderService.isOperationallyConfigured(): boolean {
+    return Boolean(
+      this.isConfigured() && this.config.get('ZOOM_WEBHOOK_SECRET_TOKEN', { infer: true }),
+    );
+  }
+
+--- apps/api/src/operations/operations.service.ts (getReport — database
+    probed FIRST, counts null when down — Codex finding 1, corrected this
+    pass) ------------------------------------------------------------------
+  export type OperationalCount = number | null;
+
+  async getReport(): Promise<LaunchOperationsReport> {
+    const database = await this.probeDatabase();
+
+    if (database === 'down') {
+      return {
+        database,
+        providers: this.getProviderConfiguration(),
+        stuckMeetingsCount: null,
+        permanentlyFailedNotificationsCount: null,
+        paymentsAwaitingResolutionCount: null,
+        upcomingSessionsCount: null,
+      };
+    }
+
+    const [
+      stuckMeetingsCount,
+      permanentlyFailedNotificationsCount,
+      paymentsAwaitingResolutionCount,
+      upcomingSessionsCount,
+    ] = await Promise.all([
+      this.prisma.session.count({ where: { meetingProvisioningStatus: MeetingProvisioningStatus.FAILED } }),
+      this.prisma.notificationOutboxItem.count({ where: { status: NotificationStatus.FAILED } }),
+      this.prisma.paymentOrder.count({ where: { status: PaymentStatus.PENDING } }),
+      this.prisma.session.count({ where: { status: SessionStatus.SCHEDULED, startTime: { gte: new Date() } } }),
+    ]);
+
+    return {
+      database,
+      providers: this.getProviderConfiguration(),
+      stuckMeetingsCount,
+      permanentlyFailedNotificationsCount,
+      paymentsAwaitingResolutionCount,
+      upcomingSessionsCount,
+    };
+  }
+------------------------------------------------------------------------------
+Why this matters: the database probe runs BEFORE any count query is even
+attempted. If it fails, the method returns immediately with every count
+`null` and issues zero count queries — it does not attempt them against an
+unreachable database (which could hang or itself throw) and it does not
+substitute a `0` that an ADMIN could mistake for "nothing is stuck." A `0`
+returned from this endpoint can always be trusted to mean exactly zero.
+
+--- apps/api/src/operations/operations.service.ts (fixed enum projection) ---
+  private getProviderConfiguration(): ProviderConfigurationStatus {
+    return {
+      zoom: this.zoomProvider.isOperationallyConfigured() ? 'CONFIGURED' : 'NOT_CONFIGURED',
+      payments: this.paymentsService.isConfigured() ? 'CONFIGURED' : 'NOT_CONFIGURED',
+      email: this.emailProvider.isConfigured() ? 'CONFIGURED' : 'NOT_CONFIGURED',
+    };
+  }
+
+  private async probeDatabase(): Promise<'ok' | 'down'> {
+    try {
+      await this.prisma.ping();
+      return 'ok';
+    } catch {
+      return 'down';
+    }
+  }
+------------------------------------------------------------------------------
+Why this matters: Operations no longer duplicates partial environment rules.
+Each owning integration answers readiness without a network call, and no
+branch can return a credential value - every path collapses to a fixed enum
+member. Partial Paystack/callback, SMTP, and Zoom/webhook configurations are
+covered by focused tests and remain NOT_CONFIGURED. The database probe mirrors
+`HealthService.probeDatabase()`'s pattern of swallowing the real driver
+error and returning only a fixed, non-sensitive result.
+
+--- apps/api/src/operations/operations.controller.ts (guard stack) ----------
+  @Controller('admin/operations')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('ADMIN')
+  export class OperationsController {
+    constructor(private readonly operationsService: OperationsService) {}
+
+    @Get()
+    getReport(): Promise<LaunchOperationsReport> {
+      return this.operationsService.getReport();
+    }
+  }
+------------------------------------------------------------------------------
+
+--- apps/api/src/offerings/offerings.service.ts (create — course-existence
+    validated before write; update — deliveryMode deliberately excluded) ---
+  async create(dto: CreateOfferingDto): Promise<OfferingWithCourses> {
+    if (dto.courseIds.length > 0) {
+      await this.assertCoursesExist(dto.courseIds);
+    }
+    const created = await this.prisma.offering.create({
+      data: {
+        name: dto.name,
+        deliveryMode: dto.deliveryMode,
+        monthlyPrice: dto.monthlyPrice,
+        courses: { create: dto.courseIds.map((courseId) => ({ courseId })) },
+      },
+      include: offeringInclude,
+    });
+    return created;
+  }
+
+  async update(id: string, dto: UpdateOfferingDto): Promise<Offering> {
+    await this.findOne(id);
+    return this.prisma.offering.update({
+      where: { id },
+      data: {
+        ...(dto.name !== undefined ? { name: dto.name } : {}),
+        ...(dto.monthlyPrice !== undefined ? { monthlyPrice: dto.monthlyPrice } : {}),
+      },
+    });
+  }
+------------------------------------------------------------------------------
+Why this matters: `UpdateOfferingDto` has no `deliveryMode` field at all
+(not merely unused) — see section Y limitation 2 for why that is
+intentional, not an oversight.
+
+--- apps/api/src/offerings/offerings.service.ts (addCourse/removeCourse —
+    Prisma constraint-race handling, Codex finding 2, corrected this pass) --
+  async addCourse(id: string, dto: AddOfferingCourseDto): Promise<OfferingWithCourses> {
+    await this.findOne(id);
+    await this.assertCoursesExist([dto.courseId]);
+
+    const existing = await this.prisma.offeringCourse.findUnique({
+      where: { offeringId_courseId: { offeringId: id, courseId: dto.courseId } },
+    });
+    if (existing) {
+      throw new ConflictException(`Course ${dto.courseId} is already part of offering ${id}`);
+    }
+
+    try {
+      await this.prisma.offeringCourse.create({ data: { offeringId: id, courseId: dto.courseId } });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new ConflictException(`Course ${dto.courseId} is already part of offering ${id}`);
+      }
+      throw error;
+    }
+    return this.findOneWithCourses(id);
+  }
+
+  async removeCourse(id: string, courseId: string): Promise<OfferingWithCourses> {
+    await this.findOne(id);
+    const existing = await this.prisma.offeringCourse.findUnique({
+      where: { offeringId_courseId: { offeringId: id, courseId } },
+    });
+    if (!existing) {
+      throw new NotFoundException(`Course ${courseId} is not part of offering ${id}`);
+    }
+
+    try {
+      await this.prisma.offeringCourse.delete({
+        where: { offeringId_courseId: { offeringId: id, courseId } },
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') {
+        throw new NotFoundException(`Course ${courseId} is not part of offering ${id}`);
+      }
+      throw error;
+    }
+    return this.findOneWithCourses(id);
+  }
+------------------------------------------------------------------------------
+Why this matters: the `findUnique` pre-check remains a fast path for the
+uncontended case, but is explicitly NOT the correctness guarantee — two
+simultaneous requests can both pass it. The composite unique constraint on
+`(offeringId, courseId)` is what Postgres actually enforces; the `catch`
+turns the resulting `P2002` (duplicate attach) or `P2025` (already-removed
+detach) into the same 409/404 a sequential duplicate/double-removal would
+get, rather than letting a raw database constraint violation escape as an
+unhandled 500. Any other error is re-thrown unchanged — this is a narrow
+catch on a specific Prisma error code, not a generic error swallower.
+
+--- apps/api/src/offerings/dto/create-offering.dto.ts (whitespace-only name
+    rejection — Codex finding 4, corrected this pass) ---------------------
+  export class CreateOfferingDto {
+    @Transform(({ value }: TransformFnParams): unknown =>
+      typeof value === 'string' ? value.trim() : value,
+    )
+    @IsString()
+    @MinLength(1, { message: 'name must not be empty or whitespace-only' })
+    @MaxLength(200)
+    name!: string;
+    ...
+  }
+  // UpdateOfferingDto applies the identical @Transform + @MinLength(1)
+  // pair to its optional `name` field.
+------------------------------------------------------------------------------
+Why this matters: `@Transform` runs before `@MinLength` in the global
+`ValidationPipe`'s `transform: true` pipeline (apps/api/src/main.ts), so a
+value like `"   "` is trimmed to `""` and THEN validated — `@MinLength(1)`
+correctly rejects it with a 400. Without the trim, `"   ".length` is 3 and
+`@MinLength(1)` would have passed a name that is, for every practical
+purpose, empty. A name with genuine leading/trailing whitespace (e.g.
+`"  Grade 8 Live Bundle  "`) is silently trimmed rather than rejected.
+
+--- apps/api/src/offerings/offerings.controller.ts (full guard stack, all
+    five routes) ---------------------------------------------------------
+  @Controller('admin/offerings')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('ADMIN')
+  export class OfferingsController {
+    @Get()      findAll(): Promise<Offering[]>
+    @Get(':id') findOne(@Param('id', ParseUUIDPipe) id: string): Promise<OfferingWithCourses>
+    @Post()     create(@Body() dto: CreateOfferingDto): Promise<OfferingWithCourses>
+    @Patch(':id') update(...): Promise<Offering>
+    @Post(':id/courses') addCourse(...): Promise<OfferingWithCourses>
+    @Delete(':id/courses/:courseId') removeCourse(...): Promise<OfferingWithCourses>
+  }
+------------------------------------------------------------------------------
+
+================================================================================
+AD. PRODUCTION ACCEPTANCE-GATE RESULT
+================================================================================
+
+RESULT: PARTIAL — cannot be truthfully reported as PASS or fully BLOCKED.
+
+Precise breakdown of what CAN and CANNOT be truthfully stated:
+
+  CAN be stated as PASS:
+    - The Phase 4 codebase is genuinely frozen, committed, tagged, and
+      present on `origin/main` (section A).
+    - The Phase 5 additions (Offering admin, notification operations,
+      launch operations dashboard) are implemented, fully covered by
+      automated tests. The Phase 4 baseline was 414 backend + 68 frontend
+      tests; Phase 5 now totals 455 backend + 72 frontend, a net addition of
+      41 backend and 4 frontend tests. Typecheck, ESLint, Prisma, and both
+      production builds pass (sections B, Q, S, Z, AA).
+    - All four findings from the Codex first-review inspection are fixed
+      and verified by new automated tests: operations database-down
+      handling now reports counts as `null`/"Unavailable" rather than a
+      misleading `0`; Offering course attach/detach now correctly handles
+      the Prisma P2002/P2025 concurrency races as 409/404 instead of an
+      unhandled 500; ADMIN notification listing/retry no longer exposes
+      internal `claimToken`/`claimedAt`/`payload` fields; and whitespace-
+      only Offering names are rejected rather than accepted (section B
+      item 6, sections Q, S, T, U, AC).
+    - No frozen architectural rule was violated, no schema was changed
+      unnecessarily, no fake production data was inserted, no destructive
+      database operation was run (sections D, Y).
+    - An ADMIN can now, through the API and UI alone with no direct
+      database access, fully configure a school's grade levels, subjects,
+      academic terms, courses, teachers, sessions, and commercial offerings
+      (section L).
+
+  CANNOT be stated as PASS, and are explicitly BLOCKED — OPERATOR ACTION
+  REQUIRED:
+    - Production is not currently running the Phase 4 (or later) backend
+      build at all (section E) — this is the actual root blocker beneath
+      almost every other BLOCKED item below.
+    - Zoom, Paystack, and SMTP are not configured in production and no
+      credentials are available to this environment (sections I, J, K).
+    - No real live-class attendance, recording, or payment flow has been
+      exercised against a real provider or real production traffic
+      (sections O, P, W).
+    - The pilot acceptance test has not been run (section W).
+    - Real browser/mobile QA and the production pilot remain unavailable.
+
+This gate cannot be marked PASS while production is not even serving the
+frozen Phase 4 code, and it is not marked fully BLOCKED because substantial,
+genuinely-verified Phase 5 engineering work is complete and ready for
+review. PARTIAL is the only truthful classification. The single highest-
+priority action to move this toward PASS is resolving the Railway
+deployment gap in section E — every other BLOCKED item downstream of it
+cannot even begin until that is fixed.
+
+================================================================================
+END OF DOCUMENT — awaiting external review. No commit, tag, or push has been
+made for any Phase 5 change. Phase 6 has not begun.
+================================================================================

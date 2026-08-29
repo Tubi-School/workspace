@@ -19,8 +19,23 @@ describe('EmailProviderService', () => {
     await expect(service.send('a@b.com', 'subject', 'text')).rejects.toThrow(/not configured/i);
   });
 
-  it('is configured once SMTP_HOST is present', () => {
-    const service = new EmailProviderService(buildConfig({ SMTP_HOST: 'smtp.example.com' }));
+  it('is not configured when only some SMTP settings are present', () => {
+    const service = new EmailProviderService(
+      buildConfig({ SMTP_HOST: 'smtp.example.com', SMTP_USER: 'mailer' }),
+    );
+    expect(service.isConfigured()).toBe(false);
+  });
+
+  it('is configured only when all required SMTP settings are present', () => {
+    const service = new EmailProviderService(
+      buildConfig({
+        SMTP_HOST: 'smtp.example.com',
+        SMTP_PORT: 587,
+        SMTP_USER: 'mailer',
+        SMTP_PASSWORD: 'password',
+        SMTP_FROM_ADDRESS: 'no-reply@example.com',
+      }),
+    );
     expect(service.isConfigured()).toBe(true);
   });
 });

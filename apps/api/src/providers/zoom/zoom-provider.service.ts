@@ -43,6 +43,12 @@ export class ZoomProviderService {
     );
   }
 
+  isOperationallyConfigured(): boolean {
+    return Boolean(
+      this.isConfigured() && this.config.get('ZOOM_WEBHOOK_SECRET_TOKEN', { infer: true }),
+    );
+  }
+
   private isLocalDevFakeAllowed(): boolean {
     return this.config.get('NODE_ENV', { infer: true }) !== 'production' && !this.isConfigured();
   }
