@@ -6,7 +6,7 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import * as bcrypt from 'bcryptjs';
 import { isEmail } from 'class-validator';
 
-import { PrismaClient, RoleName } from '../generated/prisma/client.js';
+import { Prisma, PrismaClient, RoleName } from '../generated/prisma/client.js';
 
 /**
  * One-time operator CLI to create the first production ADMIN account.
@@ -180,6 +180,33 @@ async function resolvePassword(): Promise<string> {
   return first;
 }
 
+/**
+ * Acquires the transaction-scoped advisory lock that serializes concurrent
+ * bootstrap invocations (see the "Concurrency" note above). Extracted into
+ * its own function so a test can assert the exact call shape without a
+ * real database connection.
+ *
+ * Uses `$executeRaw`, not `$queryRaw`: `pg_advisory_xact_lock` returns
+ * PostgreSQL `void`, and `$queryRaw` always tries to deserialize a result
+ * set into typed columns — `void` has no such mapping, so it fails every
+ * time with "Failed to deserialize column of type 'void'" (this was the
+ * exact failure seen when this script was first run against production;
+ * reproduced against a real database before this fix, see the external-
+ * review artifact for the exact error text). `$executeRaw` executes the
+ * identical statement and reports only the affected-row count, never
+ * attempting to deserialize a column — the lock is acquired identically
+ * either way (this is a client-side deserialization concern, not a
+ * difference in what PostgreSQL does), and this fix changes nothing about
+ * the transaction-scoped serialization semantics: the lock is still taken
+ * inside the same `$transaction`, before either read, and is still
+ * released automatically when that transaction commits or rolls back.
+ */
+export async function acquireBootstrapAdminLock(
+  tx: Pick<Prisma.TransactionClient, '$executeRaw'>,
+): Promise<void> {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${BOOTSTRAP_ADMIN_LOCK_KEY})::bigint)`;
+}
+
 async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
   if (!parsed) {
@@ -233,8 +260,9 @@ async function main(): Promise<void> {
       // blocks here until the first transaction commits or rolls back,
       // then performs its own check against the now-current state — it
       // can never observe "no ADMIN exists" while another transaction is
-      // also mid-flight toward creating one.
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${BOOTSTRAP_ADMIN_LOCK_KEY})::bigint)`;
+      // also mid-flight toward creating one. See `acquireBootstrapAdminLock`
+      // above for why this uses `$executeRaw`, not `$queryRaw`.
+      await acquireBootstrapAdminLock(tx);
 
       const existingAdmin = await tx.user.findFirst({
         where: { role: RoleName.ADMIN },

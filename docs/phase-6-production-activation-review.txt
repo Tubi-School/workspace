@@ -7,6 +7,70 @@ verification as this execution environment can genuinely perform (API-level
 only — no browser is available here). Not a redesign; no new architecture.
 
 ================================================================================
+0. SURGICAL HOTFIX — PRODUCTION BOOTSTRAP FAILURE (void-deserialization)
+================================================================================
+
+The operator's first real production bootstrap attempt failed before
+creating any ADMIN row, with:
+
+    Invalid `prisma.$queryRaw()` invocation
+    Raw query failed:
+    Failed to deserialize column of type 'void'
+
+Exact root cause: `acquireBootstrapAdminLock` (the function taking the
+transaction-scoped advisory lock — see section 1/8) used
+`tx.$queryRaw`SELECT pg_advisory_xact_lock(...)`;`. `pg_advisory_xact_lock`
+returns PostgreSQL's `void` type. `$queryRaw` always attempts to
+deserialize every returned column into a typed JS value; `void` has no
+such mapping, so the call fails on every invocation — reproduced against a
+real PostgreSQL database (this session's own Neon development instance,
+not production) with the identical error text quoted above, confirming
+this is a deterministic client-side deserialization defect, not a
+transient or environment-specific failure.
+
+Fix applied (smallest correct form, no architecture change): replaced
+`tx.$queryRaw` with `tx.$executeRaw` for this one statement. `$executeRaw`
+executes the identical SQL and reports only the affected-row count; it
+never attempts to deserialize a result column, so the `void` return value
+is simply never inspected. PostgreSQL performs the exact same lock
+acquisition either way — this is purely a difference in how the Node
+driver reads back an (irrelevant) result, not a difference in server-side
+behavior. Re-verified by running the fixed function against the same real
+database: the lock now acquires successfully with no error.
+
+The lock acquisition was extracted into its own exported function,
+`acquireBootstrapAdminLock(tx)`, called as the first statement inside the
+`$transaction` callback in `main()` — unchanged position, unchanged
+transaction-scoped semantics (still released automatically on commit or
+rollback), unchanged fixed lock key. This was done only so a test could
+assert the exact call shape (`$executeRaw`, not `$queryRaw`) without a
+real database connection — see section 9.
+
+Control-flow confirmation that the failed attempt could not have reached
+the ADMIN insert: `acquireBootstrapAdminLock(tx)` is the FIRST statement
+inside the `$transaction` callback — it runs before the existing-ADMIN
+`findFirst`, before the email-uniqueness `findUnique`, and before
+`user.create`. Because it threw synchronously, none of those three later
+statements executed at all; Prisma's interactive-transaction wrapper
+caught the throw, issued a rollback, and re-threw the same error out of
+`prisma.$transaction(...)` — so `const result = await prisma.$transaction(...)`
+itself never returned, and the `switch (result.outcome)` block that would
+call `user.create` (in the `'created'` branch) was never reached. Zero
+durable writes occurred against production during the failed attempt.
+
+This hotfix does not change: standalone-CLI-only architecture, absence of
+any HTTP bootstrap endpoint, transaction-scoped (`pg_advisory_xact_lock`)
+locking, concurrency-safety of first-admin creation, LEARNER-only public
+registration, or the existing-ADMIN/duplicate-email safeguards. No secret
+value was printed at any point during reproduction or verification — only
+error message text and success/failure booleans.
+
+The ADMIN bootstrap was NOT re-run against production from this session —
+this environment still has no Railway/production database access. The fix
+is implemented, typechecked, linted, built, unit-tested, and additionally
+verified against a real (non-production) PostgreSQL database.
+
+================================================================================
 1. ADMIN BOOTSTRAP IMPLEMENTATION
 ================================================================================
 
@@ -206,21 +270,29 @@ there is a statement about what was tested, not a clearance of what wasn't.
 5. TESTS AND VERIFICATION TOTALS
 ================================================================================
 
-Backend (Jest):        49 suites / 463 tests passed (was 48/455 before this
+Backend (Jest):        49 suites / 465 tests passed (was 48/455 before this
                         phase). History this phase: 48/455 → 49/461 after
-                        the concurrency fix (+1 suite, +6 tests —
-                        bootstrap-admin.spec.ts created; the concurrency
-                        fix itself changed control flow inside `main()`,
-                        not `parseArgs`, so it added no new tests) →
-                        49/463 after the Codex HIGH email-normalization fix
-                        (+2 tests, proving `Admin@School.Example` becomes
-                        `admin@school.example`).
-Backend typecheck:      PASS (tsc --noEmit) — re-run after the normalization fix
-Backend ESLint:         PASS (--max-warnings=0) — re-run after the normalization fix
-Backend build:          PASS (nest build) — re-run after the normalization fix
-Frontend typecheck:     PASS (tsc --noEmit, route types generated)
-Frontend ESLint:        PASS (--max-warnings=0)
-Frontend build:         PASS (next build — Turbopack; all 24 routes compiled)
+                        the concurrency fix → 49/463 after the Codex HIGH
+                        email-normalization fix → 49/465 after this
+                        surgical hotfix (+2 tests: `acquireBootstrapAdminLock`
+                        uses `$executeRaw` not `$queryRaw`; the lock key is
+                        identical and non-empty across calls). One worker
+                        force-exit warning was logged by Jest
+                        ("A worker process has failed to exit gracefully")
+                        — a teardown-timing warning, not a test failure;
+                        all 465 tests still reported passed, exit code 0.
+Backend typecheck:      PASS (tsc --noEmit) — re-run after this hotfix
+Backend ESLint:         PASS (--max-warnings=0) — re-run after this hotfix
+Backend build:          PASS (nest build) — re-run after this hotfix
+Real-database verification (this session's own Neon development instance,
+NOT production): reproduced the exact production error
+("Failed to deserialize column of type 'void'") using `$queryRaw` against
+a real PostgreSQL connection, then confirmed `acquireBootstrapAdminLock`
+(now using `$executeRaw`) acquires the same lock successfully with no
+error against that same real database.
+Frontend typecheck:     PASS (tsc --noEmit, route types generated) — unchanged, not re-run this pass (no frontend file touched)
+Frontend ESLint:        PASS (--max-warnings=0) — unchanged, not re-run this pass
+Frontend build:         PASS (next build — Turbopack; all 24 routes compiled) — unchanged, not re-run this pass
 Frontend tests (Vitest): BLOCKED IN THIS ENVIRONMENT — not a code defect.
                         Vitest 4's rolldown-based runner fails to load its
                         native binding on this machine
@@ -236,21 +308,24 @@ Frontend tests (Vitest): BLOCKED IN THIS ENVIRONMENT — not a code defect.
                         binary is affected. Last known-good run in this
                         same session, before this environment issue
                         appeared: 18 files / 72 tests passing.
-Prisma format:          PASS, no schema change
-Prisma validate:        PASS
-Prisma generate:        PASS
-Prisma migrate status:  PASS — 4 migrations, database up to date
-Root typecheck:         PASS — 8/8 Turbo tasks
-Repository format check: PASS (one Prettier-only fix applied to the two new
-                        script files; re-verified clean)
+Prisma validate:        PASS, re-run this pass — no schema change
+Prisma format/generate/migrate status: unchanged from the prior pass
+                        (PASS, 4 migrations, database up to date) — not
+                        re-run this pass since no schema/migration file was
+                        touched by this hotfix.
+Root typecheck:         PASS — 8/8 Turbo tasks (unchanged, not re-run this pass)
+Repository format check: PASS — re-run this pass, clean
 
 ================================================================================
 6. UNRESOLVED LAUNCH BLOCKERS
 ================================================================================
 
-  1. No ADMIN account exists yet in production, or if one does, this
-     session has no way to know — bootstrap script is ready but has not
-     been run. OPERATOR ACTION REQUIRED: run the command in section 1.
+  1. No ADMIN account exists in production. The operator's first real
+     attempt failed with the void-deserialization error (section 0) before
+     any row was written (confirmed by control-flow analysis — zero
+     durable writes). The bug is now fixed and verified against a real
+     database, but has NOT been re-run against production from this
+     session. OPERATOR ACTION REQUIRED: re-run the command in section 1.
   2. TEACHER activation is blocked on (1).
   3. ADMIN school setup (grade levels, terms, subjects, courses, offerings,
      sessions) is blocked on (1) and on browser access this environment
@@ -267,14 +342,17 @@ Repository format check: PASS (one Prettier-only fix applied to the two new
 ================================================================================
 
   $ git status --short
-   M apps/api/package.json
-  ?? apps/api/src/scripts/
-  ?? docs/phase-6-production-activation-review.txt
+   M apps/api/src/scripts/bootstrap-admin.spec.ts
+   M apps/api/src/scripts/bootstrap-admin.ts
+   M docs/phase-6-production-activation-review.txt
 
-Nothing committed, pushed, tagged, or deployed. This revision addresses
-Codex's HIGH (email normalization) and LOW (advisory-lock terminology)
-findings from the prior round. Awaiting ChatGPT confirmation that the HIGH
-finding is closed before sending back to Codex for final re-review.
+Context: Phase 6 (commit 14601b0, tag v0.6.0-phase6-production-activation)
+was already reviewed, approved, committed, and pushed to `origin/main`
+before the operator's first real bootstrap attempt against production
+surfaced the void-deserialization defect described in section 0. The three
+files above are this surgical hotfix, layered on top of that already-frozen
+commit — nothing has been committed, pushed, tagged, or deployed for this
+hotfix. Awaiting ChatGPT review of this correction.
 
 ================================================================================
 8. SOURCE EXCERPTS FOR INDEPENDENT REVIEW (apps/api/src/scripts/bootstrap-admin.ts)
@@ -312,14 +390,41 @@ export function parseArgs(argv: string[]): ParsedArgs | null {
   return { email: email.trim().toLowerCase(), fullName: fullName.trim(), allowAdditional };
 }
 
---- Concurrency serialization + existing-ADMIN check + email-uniqueness
-    check + password hashing + ADMIN creation + cleanup/error handling ---
+--- Advisory-lock acquisition (surgical hotfix — $executeRaw, not
+    $queryRaw, to avoid the void-deserialization defect; see section 0) ---
 
 const BCRYPT_SALT_ROUNDS = 12; // Keep in sync with apps/api/src/auth/auth.service.ts
 const MIN_ADMIN_PASSWORD_LENGTH = 12;
 
 /** Fixed advisory-lock key serializing concurrent bootstrap invocations. */
 const BOOTSTRAP_ADMIN_LOCK_KEY = 'tubi:bootstrap-admin';
+
+/**
+ * Acquires the transaction-scoped advisory lock that serializes concurrent
+ * bootstrap invocations. Extracted into its own function so a test can
+ * assert the exact call shape without a real database connection.
+ *
+ * Uses `$executeRaw`, not `$queryRaw`: `pg_advisory_xact_lock` returns
+ * PostgreSQL `void`, and `$queryRaw` always tries to deserialize a result
+ * set into typed columns — `void` has no such mapping, so it fails every
+ * time with "Failed to deserialize column of type 'void'" (this was the
+ * exact failure seen when this script was first run against production;
+ * reproduced against a real database before this fix — see section 0).
+ * `$executeRaw` executes the identical statement and reports only the
+ * affected-row count, never attempting to deserialize a column — the lock
+ * is acquired identically either way, and this fix changes nothing about
+ * the transaction-scoped serialization semantics: the lock is still taken
+ * inside the same `$transaction`, before either read, and is still
+ * released automatically when that transaction commits or rolls back.
+ */
+export async function acquireBootstrapAdminLock(
+  tx: Pick<Prisma.TransactionClient, '$executeRaw'>,
+): Promise<void> {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${BOOTSTRAP_ADMIN_LOCK_KEY})::bigint)`;
+}
+
+--- Concurrency serialization + existing-ADMIN check + email-uniqueness
+    check + password hashing + ADMIN creation + cleanup/error handling ---
 
 async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
@@ -374,8 +479,9 @@ async function main(): Promise<void> {
       // blocks here until the first transaction commits or rolls back,
       // then performs its own check against the now-current state — it
       // can never observe "no ADMIN exists" while another transaction is
-      // also mid-flight toward creating one.
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${BOOTSTRAP_ADMIN_LOCK_KEY})::bigint)`;
+      // also mid-flight toward creating one. See `acquireBootstrapAdminLock`
+      // above for why this uses `$executeRaw`, not `$queryRaw`.
+      await acquireBootstrapAdminLock(tx);
 
       const existingAdmin = await tx.user.findFirst({
         where: { role: RoleName.ADMIN },
@@ -455,7 +561,46 @@ if (require.main === module) {
 9. TESTS (apps/api/src/scripts/bootstrap-admin.spec.ts)
 ================================================================================
 
-import { parseArgs } from './bootstrap-admin.js';
+import { acquireBootstrapAdminLock, parseArgs } from './bootstrap-admin.js';
+
+describe('acquireBootstrapAdminLock', () => {
+  it('uses $executeRaw, never $queryRaw, for the void-returning advisory-lock call', async () => {
+    // pg_advisory_xact_lock returns PostgreSQL `void`, which `$queryRaw`
+    // cannot deserialize ("Failed to deserialize column of type 'void'" —
+    // the exact production failure this test guards against). A fake
+    // whose `$queryRaw` throws proves the fix never calls it for this
+    // statement; `$executeRaw` returning a plain row-count (no
+    // deserialization attempt) proves the call still succeeds.
+    const queryRaw = jest.fn(() => {
+      throw new Error('$queryRaw must not be called for a void-returning statement');
+    });
+    const executeRaw = jest.fn().mockResolvedValue(1);
+    const tx = { $queryRaw: queryRaw, $executeRaw: executeRaw };
+
+    await expect(acquireBootstrapAdminLock(tx)).resolves.toBeUndefined();
+
+    expect(executeRaw).toHaveBeenCalledTimes(1);
+    expect(queryRaw).not.toHaveBeenCalled();
+  });
+
+  it('locks on the same fixed key every call (transaction-scoped serialization is keyed, not per-invocation-random)', async () => {
+    const executeRaw = jest.fn().mockResolvedValue(1);
+    const tx = { $queryRaw: jest.fn(), $executeRaw: executeRaw };
+
+    await acquireBootstrapAdminLock(tx);
+    await acquireBootstrapAdminLock(tx);
+
+    // Prisma's tagged-template raw-query helpers pass the interpolated
+    // values as a strings array followed by the values themselves — the
+    // lock key value must be identical (and non-empty) across calls, or
+    // two invocations could take different locks and never actually
+    // serialize against each other.
+    const [, keyFirstCall] = executeRaw.mock.calls[0] as [TemplateStringsArray, string];
+    const [, keySecondCall] = executeRaw.mock.calls[1] as [TemplateStringsArray, string];
+    expect(keyFirstCall).toBe(keySecondCall);
+    expect(keyFirstCall.length).toBeGreaterThan(0);
+  });
+});
 
 describe('bootstrap-admin parseArgs', () => {
   it('parses --email and --name', () => {
@@ -518,17 +663,22 @@ describe('bootstrap-admin parseArgs', () => {
   });
 });
 
-These 8 tests (6 original + 2 added for the Codex HIGH email-normalization
-finding) cover argument parsing only — the concurrency/transaction logic
-in section 8 is reviewed by source inspection rather than an automated
-concurrency test, since exercising a real Postgres advisory-lock race
-would require two genuinely concurrent connections against a live
-database, which is out of scope for a one-time operator CLI's unit-test
-coverage and was not requested. ChatGPT/Codex review of the transaction
-shape in section 8 is the verification mechanism for that fix; the two new
-tests here are the verification mechanism for the email-normalization fix
-— they directly assert the exact case from the Codex finding
-(`Admin@School.Example` → `admin@school.example`).
+This file now has 10 tests total: 2 new tests for `acquireBootstrapAdminLock`
+(this hotfix — proving `$executeRaw` is used and never `$queryRaw` for the
+void-returning statement, and that the lock key is stable across calls) +
+8 for `parseArgs` (6 original + 2 added for the earlier Codex HIGH
+email-normalization finding, directly asserting
+`Admin@School.Example` → `admin@school.example`).
+
+The two new `acquireBootstrapAdminLock` tests use a fake transaction client
+rather than a real database connection, so they run in the standard Jest
+suite without requiring database access — but the fix was ALSO verified
+against a real (non-production) PostgreSQL database in this session,
+confirming the fake-client assertions match genuine driver/server behavior
+(see section 0). Exercising the actual advisory-lock concurrency/blocking
+behavior end-to-end would require two genuinely concurrent connections
+against a live database, which remains out of scope for this one-time
+operator CLI's unit-test coverage, as before.
 
 ================================================================================
 END OF DOCUMENT
