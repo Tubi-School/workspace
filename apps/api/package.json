@@ -13,7 +13,8 @@
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
-    "db:studio": "prisma studio"
+    "db:studio": "prisma studio",
+    "bootstrap:admin": "node dist/scripts/bootstrap-admin.js"
   },
   "jest": {
     "rootDir": "src",

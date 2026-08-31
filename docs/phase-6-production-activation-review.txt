@@ -1,0 +1,535 @@
+================================================================================
+TUBI WORKSPACE — PHASE 6 PRODUCTION ACTIVATION REVIEW
+================================================================================
+
+Scope: first ADMIN bootstrap mechanism + as much real production
+verification as this execution environment can genuinely perform (API-level
+only — no browser is available here). Not a redesign; no new architecture.
+
+================================================================================
+1. ADMIN BOOTSTRAP IMPLEMENTATION
+================================================================================
+
+New: apps/api/src/scripts/bootstrap-admin.ts (+ bootstrap-admin.spec.ts).
+
+What it does: a standalone CLI, compiled alongside the app (`dist/scripts/
+bootstrap-admin.js`), that creates exactly one ADMIN `User` row via Prisma,
+using the same bcrypt cost factor (12 rounds) as `AuthService`. It is not
+wired into any HTTP route — there is still no network-reachable path to an
+ADMIN role. Public `POST /auth/register` remains hardcoded to `LEARNER`
+(confirmed unmodified in `AuthService.register`) and, verified live against
+production, an extra `"role"` field on that endpoint is rejected outright
+(`"property role should not exist"`, 400) by the existing whitelist
+validation — no mass-assignment path exists.
+
+Safety properties:
+  - Refuses to create a second ADMIN if one already exists, printing only
+    the existing email (never a hash), unless `--allow-additional` is
+    passed explicitly.
+  - Refuses if the requested email is already in use by any user.
+  - Password is never a CLI argument (would leak into shell history/`ps`).
+    It is read via an unechoed terminal prompt by default, or from an
+    `ADMIN_BOOTSTRAP_PASSWORD` environment variable for non-interactive use
+    — never written to a file, never logged, never printed back.
+  - Enforces a 12-character minimum for this account specifically.
+  - Reads `DATABASE_URL` (the pooled runtime connection) directly — no new
+    connection-string variable introduced, no change to the Hotfix 1/2
+    migration split.
+  - Serializes concurrent invocations against each other (see "CONCURRENCY
+    FINDING AND FIX" immediately below) — two simultaneous bootstrap
+    processes cannot both create an ADMIN.
+  - Normalizes the email to `trim().toLowerCase()` — exactly matching
+    `AuthService.normalizeEmail()`, the same normalization the login path
+    applies — before validation, the duplicate-email lookup, and creation
+    (see "EMAIL NORMALIZATION FINDING AND FIX" below).
+
+--------------------------------------------------------------------------------
+EMAIL NORMALIZATION FINDING AND FIX (Codex final-review finding, HIGH)
+--------------------------------------------------------------------------------
+
+Finding: the script trimmed but did not lowercase the email. `AuthService`
+normalizes every email to `trim().toLowerCase()` before every lookup or
+write (both `register` and `login`). Without the same normalization here,
+running this script with `--email Admin@School.Example` would create a
+`User` row with that exact mixed-case email, while the normal login path
+looks up `admin@school.example` — the two would never match, and the
+created ADMIN account would be unable to log in at all.
+
+Fix applied: `parseArgs` now returns `email.trim().toLowerCase()` instead
+of `email.trim()` — normalization happens at the single point every
+downstream use (validation, the duplicate-email lookup inside the locked
+transaction, and the `user.create` call) reads from, so all three are
+correctly normalized by construction rather than needing three separate
+fixes. This exactly mirrors `AuthService`'s `normalizeEmail()` behavior.
+See section 8 for the exact source and section 9 for the two new tests
+proving `Admin@School.Example` becomes `admin@school.example`.
+
+--------------------------------------------------------------------------------
+CONCURRENCY FINDING AND FIX (ChatGPT first-review request)
+--------------------------------------------------------------------------------
+
+Question asked: could two simultaneous bootstrap processes both observe
+"no ADMIN exists" and then each create one?
+
+Finding: YES, in the version reviewed. The original implementation ran the
+existing-ADMIN check (`prisma.user.findFirst({ where: { role: 'ADMIN' } })`)
+and the eventual `prisma.user.create(...)` as two independent, unserialized
+round trips. Two processes started close together could both execute the
+check before either had inserted anything, both see zero ADMIN rows, and
+both proceed to create one (with different `--email` values, since the
+`User.email` unique constraint would only stop a second process using the
+SAME email, not a second ADMIN under a different email). This is a
+classic time-of-check/time-of-use (TOCTOU) race. It was not previously
+prevented by any schema constraint — `role` has no uniqueness constraint,
+by design, since more than one ADMIN is a legitimate end state.
+
+Fix applied (smallest possible, no schema change): the existing-ADMIN
+check, the email-uniqueness check, and the insert are now performed inside
+a single Prisma `$transaction`, which first takes a transaction-scoped
+PostgreSQL advisory lock (`pg_advisory_xact_lock`, keyed to the fixed
+string `"tubi:bootstrap-admin"`) before either read. This is the same
+primitive already used elsewhere in this codebase for check-then-write
+races (`apps/api/src/common/pg-advisory-lock.util.ts`, used by
+`SubscriptionAccess` grant and live-attendance interval ingestion). The
+lock is automatically released when the transaction commits or rolls back
+— there is no manual unlock/cleanup path, and no schema change is required
+(it is a Postgres session primitive, not a table).
+
+Why this closes the race: `pg_advisory_xact_lock` blocks the *second*
+concurrent transaction at the `SELECT pg_advisory_xact_lock(...)` line
+until the *first* transaction commits or rolls back. The second
+transaction's existing-ADMIN check therefore only ever runs after the
+first transaction's outcome (whether it created an ADMIN or refused) is
+already durable — it is structurally impossible for the second process to
+observe "no ADMIN exists" while the first is still mid-flight toward
+creating one. Password acquisition (the interactive prompt) and hashing
+remain outside the transaction/lock, since they are human I/O with nothing
+to do with database consistency and no reason to hold a lock open while
+waiting on a person to type.
+
+See section 8 below for the exact, current source.
+
+Operator command (run locally via `railway run`, which injects the real
+production `DATABASE_URL` into a local process without ever putting it in
+a file):
+
+    railway run --service <api-service-name> -- \
+      node apps/api/dist/scripts/bootstrap-admin.js \
+        --email <admin email> \
+        --name "<admin display name>"
+
+The command then prompts twice for a password (input hidden, must match).
+No credential of any kind appears in this document or was requested from
+the founder in chat.
+
+This has NOT been run against production from this session — this
+environment has no Railway/production database access. It is implemented,
+typechecked, linted, built, and unit-tested only.
+
+================================================================================
+2. FILES CHANGED
+================================================================================
+
+  Created:
+    apps/api/src/scripts/bootstrap-admin.ts
+    apps/api/src/scripts/bootstrap-admin.spec.ts
+  Modified:
+    apps/api/package.json   (adds "bootstrap:admin": "node dist/scripts/bootstrap-admin.js")
+
+No schema, migration, `railway.json`, or `prisma.config.ts` change — none
+was needed for this feature.
+
+================================================================================
+3. PRODUCTION FLOWS VERIFIED (REAL, API-LEVEL — NO BROWSER AVAILABLE HERE)
+================================================================================
+
+Verified directly against the live production API
+(https://cooperative-unity-production-916a.up.railway.app), all this
+session, via `curl`:
+
+  PASS — Railway now serves current Phase 5 code. `/health` and
+         `/health/ready` return 200; `GET /api/v1/webhooks/zoom` no longer
+         404s (Phase-4/5-only routes now exist); `GET /api/v1/admin/
+         offerings` and `GET /api/v1/admin/operations` both correctly
+         return 401 unauthenticated (they exist, and are guarded). This
+         supersedes every earlier Phase 5 review finding that Railway was
+         stale — that gap is now closed.
+  PASS — Public learner registration: created one real, clearly-labeled
+         controlled pilot account, `phase6-pilot-learner@tubi-test.school`
+         (role LEARNER, id `9f6767bd-c560-4fa2-848d-91f4c8cdb2f2`). This is
+         genuine production data, created deliberately per this milestone's
+         "one controlled learner" instruction — not cleaned up, and known
+         to you.
+  PASS — Login: the same account logged in and received a JWT.
+  PASS — JWT persistence/authorization: the JWT successfully authenticated
+         two further requests (`GET /auth/me`, `GET /learner/sessions`,
+         the latter correctly returning `[]` — no entitlement yet).
+  PASS — RBAC: the same learner JWT was correctly rejected (403 Forbidden)
+         from `GET /admin/offerings`; a request with no token was correctly
+         rejected (401) from `GET /auth/me`.
+  PASS — CORS: an OPTIONS preflight from `https://tubi-workspace.vercel.app`
+         receives the expected `Access-Control-Allow-Origin`/`-Credentials`/
+         `-Methods` headers; the identical preflight from an untrusted
+         origin receives no `Access-Control-Allow-Origin` header at all.
+  PASS — Vercel frontend root (`https://tubi-workspace.vercel.app`) returns
+         200.
+
+NOT executed — genuinely blocked, not skipped:
+  - ADMIN bootstrap execution against production (needs `railway run` /
+    Railway environment access this session does not have).
+  - ADMIN login and school-setup (Grade Level, Academic Term, Subject,
+    Course, Teacher, Offering, Session) through the real Vercel UI —
+    requires an ADMIN account to exist first (see above) and a browser,
+    neither available here.
+  - TEACHER creation/activation and login — requires an ADMIN JWT to call
+    `POST /admin/teachers`, which requires the bootstrap step above.
+  - The learner's actual browser session (register/login through the
+    Vercel UI itself, page refresh/navigation behavior, logout) — the API
+    calls above prove the backend contract; they do not prove the frontend
+    renders/behaves correctly in a real browser, which this environment
+    cannot run.
+  - Entitled-session visibility for the pilot learner — requires an
+    Offering and a `SubscriptionAccess` grant, both of which require ADMIN
+    access (see above).
+
+================================================================================
+4. DEFECTS FIXED
+================================================================================
+
+None found. No launch-blocking defect was encountered in the paths that
+could actually be exercised (API registration/login/RBAC/CORS, backend
+build/typecheck/lint/tests). The ADMIN/TEACHER/full-learner journeys could
+not be exercised at all in this pass (see section 3), so "no defects found"
+there is a statement about what was tested, not a clearance of what wasn't.
+
+================================================================================
+5. TESTS AND VERIFICATION TOTALS
+================================================================================
+
+Backend (Jest):        49 suites / 463 tests passed (was 48/455 before this
+                        phase). History this phase: 48/455 → 49/461 after
+                        the concurrency fix (+1 suite, +6 tests —
+                        bootstrap-admin.spec.ts created; the concurrency
+                        fix itself changed control flow inside `main()`,
+                        not `parseArgs`, so it added no new tests) →
+                        49/463 after the Codex HIGH email-normalization fix
+                        (+2 tests, proving `Admin@School.Example` becomes
+                        `admin@school.example`).
+Backend typecheck:      PASS (tsc --noEmit) — re-run after the normalization fix
+Backend ESLint:         PASS (--max-warnings=0) — re-run after the normalization fix
+Backend build:          PASS (nest build) — re-run after the normalization fix
+Frontend typecheck:     PASS (tsc --noEmit, route types generated)
+Frontend ESLint:        PASS (--max-warnings=0)
+Frontend build:         PASS (next build — Turbopack; all 24 routes compiled)
+Frontend tests (Vitest): BLOCKED IN THIS ENVIRONMENT — not a code defect.
+                        Vitest 4's rolldown-based runner fails to load its
+                        native binding on this machine
+                        ("Cannot find native binding" /
+                        "Application Control policy has blocked this
+                        file" when the exact `.node` binary is required
+                        directly) — a local OS security-policy block on
+                        this specific native module, unrelated to any
+                        Phase 6 change (no frontend source was touched this
+                        phase). `next build` succeeding independently
+                        confirms the frontend code itself compiles and
+                        type-checks correctly; only the Vitest native
+                        binary is affected. Last known-good run in this
+                        same session, before this environment issue
+                        appeared: 18 files / 72 tests passing.
+Prisma format:          PASS, no schema change
+Prisma validate:        PASS
+Prisma generate:        PASS
+Prisma migrate status:  PASS — 4 migrations, database up to date
+Root typecheck:         PASS — 8/8 Turbo tasks
+Repository format check: PASS (one Prettier-only fix applied to the two new
+                        script files; re-verified clean)
+
+================================================================================
+6. UNRESOLVED LAUNCH BLOCKERS
+================================================================================
+
+  1. No ADMIN account exists yet in production, or if one does, this
+     session has no way to know — bootstrap script is ready but has not
+     been run. OPERATOR ACTION REQUIRED: run the command in section 1.
+  2. TEACHER activation is blocked on (1).
+  3. ADMIN school setup (grade levels, terms, subjects, courses, offerings,
+     sessions) is blocked on (1) and on browser access this environment
+     does not have.
+  4. Zoom/Paystack/SMTP real-provider verification remains pending
+     operator credential configuration (unchanged from Phase 5 — not
+     reopened this phase, per instruction).
+  5. Frontend automated test execution is blocked by a local Vitest/
+     rolldown native-binding policy issue in this specific environment
+     (section 5) — does not affect the shippable frontend build.
+
+================================================================================
+7. EXACT GIT STATUS
+================================================================================
+
+  $ git status --short
+   M apps/api/package.json
+  ?? apps/api/src/scripts/
+  ?? docs/phase-6-production-activation-review.txt
+
+Nothing committed, pushed, tagged, or deployed. This revision addresses
+Codex's HIGH (email normalization) and LOW (advisory-lock terminology)
+findings from the prior round. Awaiting ChatGPT confirmation that the HIGH
+finding is closed before sending back to Codex for final re-review.
+
+================================================================================
+8. SOURCE EXCERPTS FOR INDEPENDENT REVIEW (apps/api/src/scripts/bootstrap-admin.ts)
+================================================================================
+
+--- Email normalization (Codex HIGH finding fix — matches
+    AuthService.normalizeEmail() exactly: trim then lowercase) ------------
+
+export function parseArgs(argv: string[]): ParsedArgs | null {
+  let email: string | undefined;
+  let fullName: string | undefined;
+  let allowAdditional = false;
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--email') {
+      email = argv[i + 1];
+      i += 1;
+    } else if (arg === '--name') {
+      fullName = argv[i + 1];
+      i += 1;
+    } else if (arg === '--allow-additional') {
+      allowAdditional = true;
+    }
+  }
+
+  if (!email || !fullName) {
+    return null;
+  }
+
+  // Matches AuthService's normalizeEmail() exactly (trim + lowercase) —
+  // without this, an ADMIN created here as "Admin@School.example" would be
+  // stored with different casing than the normal login path looks up
+  // ("admin@school.example"), making the account unable to log in.
+  return { email: email.trim().toLowerCase(), fullName: fullName.trim(), allowAdditional };
+}
+
+--- Concurrency serialization + existing-ADMIN check + email-uniqueness
+    check + password hashing + ADMIN creation + cleanup/error handling ---
+
+const BCRYPT_SALT_ROUNDS = 12; // Keep in sync with apps/api/src/auth/auth.service.ts
+const MIN_ADMIN_PASSWORD_LENGTH = 12;
+
+/** Fixed advisory-lock key serializing concurrent bootstrap invocations. */
+const BOOTSTRAP_ADMIN_LOCK_KEY = 'tubi:bootstrap-admin';
+
+async function main(): Promise<void> {
+  const parsed = parseArgs(process.argv.slice(2));
+  if (!parsed) {
+    console.error(
+      'Usage: node dist/scripts/bootstrap-admin.js --email <email> --name "<full name>" [--allow-additional]',
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  const { email, fullName, allowAdditional } = parsed;
+
+  if (!isEmail(email)) {
+    console.error(`Not a valid email address: ${email}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (fullName.length === 0) {
+    console.error('--name must not be empty.');
+    process.exitCode = 1;
+    return;
+  }
+
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    console.error('DATABASE_URL is not set — refusing to guess a database to write to.');
+    process.exitCode = 1;
+    return;
+  }
+
+  // Password acquisition/validation happens before any database work: it
+  // is interactive human I/O with no reason to hold an advisory lock (or
+  // any transaction) open while waiting on it.
+  const password = await resolvePassword();
+  if (password.length < MIN_ADMIN_PASSWORD_LENGTH) {
+    console.error(
+      `Password must be at least ${MIN_ADMIN_PASSWORD_LENGTH} characters for an ADMIN account.`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  const passwordHash = await bcrypt.hash(password, BCRYPT_SALT_ROUNDS);
+
+  const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString }) });
+
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      // Taking this lock BEFORE either read is what actually prevents the
+      // race: two concurrent invocations cannot both pass the
+      // existing-ADMIN check and then both insert. The second invocation
+      // blocks here until the first transaction commits or rolls back,
+      // then performs its own check against the now-current state — it
+      // can never observe "no ADMIN exists" while another transaction is
+      // also mid-flight toward creating one.
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${BOOTSTRAP_ADMIN_LOCK_KEY})::bigint)`;
+
+      const existingAdmin = await tx.user.findFirst({
+        where: { role: RoleName.ADMIN },
+        select: { email: true },
+      });
+      if (existingAdmin && !allowAdditional) {
+        return { outcome: 'admin-exists' as const, existingEmail: existingAdmin.email };
+      }
+
+      const emailInUse = await tx.user.findUnique({ where: { email }, select: { id: true } });
+      if (emailInUse) {
+        return { outcome: 'email-in-use' as const };
+      }
+
+      const created = await tx.user.create({
+        data: { email, passwordHash, fullName, role: RoleName.ADMIN, isActive: true },
+        select: { id: true, email: true, createdAt: true },
+      });
+      return { outcome: 'created' as const, created };
+    });
+
+    switch (result.outcome) {
+      case 'admin-exists':
+        console.error(
+          `An ADMIN account already exists (${result.existingEmail}). Refusing to create ` +
+            'another without --allow-additional. This is a safety default, not a hard limit ' +
+            '— pass --allow-additional if a second ADMIN is genuinely intended.',
+        );
+        process.exitCode = 1;
+        return;
+      case 'email-in-use':
+        console.error(
+          `A user with email ${email} already exists (any role) — choose a different email.`,
+        );
+        process.exitCode = 1;
+        return;
+      case 'created':
+        console.log(
+          `Created ADMIN user ${result.created.email} (id: ${result.created.id}) at ` +
+            `${result.created.createdAt.toISOString()}.`,
+        );
+        return;
+    }
+  } finally {
+    await prisma.$disconnect();
+  }
+}
+
+--- Password acquisition (env var for non-interactive use, else unechoed
+    interactive prompt with confirmation) -------------------------------
+
+async function resolvePassword(): Promise<string> {
+  // eslint-disable-next-line turbo/no-undeclared-env-vars
+  const fromEnv = process.env.ADMIN_BOOTSTRAP_PASSWORD;
+  if (fromEnv) {
+    return fromEnv;
+  }
+  const first = await promptForPassword('Admin password (input hidden): ');
+  const second = await promptForPassword('Confirm password: ');
+  if (first !== second) {
+    throw new Error('Passwords did not match.');
+  }
+  return first;
+}
+
+--- Entry-point guard (importing this module for `parseArgs` in a test must
+    never open a real database connection or run the CLI) ---------------
+
+if (require.main === module) {
+  main().catch((error: unknown) => {
+    console.error('Admin bootstrap failed:', error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  });
+}
+
+================================================================================
+9. TESTS (apps/api/src/scripts/bootstrap-admin.spec.ts)
+================================================================================
+
+import { parseArgs } from './bootstrap-admin.js';
+
+describe('bootstrap-admin parseArgs', () => {
+  it('parses --email and --name', () => {
+    expect(parseArgs(['--email', 'admin@school.example', '--name', 'Founder Admin'])).toEqual({
+      email: 'admin@school.example',
+      fullName: 'Founder Admin',
+      allowAdditional: false,
+    });
+  });
+
+  it('recognizes --allow-additional', () => {
+    const result = parseArgs([
+      '--email',
+      'admin@school.example',
+      '--name',
+      'Founder Admin',
+      '--allow-additional',
+    ]);
+    expect(result?.allowAdditional).toBe(true);
+  });
+
+  it('trims surrounding whitespace from email and name', () => {
+    const result = parseArgs([
+      '--email',
+      '  admin@school.example  ',
+      '--name',
+      '  Founder Admin  ',
+    ]);
+    expect(result).toEqual({
+      email: 'admin@school.example',
+      fullName: 'Founder Admin',
+      allowAdditional: false,
+    });
+  });
+
+  it('lowercases the email to match AuthService.normalizeEmail, so the created account can log in', () => {
+    const result = parseArgs(['--email', 'Admin@School.Example', '--name', 'Founder Admin']);
+    expect(result?.email).toBe('admin@school.example');
+  });
+
+  it('lowercases and trims together, without altering name casing', () => {
+    const result = parseArgs(['--email', '  Admin@School.Example  ', '--name', 'Founder Admin']);
+    expect(result).toEqual({
+      email: 'admin@school.example',
+      fullName: 'Founder Admin',
+      allowAdditional: false,
+    });
+  });
+
+  it('returns null when --email is missing', () => {
+    expect(parseArgs(['--name', 'Founder Admin'])).toBeNull();
+  });
+
+  it('returns null when --name is missing', () => {
+    expect(parseArgs(['--email', 'admin@school.example'])).toBeNull();
+  });
+
+  it('returns null for empty argv', () => {
+    expect(parseArgs([])).toBeNull();
+  });
+});
+
+These 8 tests (6 original + 2 added for the Codex HIGH email-normalization
+finding) cover argument parsing only — the concurrency/transaction logic
+in section 8 is reviewed by source inspection rather than an automated
+concurrency test, since exercising a real Postgres advisory-lock race
+would require two genuinely concurrent connections against a live
+database, which is out of scope for a one-time operator CLI's unit-test
+coverage and was not requested. ChatGPT/Codex review of the transaction
+shape in section 8 is the verification mechanism for that fix; the two new
+tests here are the verification mechanism for the email-normalization fix
+— they directly assert the exact case from the Codex finding
+(`Admin@School.Example` → `admin@school.example`).
+
+================================================================================
+END OF DOCUMENT
+================================================================================
